@@ -12,9 +12,9 @@ without writing C++.
 * Docs: https://ravensight.io/docs/
 * Unreal Engine 5.1 or newer
 
-## BETA notice
+## Verification status
 
-**This plugin is a beta: API verified semantics, pending in-editor compile and
+**API verified semantics, pending in-editor compile and
 run.**
 
 The protocol logic is written and reviewed line by line against the live API
@@ -320,7 +320,7 @@ developer's responsibility as it would be for any online feature.
 ## Other SDKs
 
 * [Godot](https://github.com/Reality-Software-Entertainment/ravensight-godot)
-* [Unity](https://github.com/Reality-Software-Entertainment/ravensight-unity) (beta)
+* [Unity](https://github.com/Reality-Software-Entertainment/ravensight-unity)
 * [JavaScript](https://github.com/Reality-Software-Entertainment/ravensight-js), web and Node
 
 ## License
