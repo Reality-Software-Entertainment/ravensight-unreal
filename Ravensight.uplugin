@@ -1,0 +1,24 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "Ravensight",
+	"Description": "Player analytics for Unreal Engine 5. Sessions, batched events, an offline queue, rate limit handling and a server side kill switch, with Blueprint support.",
+	"Category": "Analytics",
+	"CreatedBy": "Reality Software Entertainment",
+	"CreatedByURL": "https://ravensight.io",
+	"DocsURL": "https://ravensight.io/docs/",
+	"MarketplaceURL": "",
+	"SupportURL": "https://github.com/Reality-Software-Entertainment/ravensight-unreal/issues",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "Ravensight",
+			"Type": "Runtime",
+			"LoadingPhase": "PreDefault"
+		}
+	]
+}
