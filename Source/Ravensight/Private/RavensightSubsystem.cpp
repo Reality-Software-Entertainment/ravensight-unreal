@@ -20,6 +20,8 @@
 #include "Misc/Guid.h"
 #include "Misc/Parse.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
+#include "Misc/ScopeExit.h"
+#include "RavensightBackgroundTask.h"
 #include "RavensightSettings.h"
 #include "RavensightTransport.h"
 #include "Serialization/JsonReader.h"
@@ -128,6 +130,7 @@ void URavensightSubsystem::Deinitialize()
 
 	StopTimers();
 	UnbindApplicationDelegates();
+	EndBackgroundTask();
 
 	Super::Deinitialize();
 }
@@ -627,6 +630,9 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 
 void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation)
 {
+	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
+	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
+
 	Queue.EndFlush();
 
 	// The queue this batch came from was thrown away while it was in flight:
@@ -762,6 +768,9 @@ void URavensightSubsystem::CheckServerSettings()
 
 void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)
 {
+	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
+	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
+
 	bSettingsRequestPending = false;
 
 	if (bStoppedForRun)
@@ -886,6 +895,9 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 
 void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation)
 {
+	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
+	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
+
 	bSessionRequestPending = false;
 
 	// A session opened for a queue (or a device id) that has since been
@@ -1331,8 +1343,11 @@ void URavensightSubsystem::OnApplicationWillEnterBackground()
 	}
 
 	// The most important flush on mobile: iOS and Android can suspend or kill
-	// the process without ever returning to the foreground.
+	// the process without ever returning to the foreground. On iOS it runs
+	// inside a background task, so the system allows it time to finish.
+	BeginBackgroundTask();
 	FlushInternal(true);
+	EndBackgroundTaskIfIdle();
 
 	if (IsMobilePlatform())
 	{
@@ -1346,6 +1361,8 @@ void URavensightSubsystem::OnApplicationEnteredForeground()
 	{
 		return;
 	}
+
+	EndBackgroundTask();
 
 	if (IsMobilePlatform())
 	{
@@ -1490,6 +1507,34 @@ void URavensightSubsystem::SendExitUnderToken(const FString& Token, double Exite
 	RavensightTransport::Send(Request);
 
 	Log(TEXT("reported game_exited for a session that ended in the background"));
+}
+
+void URavensightSubsystem::BeginBackgroundTask()
+{
+#if PLATFORM_IOS
+	if (!bBackgroundTaskActive)
+	{
+		bBackgroundTaskActive = true;
+		RavensightBackgroundTask::Begin();
+	}
+#endif
+}
+
+void URavensightSubsystem::EndBackgroundTask()
+{
+	if (bBackgroundTaskActive)
+	{
+		bBackgroundTaskActive = false;
+		RavensightBackgroundTask::End();
+	}
+}
+
+void URavensightSubsystem::EndBackgroundTaskIfIdle()
+{
+	if (bBackgroundTaskActive && !Queue.IsFlushInProgress() && !bSessionRequestPending && !bSettingsRequestPending)
+	{
+		EndBackgroundTask();
+	}
 }
 
 void URavensightSubsystem::PumpUntilIdle(double BudgetSeconds)

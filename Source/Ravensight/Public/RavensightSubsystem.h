@@ -259,7 +259,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.2.0". */
+	/** The plugin version, "0.2.1". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
@@ -315,6 +315,15 @@ private:
 
 	/** Holds the quit for at most ExitFlushBudgetSeconds while a session or batch request is in flight. */
 	void PumpUntilIdle(double BudgetSeconds);
+
+	/**
+	 * iOS: the background flush runs inside a UIKit background task, ended
+	 * once no settings, session or batch request is in flight, on return to
+	 * the foreground, or on quit. Does nothing on other platforms.
+	 */
+	void BeginBackgroundTask();
+	void EndBackgroundTask();
+	void EndBackgroundTaskIfIdle();
 
 	// --- Timers ------------------------------------------------------------
 
@@ -398,6 +407,9 @@ private:
 	 * answer from an older generation is ignored.
 	 */
 	int32 QueueGeneration = 0;
+
+	/** iOS: a background task is running for the background flush. */
+	bool bBackgroundTaskActive = false;
 
 	/** iOS and Android: when the app last went to the background, 0 when in the foreground. */
 	double BackgroundedAtSeconds = 0.0;

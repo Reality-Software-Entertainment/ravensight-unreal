@@ -31,5 +31,13 @@ public class Ravensight : ModuleRules
 				"Projects",
 			}
 		);
+
+		if (Target.Platform == UnrealTargetPlatform.IOS)
+		{
+			// Private/IOS/RavensightIOSBackgroundTask.mm wraps the background
+			// flush in a UIKit background task. UnrealBuildTool compiles a
+			// Private/IOS folder only for iOS, so other platforms never see it.
+			PublicFrameworks.Add("UIKit");
+		}
 	}
 }
