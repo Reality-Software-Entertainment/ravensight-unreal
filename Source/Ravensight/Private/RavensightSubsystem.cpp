@@ -21,6 +21,7 @@
 #include "Misc/Parse.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "RavensightSettings.h"
+#include "RavensightTransport.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
@@ -615,7 +616,7 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 	Request->SetContentAsString(WriteJson(Body));
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleBatchResponse, Batch.Num(), QueueGeneration);
 
-	if (!Request->ProcessRequest())
+	if (!RavensightTransport::Send(Request))
 	{
 		Queue.EndFlush();
 		Queue.OnTransportFailure(NowSeconds());
@@ -751,7 +752,7 @@ void URavensightSubsystem::CheckServerSettings()
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSettingsResponse);
 
-	if (!Request->ProcessRequest())
+	if (!RavensightTransport::Send(Request))
 	{
 		bSettingsRequestPending = false;
 		UE_LOG(LogRavensight, Warning, TEXT("settings check could not start, assuming tracking is enabled"));
@@ -872,7 +873,7 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	Request->SetContentAsString(WriteJson(Body));
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration);
 
-	if (!Request->ProcessRequest())
+	if (!RavensightTransport::Send(Request))
 	{
 		bSessionRequestPending = false;
 		UE_LOG(LogRavensight, Warning, TEXT("session request could not start"));
@@ -1040,7 +1041,7 @@ void URavensightSubsystem::SubmitFeedback(const FString& Message, const FString&
 	Request->SetContentAsString(WriteJson(Body));
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleFeedbackResponse);
 
-	if (!Request->ProcessRequest())
+	if (!RavensightTransport::Send(Request))
 	{
 		OnFeedbackResult.Broadcast(false, TEXT("request_not_started"));
 	}
@@ -1108,7 +1109,7 @@ void URavensightSubsystem::FetchSuggestions()
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSuggestionsResponse);
 
-	if (!Request->ProcessRequest())
+	if (!RavensightTransport::Send(Request))
 	{
 		OnSuggestionsReceived.Broadcast(false, TArray<FString>());
 	}
@@ -1486,7 +1487,7 @@ void URavensightSubsystem::SendExitUnderToken(const FString& Token, double Exite
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-Session-Token"), Token);
 	Request->SetContentAsString(WriteJson(Body));
-	Request->ProcessRequest();
+	RavensightTransport::Send(Request);
 
 	Log(TEXT("reported game_exited for a session that ended in the background"));
 }
@@ -1511,7 +1512,7 @@ void URavensightSubsystem::PumpUntilIdle(double BudgetSeconds)
 
 FHttpRequestRef URavensightSubsystem::MakeRequest(const FString& Verb, const FString& Path) const
 {
-	const FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
+	const FHttpRequestRef Request = RavensightTransport::CreateRequest();
 	Request->SetVerb(Verb);
 	Request->SetURL(ApiUrl + Path);
 	Request->SetTimeout(RequestTimeoutSeconds);
