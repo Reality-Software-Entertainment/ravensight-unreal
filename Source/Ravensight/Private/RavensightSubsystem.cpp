@@ -885,9 +885,11 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 				ExpiresAt = Now + ExpiresIn;
 			}
 
-			// A session opened, so the key is good after all.
+			// A session opened, so the key is good after all. A refused key
+			// had stopped the timer, so it comes back too.
+			const bool bWasRefused = bKeyRefused;
 			bKeyRefused = false;
-			if (!bStarted)
+			if (!bStarted || bWasRefused)
 			{
 				bStarted = true;
 				StartFlushTimer();

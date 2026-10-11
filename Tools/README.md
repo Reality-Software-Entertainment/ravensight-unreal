@@ -4,10 +4,14 @@ The plugin was authored on a machine with no Unreal toolchain installed, so it
 has never been through UnrealBuildTool. This file is what to run first, and what
 to look at when something does not build.
 
-There is no `compile-check.sh` here on purpose. Unreal C++ cannot be compiled
-outside the engine: the headers depend on generated `.generated.h` files that
-only UnrealHeaderTool produces, so a standalone `clang++` run would fail on the
-first include and tell you nothing useful. The checks below are the real ones.
+There is no `compile-check.sh` for the plugin as a whole on purpose. Unreal C++
+cannot be compiled outside the engine: the subsystem and settings headers
+depend on generated `.generated.h` files that only UnrealHeaderTool produces.
+The engine checks below are the real ones.
+
+The one thing that does run without the engine is `host-check/` (see
+[Host check](#host-check) below): the queue, the protocol table and their
+specs, which use no UObject at all.
 
 ## The fast path
 
@@ -44,19 +48,39 @@ To produce a redistributable build and catch anything project specific:
   -TargetPlatforms=Mac+IOS+Android
 ```
 
-## Running the spec
+## Running the specs
 
-`Source/Ravensight/Private/Tests/RavensightQueue.spec.cpp` covers the whole
-state machine and needs no network, no clock and no world.
+`Source/Ravensight/Private/Tests/RavensightQueue.spec.cpp` covers the queue
+state machine and `RavensightProtocol.spec.cpp` covers the response table,
+`ApiUrl` forms, feedback validation, the lifecycle once-guards, the mobile 30
+minute rule, the Playtest sources and a fake transport over the queue. Neither
+needs a network, a clock or a world.
 
 ```bash
 UnrealEditor-Cmd YourProject.uproject \
-  -ExecCmds="Automation RunTests Ravensight.Queue; Quit" \
+  -ExecCmds="Automation RunTests Ravensight; Quit" \
   -unattended -nopause -nullrhi
 ```
 
-The spec is wrapped in `#if WITH_DEV_AUTOMATION_TESTS`, so it compiles out of a
-shipping build entirely.
+Both specs are wrapped in `#if WITH_DEV_AUTOMATION_TESTS`, so they compile out
+of a shipping build entirely.
+
+## Host check
+
+```bash
+bash Tools/host-check/run.sh
+```
+
+Compiles `RavensightQueue.cpp`, `RavensightProtocol.cpp` and both spec files,
+unchanged, with any C++17 compiler (`CXX` overrides `c++`) and
+`-Wall -Wextra -Wshadow -Werror`, against stand-in headers in
+`host-check/include/` for the handful of engine types they use (`FString`,
+`TArray`, `FMath`, `TUniquePtr` and the spec macros), then runs every case.
+Where Unreal's semantics matter the stand-ins copy them: `FString` equality and
+`EndsWith` ignore case.
+
+This proves the logic, not the build. The subsystem, UnrealHeaderTool,
+UnrealBuildTool and the engine's real headers are not involved.
 
 ## Known version sensitive lines
 
@@ -70,18 +94,27 @@ engine API moved between 5.x releases.
 | `RavensightSubsystem.cpp` | `Request->SetTimeout(RequestTimeoutSeconds)`. Present since 4.26. If your HTTP module predates it, delete the line: the module wide timeout still applies. |
 | `RavensightSubsystem.cpp` | `TryGetStringField` / `TryGetBoolField` / `TryGetNumberField` take an `FStringView` from 5.4 onward and an `FString` before that. `TEXT("...")` binds to both, so this should be fine either way. |
 | `RavensightSubsystem.cpp` | `FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower)`. If the enumerator is missing, `EGuidFormats::Digits` is equivalent for our purposes. |
+| `RavensightSubsystem.cpp` | `FHttpModule::Get().GetHttpManager().Tick(0.0f)` in `PumpUntilIdle`, the bounded quit flush. `FHttpManager::Tick(float)` is the manager's ticker override; if your version makes it inaccessible, `GetHttpManager().Flush(...)` with your engine's flush reason is the alternative, though it is not bounded by our 1.5 seconds. |
+| `RavensightSubsystem.cpp` | `FPlatformMisc::GetEnvironmentVariable(const TCHAR*)` returning `FString` (UE5 form), and `FParse::Value(FCommandLine::Get(), ..., FString&, false)` for the Playtest sources. |
+| `RavensightSubsystem.cpp` | `GConfig->SetBool` / `GetBool` / `SetString` / `GetString` / `Flush` against `GGameUserSettingsIni`, for the saved opt-out and the mobile background marker. |
+| `RavensightProtocol.cpp` | `TArray::ContainsByPredicate` with `FString::Equals(..., ESearchCase::CaseSensitive)`. |
 | `Ravensight.Build.cs` | The `HTTP` module is spelled in caps. `Http` also resolves on some versions but caps is the safe form. |
 
 ## What was verified without a toolchain
 
-* Every brace, bracket and parenthesis balances in all nine source files.
-* Every member function declared in a header has exactly one definition, with
-  matching return type and `const` qualification, and no definition exists
-  without a declaration.
-* Every request path, header name, status code and JSON field name was checked
-  against `Ravensight.gd`, the reference implementation, field by field.
+For 0.2.0, on 2026-10-10:
+
+* `bash Tools/host-check/run.sh` with Apple clang 21.0.0: the queue, the
+  protocol table and both specs compiled with `-Wshadow -Werror` and ran, 54
+  cases, 0 failed. It caught one real defect on the way: a parameter that
+  shadowed a new queue member, which the engine's own shadowing check would
+  also have refused.
+* A script check that every member function declared in
+  `RavensightSubsystem.h` has a definition in `RavensightSubsystem.cpp`.
+* Every request path, header name, status code and JSON field name was read
+  against the server's ingest routes.
 * No em dashes or en dashes anywhere, per house style.
 
-What that does not cover: template instantiation, UnrealHeaderTool's rules for
-Blueprint exposed signatures, and overload resolution against the engine's
-actual headers. Those need a real build.
+What that does not cover: UnrealHeaderTool's rules for Blueprint exposed
+signatures, the subsystem against the engine's actual headers, and anything at
+run time in the editor or a packaged build. Those need a real build.
