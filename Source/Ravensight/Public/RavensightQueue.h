@@ -125,6 +125,12 @@ public:
 	 */
 	int32 Enqueue(const FRavensightEvent& Event);
 
+	/**
+	 * Like Enqueue, but places the event at the front, for game_started when
+	 * the game tracked events before Init. Never ahead of a batch in flight.
+	 */
+	int32 EnqueueAtFront(const FRavensightEvent& Event);
+
 	int32 Num() const { return Events.Num(); }
 	bool IsEmpty() const { return Events.Num() == 0; }
 	const TArray<FRavensightEvent>& GetEvents() const { return Events; }

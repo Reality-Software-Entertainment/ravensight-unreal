@@ -183,6 +183,61 @@ namespace RavensightProtocol
 	};
 
 	RAVENSIGHT_API FPlaytestResolution ResolvePlaytest(const FPlaytestSources& Sources);
+
+	/**
+	 * The status reason after a session or batch answer: an Accept clears it
+	 * (the SDK is sending again), a verdict with a reason sets it, anything
+	 * else leaves the current reason alone.
+	 */
+	RAVENSIGHT_API FString NextStatusReason(const FString& Current, const FRavensightResponseVerdict& Verdict);
+}
+
+/** Everything the start gate needs to decide which requests may go out. */
+struct FRavensightGateInput
+{
+	bool bInitialized = false;
+
+	/** The developer's Enabled setting. */
+	bool bEnabled = true;
+
+	/** The player's saved choice. Ignored during a Playtest run. */
+	bool bPlayerOptedIn = true;
+
+	bool bPlaytest = false;
+	bool bPlaytestMissingRunId = false;
+
+	/** Kill switch or Playtest stop. */
+	bool bStoppedForRun = false;
+
+	bool bKeyRefused = false;
+
+	/** An explicit Flush, the one attempt allowed after a refused key. */
+	bool bExplicitAttempt = false;
+};
+
+/** Which requests the SDK may make right now, and the reason when it may make none. */
+struct FRavensightGate
+{
+	bool bAllowEnqueue = false;
+	bool bAllowSettings = false;
+	bool bAllowSession = false;
+	bool bAllowBatch = false;
+	bool bAllowSuggestions = false;
+	bool bAllowFeedback = false;
+
+	/** disabled, invalid_key or session_failed when blocked for that reason; empty otherwise. */
+	FString Reason;
+
+	bool AllowsAnyRequest() const
+	{
+		return bAllowSettings || bAllowSession || bAllowBatch || bAllowSuggestions || bAllowFeedback;
+	}
+};
+
+namespace RavensightProtocol
+{
+	/** The start gate. Pure: active = enabled, not opted out, not stopped, key not refused. */
+	RAVENSIGHT_API FRavensightGate DecideGate(const FRavensightGateInput& Input);
 }
 
 /**

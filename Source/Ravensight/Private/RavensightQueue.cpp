@@ -42,6 +42,25 @@ int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
 	return Dropped;
 }
 
+int32 FRavensightQueue::EnqueueAtFront(const FRavensightEvent& Event)
+{
+	if (!IsActive())
+	{
+		return 0;
+	}
+
+	// A batch in flight is a copy of the leading events and leaves the queue
+	// by count on a 202, so nothing may be inserted ahead of it.
+	if (bFlushInProgress)
+	{
+		return Enqueue(Event);
+	}
+
+	const int32 Dropped = TrimToCap(1);
+	Events.Insert(Event, 0);
+	return Dropped;
+}
+
 void FRavensightQueue::Clear()
 {
 	DroppedCount += Events.Num();

@@ -32,11 +32,18 @@ What was run, on 2026-10-10: `bash Tools/host-check/run.sh`, which compiles
 `RavensightQueue.cpp`, `RavensightProtocol.cpp` and both `.spec.cpp` files
 unchanged with Apple clang 21.0.0 (`-std=c++17 -Wall -Wextra -Wshadow -Werror`)
 against small stand-in headers for the few engine types they use, and runs
-the specs: 54 cases, 0 failed. That checks the logic, not Unreal.
+the specs: 66 cases, 0 failed. That checks the logic, not Unreal.
 
 What has **not** been run: UnrealHeaderTool, UnrealBuildTool, the automation
 specs inside the editor, and anything in `URavensightSubsystem` (HTTP, timers,
 config, application lifecycle). None of that is verified yet.
+
+Known gap: on iOS the flush on entering the background is not wrapped in a
+background task (`beginBackgroundTaskWithExpirationHandler`), so iOS may
+suspend the app before that last batch is sent. The background marker still
+lets the next launch report the session's exit. Adding the task needs an
+Objective-C++ file that we will write once it can be compiled and tried on a
+device.
 
 Read `Tools/README.md` before you build. It lists the exact commands to compile
 check the plugin and run the specs, and the specific lines most likely to need

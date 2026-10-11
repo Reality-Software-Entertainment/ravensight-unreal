@@ -275,7 +275,17 @@ private:
 	void RefuseKey();
 
 	void SetStatusReason(const FString& Reason);
-	void QueueGameStartedOnce();
+	/** bAtFront puts it ahead of events the game tracked before Init. */
+	void QueueGameStartedOnce(bool bAtFront = false);
+
+	/** Validates, tags and queues one event. TrackEventJson and the lifecycle events share it. */
+	void EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront);
+
+	/** The pure start gate (RavensightProtocol::DecideGate) over the current state. */
+	FRavensightGate CurrentGate(bool bExplicitAttempt = false) const;
+
+	/** Anything already in flight belongs to an older queue and its answer is ignored. */
+	void BumpQueueGeneration() { ++QueueGeneration; }
 	void ReadPlaytestSources();
 
 	// --- Requests ----------------------------------------------------------
@@ -285,11 +295,11 @@ private:
 	void AfterSettingsChecked();
 
 	void EnsureSession(bool bExplicit = false);
-	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
+	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation);
 
 	void FlushInternal(bool bForce, bool bExplicit = false);
 	void SendBatch(const TArray<FRavensightEvent>& Batch);
-	void HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize);
+	void HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation);
 
 	void HandleFeedbackResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
 	void HandleSuggestionsResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
@@ -381,6 +391,13 @@ private:
 
 	/** 401s on /track/batch since the last 202. */
 	int32 ConsecutiveBatchUnauthorized = 0;
+
+	/**
+	 * Bumped whenever the queue or the session is thrown away (opt out,
+	 * Enabled off, ResetDeviceId, stop for the run). A batch or session
+	 * answer from an older generation is ignored.
+	 */
+	int32 QueueGeneration = 0;
 
 	/** iOS and Android: when the app last went to the background, 0 when in the foreground. */
 	double BackgroundedAtSeconds = 0.0;

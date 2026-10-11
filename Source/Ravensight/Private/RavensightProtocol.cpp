@@ -202,6 +202,62 @@ RavensightProtocol::FPlaytestResolution RavensightProtocol::ResolvePlaytest(cons
 	return Out;
 }
 
+FString RavensightProtocol::NextStatusReason(const FString& Current, const FRavensightResponseVerdict& Verdict)
+{
+	if (Verdict.Action == ERavensightResponseAction::Accept)
+	{
+		return FString();
+	}
+
+	return Verdict.Reason.IsEmpty() ? Current : Verdict.Reason;
+}
+
+FRavensightGate RavensightProtocol::DecideGate(const FRavensightGateInput& Input)
+{
+	FRavensightGate Gate;
+
+	if (Input.bPlaytestMissingRunId)
+	{
+		Gate.Reason = RavensightReason::SessionFailed;
+		return Gate;
+	}
+
+	if (Input.bStoppedForRun)
+	{
+		return Gate;
+	}
+
+	const bool bOptedIn = Input.bPlayerOptedIn || Input.bPlaytest;
+	if (!Input.bEnabled || !bOptedIn)
+	{
+		Gate.Reason = RavensightReason::Disabled;
+		return Gate;
+	}
+
+	// Events may be held before Init and while the key is refused.
+	Gate.bAllowEnqueue = true;
+
+	if (!Input.bInitialized)
+	{
+		return Gate;
+	}
+
+	if (Input.bKeyRefused)
+	{
+		Gate.Reason = RavensightReason::InvalidKey;
+		Gate.bAllowSession = Input.bExplicitAttempt;
+		Gate.bAllowBatch = Input.bExplicitAttempt;
+		return Gate;
+	}
+
+	Gate.bAllowSettings = true;
+	Gate.bAllowSession = true;
+	Gate.bAllowBatch = true;
+	Gate.bAllowSuggestions = true;
+	Gate.bAllowFeedback = true;
+	return Gate;
+}
+
 // --- Lifecycle guards -------------------------------------------------------
 
 bool FRavensightLifecycleGuards::TryClaimStarted()

@@ -69,6 +69,20 @@ verification status).
 * A `503` with `Retry-After` waits that long.
 * The ingest key is described accurately: it can also read this game's design
   suggestions.
+* A batch the server accepts clears a lingering `rate_limited` or `offline`
+  reason, and a batch that cannot reach the server reports `offline`.
+* An answer to a batch or session request made before the queue was thrown
+  away (opt out, Enabled off, `ResetDeviceId`) is ignored.
+* A settings `429`, or `503` with `Retry-After`, waits that long.
+* The quit flush also waits, within the same 1.5 seconds, for a settings
+  check still in flight.
+
+### Known limitations
+
+* Not yet compiled in Unreal; see the README's verification status.
+* On iOS the background flush is not wrapped in a background task, so iOS may
+  suspend the app before the last batch is sent. The background marker still
+  reports the session's exit on the next launch.
 
 ## [0.1.0] - 2026-08-28
 

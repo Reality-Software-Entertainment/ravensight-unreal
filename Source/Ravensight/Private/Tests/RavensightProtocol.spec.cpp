@@ -318,6 +318,132 @@ void FRavensightProtocolSpec::Define()
 		});
 	});
 
+	Describe("the status reason", [this]()
+	{
+		It("clears on a batch the server accepts, so a 429 does not linger", [this]()
+		{
+			const FString AfterLimit = RavensightProtocol::NextStatusReason(FString(), Answer(ERavensightEndpoint::Batch, 429, TEXT("rate_limited"), 5, 0, true));
+			TestEqual(TEXT("rate limited"), AfterLimit, FString(RavensightReason::RateLimited));
+			TestEqual(TEXT("cleared on 202"), RavensightProtocol::NextStatusReason(AfterLimit, Answer(ERavensightEndpoint::Batch, 202)), FString());
+		});
+
+		It("reports offline when a batch cannot reach the server mid session", [this]()
+		{
+			TestEqual(TEXT("offline"), RavensightProtocol::NextStatusReason(FString(), Answer(ERavensightEndpoint::Batch, 0, FString(), 5)), FString(RavensightReason::Offline));
+		});
+
+		It("leaves the reason alone for an answer that names none", [this]()
+		{
+			TestEqual(TEXT("500 keeps"), RavensightProtocol::NextStatusReason(TEXT("offline"), Answer(ERavensightEndpoint::Batch, 500, FString(), 5)), FString(RavensightReason::Offline));
+			TestEqual(TEXT("halve keeps"), RavensightProtocol::NextStatusReason(FString(), Answer(ERavensightEndpoint::Batch, 400, FString(), 50)), FString());
+		});
+	});
+
+	Describe("the start gate", [this]()
+	{
+		It("makes zero requests of any kind when started disabled", [this]()
+		{
+			FRavensightGateInput Input;
+			Input.bInitialized = true;
+			Input.bEnabled = false;
+			const FRavensightGate Gate = RavensightProtocol::DecideGate(Input);
+			TestFalse(TEXT("no request"), Gate.AllowsAnyRequest());
+			TestFalse(TEXT("nothing queued"), Gate.bAllowEnqueue);
+			TestEqual(TEXT("reason"), Gate.Reason, FString(RavensightReason::Disabled));
+
+			Input.bExplicitAttempt = true;
+			TestFalse(TEXT("not even an explicit flush"), RavensightProtocol::DecideGate(Input).AllowsAnyRequest());
+		});
+
+		It("keeps a saved opt-out across a new client", [this]()
+		{
+			// Stand-in for GameUserSettings.ini: the first client saves the
+			// player's choice, a second client reads it at construction.
+			TMap<FString, bool> SavedIni;
+			SavedIni.Add(TEXT("TrackingEnabled"), false);
+
+			FRavensightGateInput NewClient;
+			NewClient.bInitialized = true;
+			NewClient.bPlayerOptedIn = SavedIni.FindRef(TEXT("TrackingEnabled"));
+			const FRavensightGate Gate = RavensightProtocol::DecideGate(NewClient);
+			TestFalse(TEXT("no settings, session, batch, suggestions or feedback"), Gate.AllowsAnyRequest());
+			TestEqual(TEXT("reason"), Gate.Reason, FString(RavensightReason::Disabled));
+		});
+
+		It("lets a Playtest run past the saved opt-out without changing it", [this]()
+		{
+			FRavensightGateInput Input;
+			Input.bInitialized = true;
+			Input.bPlayerOptedIn = false;
+			Input.bPlaytest = true;
+			TestTrue(TEXT("allowed"), RavensightProtocol::DecideGate(Input).bAllowSession);
+		});
+
+		It("stops a Playtest token with no run id with session_failed", [this]()
+		{
+			FRavensightGateInput Input;
+			Input.bInitialized = true;
+			Input.bPlaytest = true;
+			Input.bPlaytestMissingRunId = true;
+			const FRavensightGate Gate = RavensightProtocol::DecideGate(Input);
+			TestFalse(TEXT("no request"), Gate.AllowsAnyRequest());
+			TestEqual(TEXT("reason"), Gate.Reason, FString(RavensightReason::SessionFailed));
+		});
+
+		It("after a refused key allows only an explicit flush, and keeps queueing", [this]()
+		{
+			FRavensightGateInput Input;
+			Input.bInitialized = true;
+			Input.bKeyRefused = true;
+			const FRavensightGate Automatic = RavensightProtocol::DecideGate(Input);
+			TestFalse(TEXT("automatic retries stop"), Automatic.AllowsAnyRequest());
+			TestTrue(TEXT("queue kept"), Automatic.bAllowEnqueue);
+			TestFalse(TEXT("feedback refused locally"), Automatic.bAllowFeedback);
+
+			Input.bExplicitAttempt = true;
+			const FRavensightGate Explicit = RavensightProtocol::DecideGate(Input);
+			TestTrue(TEXT("explicit session"), Explicit.bAllowSession);
+			TestTrue(TEXT("explicit batch"), Explicit.bAllowBatch);
+			TestFalse(TEXT("still no settings"), Explicit.bAllowSettings);
+		});
+
+		It("holds events before Init without any request", [this]()
+		{
+			const FRavensightGate Gate = RavensightProtocol::DecideGate(FRavensightGateInput());
+			TestTrue(TEXT("held"), Gate.bAllowEnqueue);
+			TestFalse(TEXT("no request"), Gate.AllowsAnyRequest());
+		});
+
+		It("stops everything for the run after the kill switch", [this]()
+		{
+			FRavensightGateInput Input;
+			Input.bInitialized = true;
+			Input.bStoppedForRun = true;
+			TestFalse(TEXT("no request"), RavensightProtocol::DecideGate(Input).AllowsAnyRequest());
+		});
+	});
+
+	Describe("game_started ahead of early events", [this]()
+	{
+		It("goes to the front of events tracked before Init", [this]()
+		{
+			Fill(2);
+			Queue->EnqueueAtFront(FRavensightEvent(TEXT("game_started"), TEXT("{}"), 1));
+			TestEqual(TEXT("first"), Queue->GetEvents()[0].EventName, FString(TEXT("game_started")));
+			TestEqual(TEXT("then the rest"), Queue->Num(), 3);
+		});
+
+		It("never jumps ahead of a batch in flight", [this]()
+		{
+			Queue->SetSession(TEXT("tok"), Now + 3600.0);
+			Fill(2);
+			Queue->BeginFlush(Now, false);
+			Queue->EnqueueAtFront(FRavensightEvent(TEXT("game_started"), TEXT("{}"), 1));
+			TestEqual(TEXT("in flight head kept"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+			TestEqual(TEXT("appended"), Queue->GetEvents()[2].EventName, FString(TEXT("game_started")));
+		});
+	});
+
 	Describe("a fake transport over the queue", [this]()
 	{
 		It("splits a batch around one event the server refuses and keeps draining", [this]()

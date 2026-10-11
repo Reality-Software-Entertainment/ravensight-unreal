@@ -105,7 +105,7 @@ engine API moved between 5.x releases.
 For 0.2.0, on 2026-10-10:
 
 * `bash Tools/host-check/run.sh` with Apple clang 21.0.0: the queue, the
-  protocol table and both specs compiled with `-Wshadow -Werror` and ran, 54
+  protocol table and both specs compiled with `-Wshadow -Werror` and ran, 66
   cases, 0 failed. It caught one real defect on the way: a parameter that
   shadowed a new queue member, which the engine's own shadowing check would
   also have refused.

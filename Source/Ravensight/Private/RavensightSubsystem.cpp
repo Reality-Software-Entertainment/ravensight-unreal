@@ -119,7 +119,8 @@ void URavensightSubsystem::Deinitialize()
 	if (bCanSend && !bKeyRefused)
 	{
 		// Best effort, and bounded: the quit is held for at most 1.5 seconds
-		// while the last session and batch requests are pumped.
+		// while a pending settings check and the last session and batch
+		// requests are pumped.
 		FlushInternal(true);
 		PumpUntilIdle(RavensightProtocol::ExitFlushBudgetSeconds);
 	}
@@ -213,10 +214,11 @@ void URavensightSubsystem::StartIfAllowed()
 		return;
 	}
 
-	if (!Queue.IsEnabled() || !Queue.IsLocallyEnabled())
+	const FRavensightGate Gate = CurrentGate();
+	if (!Gate.bAllowEnqueue)
 	{
 		// Nothing touches the network: no settings check, no session, no batch.
-		SetStatusReason(RavensightReason::Disabled);
+		SetStatusReason(Gate.Reason);
 		return;
 	}
 
@@ -234,9 +236,10 @@ void URavensightSubsystem::StartIfAllowed()
 		StartFlushTimer();
 	}
 
-	// Queued now, at the real start time and first in the queue. The settings
-	// check then decides whether it is ever sent.
-	QueueGameStartedOnce();
+	// Queued now, at the real start time and first in the queue, ahead of
+	// anything the game tracked before Init. The settings check then decides
+	// whether it is ever sent.
+	QueueGameStartedOnce(true);
 
 	if (!bSettingsChecked && !bSettingsRequestPending)
 	{
@@ -244,7 +247,7 @@ void URavensightSubsystem::StartIfAllowed()
 	}
 }
 
-void URavensightSubsystem::QueueGameStartedOnce()
+void URavensightSubsystem::QueueGameStartedOnce(bool bAtFront)
 {
 	if (!bTrackLifecycleEvents || !Queue.IsActive() || bStoppedForRun)
 	{
@@ -256,7 +259,21 @@ void URavensightSubsystem::QueueGameStartedOnce()
 		return;
 	}
 
-	TrackEvent(TEXT("game_started"), TMap<FString, FString>());
+	EnqueueEvent(TEXT("game_started"), FString(), bAtFront);
+}
+
+FRavensightGate URavensightSubsystem::CurrentGate(bool bExplicitAttempt) const
+{
+	FRavensightGateInput Input;
+	Input.bInitialized = bInitialized;
+	Input.bEnabled = Queue.IsEnabled();
+	Input.bPlayerOptedIn = Queue.IsLocallyEnabled();
+	Input.bPlaytest = IsPlaytest();
+	Input.bPlaytestMissingRunId = IsPlaytest() && PlaytestRunId.IsEmpty();
+	Input.bStoppedForRun = bStoppedForRun || !Queue.IsServerTrackingEnabled();
+	Input.bKeyRefused = bKeyRefused;
+	Input.bExplicitAttempt = bExplicitAttempt;
+	return RavensightProtocol::DecideGate(Input);
 }
 
 void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
@@ -281,6 +298,7 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 	if (!bEnabled)
 	{
 		Log(TEXT("tracking opted out, queue discarded"));
+		BumpQueueGeneration();
 		StopTimers();
 		bStarted = false;
 		SetStatusReason(RavensightReason::Disabled);
@@ -324,6 +342,7 @@ void URavensightSubsystem::SetEnabled(bool bInEnabled)
 	if (!bInEnabled)
 	{
 		Log(TEXT("disabled by the game, queue discarded"));
+		BumpQueueGeneration();
 		StopTimers();
 		bStarted = false;
 		SetStatusReason(RavensightReason::Disabled);
@@ -344,7 +363,9 @@ FString URavensightSubsystem::ResetDeviceId()
 
 	DeviceId = GenerateDeviceId();
 
-	// Nothing recorded under the old identity is sent under the new one.
+	// Nothing recorded under the old identity is sent under the new one, and
+	// a session or batch answer for the old identity is ignored.
+	BumpQueueGeneration();
 	Queue.Clear();
 	Queue.InvalidateSession();
 
@@ -423,6 +444,7 @@ void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Sour
 	}
 
 	bStoppedForRun = true;
+	BumpQueueGeneration();
 	Queue.SetServerTrackingEnabled(false);
 	StopTimers();
 	SetStatusReason(Reason);
@@ -459,6 +481,11 @@ void URavensightSubsystem::TrackEvent(const FString& EventName, const TMap<FStri
 }
 
 void URavensightSubsystem::TrackEventJson(const FString& EventName, const FString& JsonData)
+{
+	EnqueueEvent(EventName, JsonData, false);
+}
+
+void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront)
 {
 	if (EventName.IsEmpty())
 	{
@@ -501,7 +528,8 @@ void URavensightSubsystem::TrackEventJson(const FString& EventName, const FStrin
 	DataJson = Parsed.IsValid() ? WriteJson(Parsed.ToSharedRef()) : FString(TEXT("{}"));
 
 	const int64 Timestamp = FDateTime::UtcNow().ToUnixTimestamp();
-	const int32 Dropped = Queue.Enqueue(FRavensightEvent(EventName, DataJson, Timestamp));
+	const FRavensightEvent Event(EventName, DataJson, Timestamp);
+	const int32 Dropped = bAtFront ? Queue.EnqueueAtFront(Event) : Queue.Enqueue(Event);
 	if (Dropped > 0)
 	{
 		UE_LOG(LogRavensight, Warning,
@@ -533,7 +561,7 @@ void URavensightSubsystem::FlushInternal(bool bForce, bool bExplicit)
 		return;
 	}
 
-	if (bKeyRefused && !bExplicit)
+	if (!CurrentGate(bExplicit).bAllowBatch)
 	{
 		return;
 	}
@@ -585,7 +613,7 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-Session-Token"), Queue.GetSessionToken());
 	Request->SetContentAsString(WriteJson(Body));
-	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleBatchResponse, Batch.Num());
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleBatchResponse, Batch.Num(), QueueGeneration);
 
 	if (!Request->ProcessRequest())
 	{
@@ -596,11 +624,13 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 	}
 }
 
-void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize)
+void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation)
 {
 	Queue.EndFlush();
 
-	if (bStoppedForRun)
+	// The queue this batch came from was thrown away while it was in flight:
+	// removing BatchSize events now would remove the wrong ones.
+	if (bStoppedForRun || Generation != QueueGeneration)
 	{
 		return;
 	}
@@ -626,6 +656,7 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 		Queue.OnBatchAccepted(BatchSize);
 		BatchLimit = RavensightLimits::MaxBatchSize;
 		ConsecutiveBatchUnauthorized = 0;
+		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		Log(FString::Printf(TEXT("sent %d events, %d still queued"), BatchSize, Queue.Num()));
 		OnEventsFlushed.Broadcast(BatchSize);
 
@@ -682,10 +713,7 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 
 	case ERavensightResponseAction::WaitRetryAfter:
 		Queue.OnRateLimited(Now, ParseRetryAfterSeconds(Response));
-		if (!Verdict.Reason.IsEmpty())
-		{
-			SetStatusReason(Verdict.Reason);
-		}
+		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		UE_LOG(LogRavensight, Warning, TEXT("track/batch refused for now (%s), retrying in %.0fs"),
 			*FailReason, Queue.SecondsUntilNextAttempt(Now));
 		OnFlushFailed.Broadcast(FailReason);
@@ -701,6 +729,7 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 		}
 		Log(FString::Printf(TEXT("batch flush failed (HTTP %d), will retry"), Code));
 		Queue.OnTransportFailure(Now);
+		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		OnFlushFailed.Broadcast(FailReason);
 		ScheduleRetry();
 		return;
@@ -711,7 +740,7 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 
 void URavensightSubsystem::CheckServerSettings()
 {
-	if (!bInitialized || bStoppedForRun || bSettingsRequestPending || bKeyRefused || !Queue.IsActive())
+	if (bSettingsRequestPending || !CurrentGate().bAllowSettings)
 	{
 		return;
 	}
@@ -782,10 +811,20 @@ void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttp
 		StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
 		return;
 
+	case ERavensightResponseAction::WaitRetryAfter:
+		// A 429, or a 503 with Retry-After: assume on, but nothing more goes
+		// out until the server's wait has passed.
+		Queue.OnRateLimited(NowSeconds(), ParseRetryAfterSeconds(Response));
+		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
+		UE_LOG(LogRavensight, Warning, TEXT("settings check refused for now, assuming tracking is enabled and waiting %.0fs"),
+			Queue.SecondsUntilNextAttempt(NowSeconds()));
+		ScheduleRetry();
+		break;
+
 	default:
-		// Offline, rate limited or a server error. An unreachable settings
-		// endpoint must not silently stop analytics, so assume on; the
-		// session request that follows backs off on its own.
+		// Offline or a server error. An unreachable settings endpoint must
+		// not silently stop analytics, so assume on; the session request that
+		// follows backs off on its own.
 		UE_LOG(LogRavensight, Warning, TEXT("could not read settings, assuming tracking is enabled"));
 		break;
 	}
@@ -810,12 +849,7 @@ void URavensightSubsystem::AfterSettingsChecked()
 
 void URavensightSubsystem::EnsureSession(bool bExplicit)
 {
-	if (!bInitialized || bStoppedForRun || bSessionRequestPending || !bSettingsChecked || !Queue.IsActive())
-	{
-		return;
-	}
-
-	if (bKeyRefused && !bExplicit)
+	if (bSessionRequestPending || !bSettingsChecked || !CurrentGate(bExplicit).bAllowSession)
 	{
 		return;
 	}
@@ -836,7 +870,7 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->SetContentAsString(WriteJson(Body));
-	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse);
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration);
 
 	if (!Request->ProcessRequest())
 	{
@@ -849,11 +883,13 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	}
 }
 
-void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)
+void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation)
 {
 	bSessionRequestPending = false;
 
-	if (bStoppedForRun || !Queue.IsActive())
+	// A session opened for a queue (or a device id) that has since been
+	// thrown away is not adopted. The next flush opens a fresh one.
+	if (bStoppedForRun || !Queue.IsActive() || Generation != QueueGeneration)
 	{
 		return;
 	}
@@ -896,7 +932,13 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			}
 
 			Queue.SetSession(Token, ExpiresAt);
-			Queue.ResetBackoff();
+
+			// After batch 401s past the re open cap the ladder keeps climbing:
+			// only a 202 resets it then.
+			if (ConsecutiveBatchUnauthorized == 0)
+			{
+				Queue.ResetBackoff();
+			}
 			SetStatusReason(FString());
 
 			Log(TEXT("session ready"));
@@ -930,7 +972,7 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 
 	case ERavensightResponseAction::WaitRetryAfter:
 		Queue.OnRateLimited(Now, ParseRetryAfterSeconds(Response));
-		SetStatusReason(Verdict.Reason);
+		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		UE_LOG(LogRavensight, Warning, TEXT("session creation refused for now (%s), retrying in %.0fs"),
 			*FailReason, Queue.SecondsUntilNextAttempt(Now));
 		OnSessionFailed.Broadcast(FailReason);
@@ -940,7 +982,7 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 	default:
 		Log(FString::Printf(TEXT("session creation failed (HTTP %d), will retry"), Code));
 		Queue.OnTransportFailure(Now);
-		SetStatusReason(Verdict.Reason.IsEmpty() ? FString(RavensightReason::SessionFailed) : Verdict.Reason);
+		SetStatusReason(RavensightProtocol::NextStatusReason(RavensightReason::SessionFailed, Verdict));
 		OnSessionFailed.Broadcast(FailReason);
 		ScheduleRetry();
 		return;
@@ -964,15 +1006,10 @@ void URavensightSubsystem::SubmitFeedback(const FString& Message, const FString&
 		return;
 	}
 
-	if (!bInitialized || !Queue.IsActive() || bStoppedForRun)
+	// Not active, including a refused key: refused locally with "disabled".
+	if (!CurrentGate().bAllowFeedback)
 	{
 		OnFeedbackResult.Broadcast(false, RavensightReason::Disabled);
-		return;
-	}
-
-	if (bKeyRefused)
-	{
-		OnFeedbackResult.Broadcast(false, RavensightReason::InvalidKey);
 		return;
 	}
 
@@ -1061,7 +1098,7 @@ void URavensightSubsystem::FetchSuggestions()
 {
 	// While tracking is off nothing touches the network: same callback, an
 	// empty list, no request.
-	if (!bInitialized || !Queue.IsActive() || bStoppedForRun || bKeyRefused)
+	if (!CurrentGate().bAllowSuggestions)
 	{
 		OnSuggestionsReceived.Broadcast(false, TArray<FString>());
 		return;
@@ -1311,7 +1348,11 @@ void URavensightSubsystem::OnApplicationEnteredForeground()
 
 	if (IsMobilePlatform())
 	{
-		DeleteBackgroundMarker();
+		// A Playtest run and an opted out player never touch the marker.
+		if (!IsPlaytest() && Queue.IsLocallyEnabled())
+		{
+			DeleteBackgroundMarker();
+		}
 
 		const double BackgroundedAt = BackgroundedAtSeconds;
 		BackgroundedAtSeconds = 0.0;
@@ -1355,7 +1396,7 @@ void URavensightSubsystem::WriteBackgroundMarker()
 {
 	// A Playtest run persists nothing. Without a session there is nothing
 	// the next launch could report.
-	if (!GConfig || IsPlaytest() || BackgroundedAtSeconds <= 0.0)
+	if (!GConfig || IsPlaytest() || !Queue.IsLocallyEnabled() || BackgroundedAtSeconds <= 0.0)
 	{
 		return;
 	}
@@ -1394,7 +1435,8 @@ void URavensightSubsystem::DeleteBackgroundMarker()
 
 void URavensightSubsystem::ReportMarkerExitFromLastRun()
 {
-	if (!IsMobilePlatform() || IsPlaytest() || !GConfig)
+	// A Playtest run and an opted out player never read or delete the marker.
+	if (!IsMobilePlatform() || IsPlaytest() || !Queue.IsLocallyEnabled() || !GConfig)
 	{
 		return;
 	}
@@ -1455,8 +1497,9 @@ void URavensightSubsystem::PumpUntilIdle(double BudgetSeconds)
 	FHttpManager& HttpManager = FHttpModule::Get().GetHttpManager();
 
 	// Completion delegates run from the HTTP manager's tick, so tick it by
-	// hand while the session and batch requests settle, never past the budget.
-	while ((Queue.IsFlushInProgress() || bSessionRequestPending)
+	// hand while the settings, session and batch requests settle, never past
+	// the budget.
+	while ((Queue.IsFlushInProgress() || bSessionRequestPending || bSettingsRequestPending)
 		&& (FPlatformTime::Seconds() - StartedAt) < BudgetSeconds)
 	{
 		HttpManager.Tick(0.0f);

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <functional>
 #include <initializer_list>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -146,6 +147,7 @@ public:
 	int32 Num() const { return static_cast<int32>(Items.size()); }
 	bool IsEmpty() const { return Items.empty(); }
 	void Add(const T& Item) { Items.push_back(Item); }
+	void Insert(const T& Item, int32 Index) { Items.insert(Items.begin() + Index, Item); }
 	void Reserve(int32 Count) { Items.reserve(static_cast<size_t>(Count)); }
 	void Reset() { Items.clear(); }
 
@@ -175,4 +177,19 @@ public:
 
 private:
 	std::vector<T> Items;
+};
+
+template <typename K, typename V>
+class TMap
+{
+public:
+	void Add(const K& Key, const V& Value) { Items[Key.Str()] = Value; }
+	V FindRef(const K& Key) const
+	{
+		const auto Found = Items.find(Key.Str());
+		return Found == Items.end() ? V() : Found->second;
+	}
+
+private:
+	std::map<std::string, V> Items;
 };
