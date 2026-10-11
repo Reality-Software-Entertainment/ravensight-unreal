@@ -32,7 +32,9 @@ public class Ravensight : ModuleRules
 			}
 		);
 
-		if (Target.Platform == UnrealTargetPlatform.IOS)
+		// The IOS platform group, so the iOS file and UIKit go together on
+		// tvOS and visionOS as well.
+		if (Target.IsInPlatformGroup(UnrealPlatformGroup.IOS))
 		{
 			// Private/IOS/RavensightIOSBackgroundTask.mm wraps the background
 			// flush in a UIKit background task. UnrealBuildTool compiles a

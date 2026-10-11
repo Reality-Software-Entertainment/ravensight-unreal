@@ -26,6 +26,8 @@ namespace RavensightTransport
 	/** Starts the request through the installed sender, or ProcessRequest when none is installed. */
 	bool Send(const FHttpRequestRef& Request);
 
-	/** For the automation specs. An empty sender restores the real one. Game thread only. */
+#if WITH_DEV_AUTOMATION_TESTS
+	/** For the automation specs. An empty sender restores the real one. Game thread only. Absent from Shipping. */
 	void SetSenderForTests(FSender InSender);
+#endif
 }

@@ -50,11 +50,14 @@ void RavensightBackgroundTask::Begin()
 
 	__block UIBackgroundTaskIdentifier Task = UIBackgroundTaskInvalid;
 	Task = [Application beginBackgroundTaskWithName:@"RavensightFlush" expirationHandler:^{
-		// Out of time. iOS requires the task to be ended here, whether or not
-		// the flush finished; the background marker still reports the exit on
-		// the next launch.
-		ReleaseTask(Task);
-		[Application endBackgroundTask:Task];
+		// Out of time. iOS requires the task to be ended, whether or not the
+		// flush finished; the background marker still reports the exit on
+		// the next launch. Only the caller that releases the task ends it, so
+		// it is never ended twice.
+		if (ReleaseTask(Task))
+		{
+			[Application endBackgroundTask:Task];
+		}
 	}];
 
 	if (Task == UIBackgroundTaskInvalid)

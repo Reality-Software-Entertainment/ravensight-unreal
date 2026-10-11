@@ -24,7 +24,9 @@ bool RavensightTransport::Send(const FHttpRequestRef& Request)
 	return Sender ? Sender(Request) : Request->ProcessRequest();
 }
 
+#if WITH_DEV_AUTOMATION_TESTS
 void RavensightTransport::SetSenderForTests(FSender InSender)
 {
 	InstalledSender() = MoveTemp(InSender);
 }
+#endif

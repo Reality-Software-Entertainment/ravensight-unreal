@@ -40,7 +40,7 @@ Xcode 27.0 on an Apple silicon Mac:
 * **Automation specs in the editor**, headless (`UnrealEditor-Cmd` with
   `-nullrhi`): 78 tests, 78 passed, 0 failed, 0 not run. That is
   `Ravensight.Queue` (24), `Ravensight.Protocol` (42) and the new
-  `Ravensight.Subsystem` (12). One passing test carried an engine warning
+  `Ravensight.Subsystem` (12). A passing test can carry an engine warning
   unrelated to the plugin (the editor's iOS device probe could not start).
 * **Host check.** `bash Tools/host-check/run.sh`: the queue and protocol specs
   on a plain C++17 compiler, 66 cases, 0 failed.
@@ -552,8 +552,9 @@ And the toggle behind "turn this off" is the `SetTrackingEnabled` and
 The plugin is plain HTTPS over the engine's own HTTP module, so it works
 wherever your project ships: Windows, macOS, Linux, iOS, Android and console.
 Console networking still has to pass platform certification, which is the
-developer's responsibility as it would be for any online feature. So far it has been built and tested in the editor on
-macOS only; see [Verification status](#verification-status).
+developer's responsibility as it would be for any online feature. So far it
+has been built and spec tested on macOS only (Unreal Engine 5.8.3); see
+[Verification status](#verification-status).
 
 ## Other SDKs
 
