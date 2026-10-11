@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 2,
-	"VersionName": "0.2.0",
+	"Version": 3,
+	"VersionName": "0.2.1",
 	"FriendlyName": "Ravensight",
 	"Description": "Player analytics for Unreal Engine 5. Sessions, batched events, an offline queue, rate limit handling and a server side kill switch, with Blueprint support.",
 	"Category": "Analytics",

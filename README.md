@@ -8,42 +8,72 @@ side kill switch, in one game instance subsystem with no third party
 dependencies. Everything is exposed to Blueprint, so a designer can ship it
 without writing C++.
 
-> **Not yet compiled by its maintainers.** Version 0.2.0 of this plugin has
-> never been built by UnrealBuildTool or run in the Unreal editor, because the
-> machine it is written on has no Unreal toolchain. Expect a compile error or
-> two on first build. What has been run is listed under
-> [Verification status](#verification-status).
+> **Beta.** Version 0.2.1 compiles in Unreal Engine 5.8.3 on macOS and its
+> automation specs pass in the editor. It has not yet run in a packaged game,
+> on an iOS or Android device, or on any other engine version. What has been
+> run is listed under [Verification status](#verification-status).
 
 * API base: `https://api.ravensight.io` (the plugin appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
 * Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`SetTrackingEnabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
-* Unreal Engine 5.1 or newer
+* Unreal Engine 5.1 or newer by design; so far built and tested on 5.8.3 only
 
 ## Verification status
 
-**Beta. Engine-free logic checked on a host compiler; the plugin itself is not
-yet compiled or run in Unreal.**
+**Beta. Compiled and spec tested in Unreal Engine 5.8.3 on macOS; not yet run
+in a packaged game or on a device.**
 
-Every queue, batching, retry and response decision lives in two plain C++
-pieces with no UObject, no HTTP and no engine tick: `FRavensightQueue` and the
-response table in `RavensightProtocol`. Both have automation specs.
+What was run, on 2026-10-10, with Unreal Engine 5.8.3 (installed build) and
+Xcode 27.0 on an Apple silicon Mac:
 
-What was run, on 2026-10-10: `bash Tools/host-check/run.sh`, which compiles
-`RavensightQueue.cpp`, `RavensightProtocol.cpp` and both `.spec.cpp` files
-unchanged with Apple clang 21.0.0 (`-std=c++17 -Wall -Wextra -Wshadow -Werror`)
-against small stand-in headers for the few engine types they use, and runs
-the specs: 66 cases, 0 failed. That checks the logic, not Unreal.
+* **Editor build.** UnrealHeaderTool and UnrealBuildTool built the plugin into
+  a small C++ host project's `HostGameEditor` target (Mac, Development) with
+  warnings treated as errors and shadowed variables as errors. No warnings.
+  The 0.2.0 source compiled unchanged; nothing needed a fix.
+* **Mac game target.** The same host project's `HostGame` target compiled and
+  linked in Development and Shipping. The step after the link, where Xcode
+  wraps the binary in a `.app`, failed on this machine in an Xcode scheme
+  script ("Touch UBT generated tiles") that belongs to the engine's generated
+  project, not to the plugin. So no `.app` was produced or launched.
+* **`RunUAT.sh BuildPlugin -TargetPlatforms=Mac`.** Succeeded: the plugin
+  built for `UnrealEditor` and `UnrealGame`, arm64 and x64.
+* **Automation specs in the editor**, headless (`UnrealEditor-Cmd` with
+  `-nullrhi`): 78 tests, 78 passed, 0 failed, 0 not run. That is
+  `Ravensight.Queue` (24), `Ravensight.Protocol` (42) and the new
+  `Ravensight.Subsystem` (12). One passing test carried an engine warning
+  unrelated to the plugin (the editor's iOS device probe could not start).
+* **Host check.** `bash Tools/host-check/run.sh`: the queue and protocol specs
+  on a plain C++17 compiler, 66 cases, 0 failed.
 
-What has **not** been run: UnrealHeaderTool, UnrealBuildTool, the automation
-specs inside the editor, and anything in `URavensightSubsystem` (HTTP, timers,
-config, application lifecycle). None of that is verified yet.
+`Ravensight.Subsystem` drives a real `URavensightSubsystem` in a real game
+instance, with every HTTP request recorded instead of sent. It covers: a
+start with the Enabled setting off makes no request of any kind; a saved
+opt-out carries into a new subsystem instance, which makes no request;
+suggestions and feedback while tracking is off answer at once and send
+nothing; the Playtest token goes out in `X-Ravensight-Playtest` on the
+settings, session and batch requests; `ResetDeviceId` saves a new id,
+empties the queue, ignores a late answer for the old session and opens the
+next session under the new id.
 
-Known gap: on iOS the flush on entering the background is not wrapped in a
-background task (`beginBackgroundTaskWithExpirationHandler`), so iOS may
-suspend the app before that last batch is sent. The background marker still
-lets the next launch report the session's exit. Adding the task needs an
-Objective-C++ file that we will write once it can be compiled and tried on a
-device.
+What has **not** been run: a packaged game; any iOS or Android build or
+device; Windows or Linux; any engine version other than 5.8.3. The
+`Ravensight.Subsystem` spec implements the engine's `IHttpResponse` for its
+fake answers, and that interface changes between versions, so that one spec
+compiles only on 5.8 or newer; the other two have no such limit.
+
+iOS background flush: on entering the background the flush now runs inside a
+UIKit background task (`beginBackgroundTaskWithName:expirationHandler:`),
+ended once no settings, session or batch request is in flight, on return to
+the foreground, on quit, or by iOS's own expiration handler. It lives in
+`Source/Ravensight/Private/IOS/RavensightIOSBackgroundTask.mm`, which
+UnrealBuildTool compiles only for iOS. The iOS target platform was not
+installed on the build machine, so that file has **not** been compiled by
+UnrealBuildTool or run on a device. It was only syntax checked with Xcode's
+clang against the iPhoneOS 27.0 SDK, with stand-in headers for the two
+engine types it uses. It compiles for real once the iOS target is installed
+(`-TargetPlatforms=Mac+IOS`). Until it has run on a device, treat it as
+unverified; the background marker still lets the next launch report the
+session's exit either way.
 
 Read `Tools/README.md` before you build. It lists the exact commands to compile
 check the plugin and run the specs, and the specific lines most likely to need
@@ -80,8 +110,8 @@ git submodule add https://github.com/Reality-Software-Entertainment/ravensight-u
 git submodule update --init --recursive
 ```
 
-Pin a release with `cd Plugins/Ravensight && git checkout v0.2.0` once that
-tag exists.
+Pin a release with `cd Plugins/Ravensight && git checkout <tag>`, for
+example `v0.2.0`.
 
 ### Blueprint only projects
 
@@ -384,10 +414,16 @@ Source/Ravensight/
     RavensightProtocol.cpp
     RavensightSettings.cpp
     RavensightSubsystem.cpp  HTTP, timers, JSON, config, application lifecycle
+    RavensightTransport.*    where requests are created and sent; the specs record them here
+    RavensightBackgroundTask.h  iOS background task for the background flush, no-op elsewhere
     RavensightModule.cpp
+    IOS/
+      RavensightIOSBackgroundTask.mm  compiled for iOS only
     Tests/
       RavensightQueue.spec.cpp
       RavensightProtocol.spec.cpp
+      RavensightSubsystem.spec.cpp
+      RavensightSpecListener.h
 Tools/
   host-check/                runs both specs on a plain C++17 compiler
 ```
@@ -410,8 +446,10 @@ do at every branch.
 
 ## Running the tests
 
-There are two automation specs, `Ravensight.Queue` and `Ravensight.Protocol`,
-under `Source/Ravensight/Private/Tests/`.
+There are three automation specs under `Source/Ravensight/Private/Tests/`:
+`Ravensight.Queue`, `Ravensight.Protocol`, and `Ravensight.Subsystem` (5.8 or
+newer), which runs the real subsystem with its HTTP requests recorded
+instead of sent.
 
 Editor: **Tools > Session Frontend > Automation**, filter for `Ravensight`.
 
@@ -420,10 +458,11 @@ Headless:
 ```bash
 UnrealEditor-Cmd YourProject.uproject \
   -ExecCmds="Automation RunTests Ravensight; Quit" \
-  -unattended -nopause -nullrhi -testexit="Automation Test Queue Empty"
+  -unattended -nopause -nullrhi -testexit="Automation Test Queue Empty" \
+  -ReportExportPath="$PWD/AutomationReport"
 ```
 
-Neither has been run inside Unreal yet.
+On Unreal Engine 5.8.3 on macOS: 78 tests, 78 passed.
 
 Without the engine, on any machine with a C++17 compiler:
 
@@ -431,7 +470,7 @@ Without the engine, on any machine with a C++17 compiler:
 bash Tools/host-check/run.sh
 ```
 
-That builds the queue, the protocol table and both specs against stand-in
+That builds the queue, the protocol table and their two specs against stand-in
 headers and runs them. It checks the engine-free logic only; it is not an
 Unreal build. See `Tools/README.md` for compile checking with the engine.
 
@@ -513,7 +552,8 @@ And the toggle behind "turn this off" is the `SetTrackingEnabled` and
 The plugin is plain HTTPS over the engine's own HTTP module, so it works
 wherever your project ships: Windows, macOS, Linux, iOS, Android and console.
 Console networking still has to pass platform certification, which is the
-developer's responsibility as it would be for any online feature.
+developer's responsibility as it would be for any online feature. So far it has been built and tested in the editor on
+macOS only; see [Verification status](#verification-status).
 
 ## Other SDKs
 

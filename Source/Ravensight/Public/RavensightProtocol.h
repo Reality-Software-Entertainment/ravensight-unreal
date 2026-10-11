@@ -16,7 +16,7 @@
 namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
-	inline constexpr const TCHAR* Sdk = TEXT("0.2.0");
+	inline constexpr const TCHAR* Sdk = TEXT("0.2.1");
 }
 
 /**

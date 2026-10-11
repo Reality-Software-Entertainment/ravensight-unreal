@@ -1,8 +1,8 @@
 # Compile checking this plugin
 
-The plugin was authored on a machine with no Unreal toolchain installed, so it
-has never been through UnrealBuildTool. This file is what to run first, and what
-to look at when something does not build.
+The plugin was written without an Unreal toolchain and first compiled for
+0.2.1, on Unreal Engine 5.8.3 on macOS. This file is what to run first, and
+what to look at when something does not build on another version.
 
 There is no `compile-check.sh` for the plugin as a whole on purpose. Unreal C++
 cannot be compiled outside the engine: the subsystem and settings headers
@@ -19,7 +19,7 @@ Put the plugin in a project's `Plugins` folder, then:
 
 ```bash
 # macOS
-/Users/Shared/Epic\ Games/UE_5.4/Engine/Build/BatchFiles/Mac/Build.sh \
+/Users/Shared/Epic\ Games/UE_5.8/Engine/Build/BatchFiles/Mac/Build.sh \
   YourProjectEditor Mac Development -project="$PWD/YourProject.uproject" -waitmutex
 
 # Linux
@@ -48,21 +48,26 @@ To produce a redistributable build and catch anything project specific:
   -TargetPlatforms=Mac+IOS+Android
 ```
 
+Each platform in `-TargetPlatforms` must be installed in the engine. Without
+the iOS target, use `-TargetPlatforms=Mac`; `Private/IOS/` is then skipped.
+
 ## Running the specs
 
-`Source/Ravensight/Private/Tests/RavensightQueue.spec.cpp` covers the queue
-state machine and `RavensightProtocol.spec.cpp` covers the response table,
+`Source/Ravensight/Private/Tests/RavensightSubsystem.spec.cpp` runs the real
+subsystem in a game instance with requests recorded by the transport seam in
+`RavensightTransport.h` (Unreal Engine 5.8 or newer).
+`RavensightQueue.spec.cpp` covers the queue state machine and `RavensightProtocol.spec.cpp` covers the response table,
 `ApiUrl` forms, feedback validation, the lifecycle once-guards, the mobile 30
-minute rule, the Playtest sources and a fake transport over the queue. Neither
-needs a network, a clock or a world.
+minute rule, the Playtest sources and a fake transport over the queue. None
+needs a network.
 
 ```bash
 UnrealEditor-Cmd YourProject.uproject \
   -ExecCmds="Automation RunTests Ravensight; Quit" \
-  -unattended -nopause -nullrhi
+  -unattended -nopause -nullrhi -ReportExportPath="$PWD/AutomationReport"
 ```
 
-Both specs are wrapped in `#if WITH_DEV_AUTOMATION_TESTS`, so they compile out
+`AutomationReport/index.json` has the counts. All specs are wrapped in `#if WITH_DEV_AUTOMATION_TESTS`, so they compile out
 of a shipping build entirely.
 
 ## Host check
@@ -99,6 +104,31 @@ engine API moved between 5.x releases.
 | `RavensightSubsystem.cpp` | `GConfig->SetBool` / `GetBool` / `SetString` / `GetString` / `Flush` against `GGameUserSettingsIni`, for the saved opt-out and the mobile background marker. |
 | `RavensightProtocol.cpp` | `TArray::ContainsByPredicate` with `FString::Equals(..., ESearchCase::CaseSensitive)`. |
 | `Ravensight.Build.cs` | The `HTTP` module is spelled in caps. `Http` also resolves on some versions but caps is the safe form. |
+
+## What was verified in Unreal
+
+For 0.2.1, on 2026-10-10, with Unreal Engine 5.8.3 and Xcode 27.0 on an
+Apple silicon Mac, in a scratch C++ host project with the plugin under
+`Plugins/`:
+
+* `Build.sh HostGameEditor Mac Development` with `bWarningsAsErrors` and
+  shadowed variables as errors (`bOverrideBuildEnvironment`, since an
+  installed engine refuses changed warning levels otherwise): no warnings,
+  no errors. No line in the table below needed a change on 5.8.3.
+* `Build.sh HostGame Mac Development` and `Shipping`: compiled and linked.
+  Xcode's `.app` finalization step then failed in the generated scheme's
+  "Touch UBT generated tiles" script, an engine and Xcode 27 matter, so no
+  `.app` was launched.
+* `RunUAT.sh BuildPlugin -TargetPlatforms=Mac`: succeeded, editor and game,
+  arm64 and x64.
+* `UnrealEditor-Cmd HostGame.uproject -ExecCmds="Automation RunTests
+  Ravensight; Quit" -unattended -nopause -nullrhi`: 78 tests, 78 passed.
+* The editor needs Xcode's Metal toolchain to start
+  (`xcodebuild -downloadComponent MetalToolchain` if
+  `xcrun -sdk macosx metal --version` fails).
+* `Private/IOS/RavensightIOSBackgroundTask.mm` was not built: the iOS target
+  platform was not installed. It was syntax checked with
+  `xcrun -sdk iphoneos clang++ -fsyntax-only` against stand-in headers.
 
 ## What was verified without a toolchain
 

@@ -2,6 +2,45 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.2.1] - 2026-10-10
+
+First release compiled in Unreal. Still a beta: not yet run in a packaged
+game or on a device (see the README's verification status).
+
+### Verified
+
+* Unreal Engine 5.8.3 on macOS (Xcode 27.0): the editor target builds with
+  warnings and shadowed variables as errors, with no warnings. The 0.2.0
+  source needed no compile fix.
+* The Mac game target compiles and links in Development and Shipping, and
+  `RunUAT.sh BuildPlugin -TargetPlatforms=Mac` succeeds for the editor and
+  the game, arm64 and x64.
+* The automation specs run headless in the editor: 78 tests, 78 passed.
+
+### Added
+
+* `Ravensight.Subsystem`, an automation spec over the real subsystem in a
+  real game instance, with every HTTP request recorded instead of sent: a
+  start with Enabled off makes no request, a saved opt-out carries into a new
+  subsystem instance, suggestions and feedback while tracking is off send
+  nothing, the Playtest header is on every request, and `ResetDeviceId`
+  drops the old identity and session. Needs Unreal Engine 5.8 or newer.
+* An internal transport seam (`RavensightTransport`), where every request is
+  created and sent. By default it is the engine's HTTP module, unchanged.
+* iOS: the flush on entering the background runs inside a UIKit background
+  task, ended once nothing is in flight, on return to the foreground, on
+  quit, or by iOS when time runs out. The Objective-C++ file
+  (`Private/IOS/RavensightIOSBackgroundTask.mm`) compiles for iOS only and
+  has not yet been built by UnrealBuildTool or run on a device: the iOS
+  target platform was not installed on the build machine.
+
+### Known limitations
+
+* Not yet run in a packaged game, on iOS or Android, on Windows or Linux, or
+  on any engine version other than 5.8.3.
+* The iOS background task is unverified until it is built for iOS and run on
+  a device.
+
 ## [0.2.0] - 2026-10-10
 
 Brings the plugin to the contract every Ravensight SDK now shares. Still a
