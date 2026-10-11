@@ -48,7 +48,32 @@ void FRavensightQueue::Clear()
 	Events.Reset();
 }
 
+int32 FRavensightQueue::DropHead(int32 Count)
+{
+	const int32 ToDrop = FMath::Clamp(Count, 0, Events.Num());
+	if (ToDrop > 0)
+	{
+		Events.RemoveAt(0, ToDrop);
+		DroppedCount += ToDrop;
+	}
+	return ToDrop;
+}
+
 // --- Enablement -------------------------------------------------------------
+
+void FRavensightQueue::SetEnabled(bool bInEnabled)
+{
+	if (bInEnabled == bEnabled)
+	{
+		return;
+	}
+
+	bEnabled = bInEnabled;
+	if (!bInEnabled)
+	{
+		Clear();
+	}
+}
 
 void FRavensightQueue::SetServerTrackingEnabled(bool bEnabled)
 {
@@ -102,7 +127,7 @@ bool FRavensightQueue::IsSessionValid(double NowSeconds) const
 
 // --- Flush lifecycle --------------------------------------------------------
 
-FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce)
+FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce, int32 MaxCount)
 {
 	FRavensightFlushPlan Plan;
 
@@ -138,7 +163,8 @@ FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce
 		return Plan;
 	}
 
-	const int32 BatchSize = FMath::Min(RavensightLimits::MaxBatchSize, Events.Num());
+	const int32 Limit = FMath::Clamp(MaxCount, 1, RavensightLimits::MaxBatchSize);
+	const int32 BatchSize = FMath::Min(Limit, Events.Num());
 	Plan.Batch.Reserve(BatchSize);
 	for (int32 Index = 0; Index < BatchSize; ++Index)
 	{

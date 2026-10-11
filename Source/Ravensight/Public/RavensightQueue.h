@@ -76,7 +76,7 @@ enum class ERavensightFlushDecision : uint8
 	/** Events are waiting but there is no valid session token yet. */
 	NeedsSession,
 
-	/** Tracking is off, either by the server kill switch or a local opt out. */
+	/** Tracking is off: the Enabled setting, the server kill switch or a local opt out. */
 	Disabled,
 };
 
@@ -132,6 +132,13 @@ public:
 	/** Discards everything queued and counts it as dropped. */
 	void Clear();
 
+	/**
+	 * Removes up to Count events from the front of the queue and counts them
+	 * as dropped. Used for a single event the server answered 400, which would
+	 * otherwise block everything behind it. Returns how many went.
+	 */
+	int32 DropHead(int32 Count);
+
 	// --- Enablement --------------------------------------------------------
 
 	/** The server side kill switch from GET /settings. Disabling discards the queue. */
@@ -142,8 +149,15 @@ public:
 	void SetLocallyEnabled(bool bEnabled);
 	bool IsLocallyEnabled() const { return bLocallyEnabled; }
 
-	/** True only when both the server and the local toggle allow tracking. */
-	bool IsActive() const { return bServerTrackingEnabled && bLocallyEnabled; }
+	/**
+	 * The developer's Enabled setting, never persisted. Disabling discards the
+	 * queue. Separate from the player's opt out so neither can undo the other.
+	 */
+	void SetEnabled(bool bInEnabled);
+	bool IsEnabled() const { return bEnabled; }
+
+	/** True only when the Enabled setting, the server and the local toggle all allow tracking. */
+	bool IsActive() const { return bEnabled && bServerTrackingEnabled && bLocallyEnabled; }
 
 	// --- Session -----------------------------------------------------------
 
@@ -163,8 +177,11 @@ public:
 	 *
 	 * bForce ignores the retry window, for a flush on shutdown or a manual
 	 * Flush() call. It never ignores the session or the kill switch.
+	 *
+	 * MaxCount caps the batch below MaxBatchSize, for retrying a batch the
+	 * server answered 400 at half its size. Values below 1 are treated as 1.
 	 */
-	FRavensightFlushPlan BeginFlush(double NowSeconds, bool bForce);
+	FRavensightFlushPlan BeginFlush(double NowSeconds, bool bForce, int32 MaxCount = RavensightLimits::MaxBatchSize);
 
 	/** Clears the in flight marker. Safe to call even if no flush was started. */
 	void EndFlush();
@@ -223,6 +240,7 @@ private:
 	TArray<FRavensightEvent> Events;
 	int32 MaxQueueSize = RavensightLimits::DefaultQueueCap;
 
+	bool bEnabled = true;
 	bool bServerTrackingEnabled = true;
 	bool bLocallyEnabled = true;
 	bool bFlushInProgress = false;
