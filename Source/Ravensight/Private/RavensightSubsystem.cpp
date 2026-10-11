@@ -7,12 +7,18 @@
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "HAL/PlatformMisc.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
+#include "HttpManager.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/CoreDelegates.h"
 #include "Misc/Guid.h"
+#include "Misc/Parse.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "RavensightSettings.h"
 #include "Serialization/JsonReader.h"
@@ -24,12 +30,21 @@ DEFINE_LOG_CATEGORY(LogRavensight);
 
 namespace
 {
-	/** Where the generated device id is persisted between runs. */
-	const TCHAR* const DeviceIdSection = TEXT("Ravensight");
+	/** Everything the plugin keeps between runs lives under this section of GameUserSettings.ini. */
+	const TCHAR* const SaveSection = TEXT("Ravensight");
 	const TCHAR* const DeviceIdKey = TEXT("DeviceId");
+	const TCHAR* const TrackingEnabledKey = TEXT("TrackingEnabled");
+
+	/** iOS and Android background marker, so a swipe killed app can report its exit next launch. */
+	const TCHAR* const MarkerTokenKey = TEXT("BackgroundSessionToken");
+	const TCHAR* const MarkerExpiresAtKey = TEXT("BackgroundSessionExpiresAt");
+	const TCHAR* const MarkerBackgroundedAtKey = TEXT("BackgroundedAt");
 
 	/** Session lifetime assumed when the server sends neither expiresAt nor expiresIn. */
 	constexpr double DefaultSessionSeconds = 86400.0;
+
+	/** The platform a Playtest run reports, the same on every SDK. */
+	const TCHAR* const PlaytestPlatform = TEXT("ravensight-playtest");
 
 	FString WriteJson(const TSharedRef<FJsonObject>& Object)
 	{
@@ -55,10 +70,22 @@ void URavensightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	FlushIntervalSeconds = Settings->FlushIntervalSeconds;
 	RequestTimeoutSeconds = Settings->RequestTimeoutSeconds;
+	SessionTimeoutSeconds = Settings->SessionTimeoutSeconds;
 	bTrackLifecycleEvents = Settings->bTrackLifecycleEvents;
+	bTrackPauseEvents = Settings->bTrackPauseEvents;
 	bVerboseLogging = Settings->bVerboseLogging;
 
 	Queue.SetMaxQueueSize(Settings->MaxQueueSize);
+	Queue.SetEnabled(Settings->bEnabled);
+
+	// The player's saved choice is read before anything else can happen, so
+	// an opted out player's machine never reaches the network. A Playtest run
+	// ignores it and leaves it exactly as the player set it.
+	ReadPlaytestSources();
+	if (!IsPlaytest())
+	{
+		Queue.SetLocallyEnabled(LoadTrackingEnabled());
+	}
 
 	BindApplicationDelegates();
 
@@ -82,15 +109,20 @@ void URavensightSubsystem::Deinitialize()
 {
 	bShuttingDown = true;
 
-	if (bInitialized && bTrackLifecycleEvents && Queue.IsActive())
+	const bool bCanSend = bInitialized && bStarted && Queue.IsActive() && !bStoppedForRun;
+
+	if (bCanSend && bTrackLifecycleEvents && Lifecycle.TryClaimExited())
 	{
 		TrackEvent(TEXT("game_exited"), TMap<FString, FString>());
 	}
 
-	// Best effort. The engine does not pump HTTP after this point on every
-	// platform, so the last batch can be lost. Flush at points you control if
-	// the final events matter to you.
-	FlushInternal(true);
+	if (bCanSend && !bKeyRefused)
+	{
+		// Best effort, and bounded: the quit is held for at most 1.5 seconds
+		// while the last session and batch requests are pumped.
+		FlushInternal(true);
+		PumpUntilIdle(RavensightProtocol::ExitFlushBudgetSeconds);
+	}
 
 	StopTimers();
 	UnbindApplicationDelegates();
@@ -119,23 +151,7 @@ URavensightSubsystem* URavensightSubsystem::Get(const UObject* WorldContextObjec
 
 FString URavensightSubsystem::NormalizeApiUrl(const FString& InUrl)
 {
-	FString Raw = InUrl.TrimStartAndEnd();
-	while (Raw.EndsWith(TEXT("/")))
-	{
-		Raw.LeftChopInline(1);
-	}
-
-	if (Raw.IsEmpty())
-	{
-		return TEXT("https://api.ravensight.io/api/v1");
-	}
-
-	if (Raw.EndsWith(TEXT("/api/v1")))
-	{
-		return Raw;
-	}
-
-	return Raw + TEXT("/api/v1");
+	return RavensightProtocol::NormalizeApiUrl(InUrl);
 }
 
 void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApiUrl, const FString& InGameVersion)
@@ -158,29 +174,274 @@ void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApi
 	ApiUrl = NormalizeApiUrl(InApiUrl.IsEmpty() ? Settings->ApiUrl : InApiUrl);
 	GameVersion = InGameVersion.IsEmpty() ? ResolveGameVersion() : InGameVersion;
 	Platform = UGameplayStatics::GetPlatformName();
-	DeviceId = ResolveDeviceId();
 
 	bInitialized = true;
 
-	Log(FString::Printf(TEXT("initialized against %s as %s on %s"), *ApiUrl, *GameVersion, *Platform));
+	if (IsPlaytest())
+	{
+		if (PlaytestRunId.IsEmpty())
+		{
+			// Never run a Playtest token as a real player: that would put a
+			// persona's events under this machine's saved identity.
+			bStoppedForRun = true;
+			Queue.SetServerTrackingEnabled(false);
+			SetStatusReason(RavensightReason::SessionFailed);
+			UE_LOG(LogRavensight, Warning,
+				TEXT("A Playtest token was found without a run id. Nothing will be sent this run."));
+			return;
+		}
 
-	StartFlushTimer();
-	CheckServerSettings();
+		// In memory only. The saved device id is neither read nor written.
+		DeviceId = TEXT("pt-") + PlaytestRunId;
+		Platform = PlaytestPlatform;
+	}
+	else
+	{
+		DeviceId = ResolveDeviceId();
+	}
+
+	Log(FString::Printf(TEXT("initialized against %s as %s on %s%s"),
+		*ApiUrl, *GameVersion, *Platform, IsPlaytest() ? TEXT(" (Playtest run)") : TEXT("")));
+
+	StartIfAllowed();
+}
+
+void URavensightSubsystem::StartIfAllowed()
+{
+	if (!bInitialized || bStoppedForRun || bShuttingDown)
+	{
+		return;
+	}
+
+	if (!Queue.IsEnabled() || !Queue.IsLocallyEnabled())
+	{
+		// Nothing touches the network: no settings check, no session, no batch.
+		SetStatusReason(RavensightReason::Disabled);
+		return;
+	}
+
+	SetStatusReason(bKeyRefused ? FString(RavensightReason::InvalidKey) : FString());
+
+	if (!bMarkerChecked)
+	{
+		bMarkerChecked = true;
+		ReportMarkerExitFromLastRun();
+	}
+
+	if (!bStarted)
+	{
+		bStarted = true;
+		StartFlushTimer();
+	}
+
+	// Queued now, at the real start time and first in the queue. The settings
+	// check then decides whether it is ever sent.
+	QueueGameStartedOnce();
+
+	if (!bSettingsChecked && !bSettingsRequestPending)
+	{
+		CheckServerSettings();
+	}
+}
+
+void URavensightSubsystem::QueueGameStartedOnce()
+{
+	if (!bTrackLifecycleEvents || !Queue.IsActive() || bStoppedForRun)
+	{
+		return;
+	}
+
+	if (!Lifecycle.TryClaimStarted())
+	{
+		return;
+	}
+
+	TrackEvent(TEXT("game_started"), TMap<FString, FString>());
 }
 
 void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 {
+	if (IsPlaytest())
+	{
+		UE_LOG(LogRavensight, Log, TEXT("SetTrackingEnabled ignored during a Playtest run; the saved choice is unchanged."));
+		return;
+	}
+
+	// Written every time, before or after Init and whatever the Enabled
+	// setting says, so the choice is on disk the moment the player makes it.
+	SaveTrackingEnabled(bEnabled);
+
 	if (bEnabled == Queue.IsLocallyEnabled())
 	{
 		return;
 	}
 
 	Queue.SetLocallyEnabled(bEnabled);
-	Log(bEnabled ? TEXT("tracking opted in") : TEXT("tracking opted out, queue discarded"));
 
-	if (bEnabled && bInitialized && !bSettingsChecked)
+	if (!bEnabled)
 	{
-		CheckServerSettings();
+		Log(TEXT("tracking opted out, queue discarded"));
+		StopTimers();
+		bStarted = false;
+		SetStatusReason(RavensightReason::Disabled);
+		return;
+	}
+
+	Log(TEXT("tracking opted in"));
+	StartIfAllowed();
+}
+
+void URavensightSubsystem::SaveTrackingEnabled(bool bEnabled)
+{
+	if (!GConfig)
+	{
+		return;
+	}
+
+	GConfig->SetBool(SaveSection, TrackingEnabledKey, bEnabled, GGameUserSettingsIni);
+	GConfig->Flush(false, GGameUserSettingsIni);
+}
+
+bool URavensightSubsystem::LoadTrackingEnabled()
+{
+	bool bSaved = true;
+	if (GConfig)
+	{
+		GConfig->GetBool(SaveSection, TrackingEnabledKey, bSaved, GGameUserSettingsIni);
+	}
+	return bSaved;
+}
+
+void URavensightSubsystem::SetEnabled(bool bInEnabled)
+{
+	if (bInEnabled == Queue.IsEnabled())
+	{
+		return;
+	}
+
+	Queue.SetEnabled(bInEnabled);
+
+	if (!bInEnabled)
+	{
+		Log(TEXT("disabled by the game, queue discarded"));
+		StopTimers();
+		bStarted = false;
+		SetStatusReason(RavensightReason::Disabled);
+		return;
+	}
+
+	Log(TEXT("enabled by the game"));
+	StartIfAllowed();
+}
+
+FString URavensightSubsystem::ResetDeviceId()
+{
+	if (IsPlaytest())
+	{
+		UE_LOG(LogRavensight, Log, TEXT("ResetDeviceId ignored during a Playtest run; the saved device id is unchanged."));
+		return DeviceId;
+	}
+
+	DeviceId = GenerateDeviceId();
+
+	// Nothing recorded under the old identity is sent under the new one.
+	Queue.Clear();
+	Queue.InvalidateSession();
+
+	Log(TEXT("device id reset, queue discarded, next event opens a new session"));
+	return DeviceId;
+}
+
+void URavensightSubsystem::SetPlaytestContext(const FString& Token, const FString& RunId, const FString& JobId, const FString& Persona)
+{
+	if (bInitialized)
+	{
+		UE_LOG(LogRavensight, Warning,
+			TEXT("SetPlaytestContext must be called before Init. Turn Auto Initialize off and call Init after it. Ignored."));
+		return;
+	}
+
+	RavensightProtocol::FPlaytestSources Sources;
+	Sources.ExplicitToken = Token;
+	Sources.ExplicitRunId = RunId;
+	const RavensightProtocol::FPlaytestResolution Resolution = RavensightProtocol::ResolvePlaytest(Sources);
+	if (!Resolution.IsPlaytest())
+	{
+		UE_LOG(LogRavensight, Warning, TEXT("SetPlaytestContext called with an empty token. Ignored."));
+		return;
+	}
+
+	PlaytestToken = Resolution.Token;
+	PlaytestRunId = Resolution.RunId;
+	PlaytestJobId = JobId.TrimStartAndEnd();
+	PlaytestPersona = Persona.TrimStartAndEnd();
+
+	// A Playtest run ignores the player's saved opt out without touching it.
+	Queue.SetLocallyEnabled(true);
+}
+
+void URavensightSubsystem::ReadPlaytestSources()
+{
+	RavensightProtocol::FPlaytestSources Sources;
+	Sources.EnvToken = FPlatformMisc::GetEnvironmentVariable(TEXT("RAVENSIGHT_PLAYTEST_TOKEN"));
+	Sources.EnvRunId = FPlatformMisc::GetEnvironmentVariable(TEXT("RAVENSIGHT_PLAYTEST_RUN_ID"));
+
+#if PLATFORM_DESKTOP
+	// --ravensight-playtest-token=... and --ravensight-playtest-run-id=...
+	FParse::Value(FCommandLine::Get(), TEXT("ravensight-playtest-token="), Sources.CommandLineToken, false);
+	FParse::Value(FCommandLine::Get(), TEXT("ravensight-playtest-run-id="), Sources.CommandLineRunId, false);
+#endif
+
+	const RavensightProtocol::FPlaytestResolution Resolution = RavensightProtocol::ResolvePlaytest(Sources);
+	if (!Resolution.IsPlaytest())
+	{
+		return;
+	}
+
+	PlaytestToken = Resolution.Token;
+	PlaytestRunId = Resolution.RunId;
+	PlaytestJobId = FPlatformMisc::GetEnvironmentVariable(TEXT("RAVENSIGHT_PLAYTEST_JOB_ID")).TrimStartAndEnd();
+	PlaytestPersona = FPlatformMisc::GetEnvironmentVariable(TEXT("RAVENSIGHT_PLAYTEST_PERSONA")).TrimStartAndEnd();
+}
+
+void URavensightSubsystem::SetStatusReason(const FString& Reason)
+{
+	if (Reason == StatusReason)
+	{
+		return;
+	}
+
+	StatusReason = Reason;
+	OnStatusChanged.Broadcast(StatusReason);
+}
+
+void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Source)
+{
+	if (bStoppedForRun)
+	{
+		return;
+	}
+
+	bStoppedForRun = true;
+	Queue.SetServerTrackingEnabled(false);
+	StopTimers();
+	SetStatusReason(Reason);
+
+	UE_LOG(LogRavensight, Log, TEXT("Tracking stopped for this run (%s). Queue cleared, nothing more will be sent."), *Reason);
+	OnTrackingDisabled.Broadcast(Source);
+}
+
+void URavensightSubsystem::RefuseKey()
+{
+	bKeyRefused = true;
+	StopTimers();
+	SetStatusReason(RavensightReason::InvalidKey);
+
+	if (!bKeyRefusedLogged)
+	{
+		bKeyRefusedLogged = true;
+		UE_LOG(LogRavensight, Warning,
+			TEXT("Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key."));
 	}
 }
 
@@ -205,22 +466,39 @@ void URavensightSubsystem::TrackEventJson(const FString& EventName, const FStrin
 		return;
 	}
 
-	if (!Queue.IsActive())
+	if (!Queue.IsActive() || bStoppedForRun)
 	{
 		return;
 	}
 
 	FString DataJson = JsonData.TrimStartAndEnd();
-	if (DataJson.IsEmpty())
+	TSharedPtr<FJsonObject> Parsed;
+	if (!DataJson.IsEmpty())
 	{
-		DataJson = TEXT("{}");
+		Parsed = ParseJsonObject(DataJson);
+		if (!Parsed.IsValid())
+		{
+			UE_LOG(LogRavensight, Warning,
+				TEXT("Event '%s' carried a payload that is not a JSON object, sending it with no data"), *EventName);
+		}
 	}
-	else if (!ParseJsonObject(DataJson).IsValid())
+
+	if (IsPlaytest())
 	{
-		UE_LOG(LogRavensight, Warning,
-			TEXT("Event '%s' carried a payload that is not a JSON object, sending it with no data"), *EventName);
-		DataJson = TEXT("{}");
+		// The same synthetic tags every SDK puts on a Playtest run's events.
+		if (!Parsed.IsValid())
+		{
+			Parsed = MakeShared<FJsonObject>();
+		}
+		Parsed->SetBoolField(TEXT("synthetic"), true);
+		Parsed->SetStringField(TEXT("persona"), PlaytestPersona);
+		Parsed->SetStringField(TEXT("pt_job"), PlaytestJobId);
+		Parsed->SetStringField(TEXT("pt_run"), PlaytestRunId);
+		Parsed->SetStringField(TEXT("pt_source"), TEXT("sdk"));
+		Parsed->SetStringField(TEXT("pt_tier"), TEXT("T2_driven_build"));
 	}
+
+	DataJson = Parsed.IsValid() ? WriteJson(Parsed.ToSharedRef()) : FString(TEXT("{}"));
 
 	const int64 Timestamp = FDateTime::UtcNow().ToUnixTimestamp();
 	const int32 Dropped = Queue.Enqueue(FRavensightEvent(EventName, DataJson, Timestamp));
@@ -230,29 +508,37 @@ void URavensightSubsystem::TrackEventJson(const FString& EventName, const FStrin
 			TEXT("Queue is full at %d events, dropped %d oldest to make room"), Queue.GetMaxQueueSize(), Dropped);
 	}
 
-	if (!bInitialized || !bSettingsChecked)
+	// track only enqueues. Sending happens on the timer, on Flush, on
+	// background and on quit, and straight away only once a full batch of
+	// 50 is waiting.
+	if (Queue.Num() >= RavensightLimits::MaxBatchSize)
 	{
-		// Held until the kill switch answers. Nothing is lost: the queue keeps
-		// them and the first flush after boot sends them.
-		return;
+		FlushInternal(false);
 	}
-
-	FlushInternal(false);
 }
 
 void URavensightSubsystem::Flush()
 {
-	FlushInternal(true);
+	// An explicit Flush is the one way to make another attempt after the
+	// ingest key was refused.
+	FlushInternal(true, true);
 }
 
-void URavensightSubsystem::FlushInternal(bool bForce)
+void URavensightSubsystem::FlushInternal(bool bForce, bool bExplicit)
 {
-	if (!bInitialized)
+	// Held until the kill switch answers. Nothing is lost: the queue keeps
+	// the events and the first flush after the answer sends them.
+	if (!bInitialized || bStoppedForRun || !bSettingsChecked)
 	{
 		return;
 	}
 
-	const FRavensightFlushPlan Plan = Queue.BeginFlush(NowSeconds(), bForce);
+	if (bKeyRefused && !bExplicit)
+	{
+		return;
+	}
+
+	const FRavensightFlushPlan Plan = Queue.BeginFlush(NowSeconds(), bForce, BatchLimit);
 
 	switch (Plan.Decision)
 	{
@@ -261,7 +547,7 @@ void URavensightSubsystem::FlushInternal(bool bForce)
 		break;
 
 	case ERavensightFlushDecision::NeedsSession:
-		EnsureSession();
+		EnsureSession(bExplicit);
 		break;
 
 	default:
@@ -314,76 +600,131 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 {
 	Queue.EndFlush();
 
+	if (bStoppedForRun)
+	{
+		return;
+	}
+
 	const double Now = NowSeconds();
-
-	if (!bConnectedSuccessfully || !Response.IsValid())
-	{
-		Log(TEXT("batch flush could not reach the server, will retry"));
-		Queue.OnTransportFailure(Now);
-		OnFlushFailed.Broadcast(TEXT("unreachable"));
-		ScheduleRetry();
-		return;
-	}
-
-	const int32 Code = Response->GetResponseCode();
-
-	if (Code == 202)
-	{
-		Queue.OnBatchAccepted(BatchSize);
-		Log(FString::Printf(TEXT("sent %d events, %d still queued"), BatchSize, Queue.Num()));
-		OnEventsFlushed.Broadcast(BatchSize);
-
-		if (!Queue.IsEmpty() && !bShuttingDown)
-		{
-			// Keep draining while the server is happy to take them.
-			FlushInternal(false);
-		}
-		return;
-	}
+	const bool bAnswered = bConnectedSuccessfully && Response.IsValid();
+	const int32 Code = bAnswered ? Response->GetResponseCode() : 0;
+	const FString Body = bAnswered ? ResponseBody(Response) : FString();
 
 	if (Code == 401)
 	{
-		// Expired or revoked. The batch stays queued and goes back out as soon
-		// as a fresh token is issued.
+		++ConsecutiveBatchUnauthorized;
+	}
+
+	const FRavensightResponseVerdict Verdict = Classify(
+		ERavensightEndpoint::Batch, Response, bConnectedSuccessfully, BatchSize, ConsecutiveBatchUnauthorized);
+
+	const FString FailReason = bAnswered ? ExtractError(Body, FString::Printf(TEXT("http_%d"), Code)) : FString(TEXT("unreachable"));
+
+	switch (Verdict.Action)
+	{
+	case ERavensightResponseAction::Accept:
+		Queue.OnBatchAccepted(BatchSize);
+		BatchLimit = RavensightLimits::MaxBatchSize;
+		ConsecutiveBatchUnauthorized = 0;
+		Log(FString::Printf(TEXT("sent %d events, %d still queued"), BatchSize, Queue.Num()));
+		OnEventsFlushed.Broadcast(BatchSize);
+
+		if (!Queue.IsEmpty())
+		{
+			// Keep draining while the server is happy to take them. During the
+			// quit this is still bounded by the exit budget.
+			FlushInternal(false);
+		}
+		return;
+
+	case ERavensightResponseAction::RefreshSession:
+		// Expired or revoked. The batch stays queued and goes back out as
+		// soon as a fresh token is issued, at most twice in a row.
 		Log(TEXT("session invalid or expired, refreshing"));
 		Queue.OnUnauthorized();
 		EnsureSession();
 		return;
-	}
 
-	const FString Body = ResponseBody(Response);
+	case ERavensightResponseAction::HalveBatch:
+		BatchLimit = FMath::Max(1, BatchSize / 2);
+		Log(FString::Printf(TEXT("batch of %d refused with HTTP 400, retrying at %d"), BatchSize, BatchLimit));
+		FlushInternal(false);
+		return;
 
-	if (Code == 429)
-	{
-		const double RetryAfter = ParseRetryAfterSeconds(Response);
-		Queue.OnRateLimited(Now, RetryAfter);
+	case ERavensightResponseAction::DropHead:
+		// One event the server will never accept. Drop it so the rest of the
+		// queue is not blocked behind it for the whole run.
+		Queue.DropHead(1);
+		BatchLimit = RavensightLimits::MaxBatchSize;
+		if (!bDroppedEventLogged)
+		{
+			bDroppedEventLogged = true;
+			UE_LOG(LogRavensight, Warning,
+				TEXT("Dropped an event the server refused with HTTP 400 (%s). Further drops are counted in GetQueue().GetStats() without a log line."),
+				*FailReason);
+		}
+		OnFlushFailed.Broadcast(FailReason);
+		FlushInternal(false);
+		return;
 
-		const FString Reason = ExtractError(Body, TEXT("rate_limited"));
-		UE_LOG(LogRavensight, Warning, TEXT("track/batch rate limited (%s), retrying in %.0fs"),
-			*Reason, Queue.SecondsUntilNextAttempt(Now));
+	case ERavensightResponseAction::FatalKey:
+		RefuseKey();
+		OnFlushFailed.Broadcast(RavensightReason::InvalidKey);
+		return;
 
-		OnFlushFailed.Broadcast(Reason);
+	case ERavensightResponseAction::KillSwitch:
+		StopForRun(Verdict.Reason, TEXT("server"));
+		return;
+
+	case ERavensightResponseAction::PlaytestStop:
+		StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
+		return;
+
+	case ERavensightResponseAction::WaitRetryAfter:
+		Queue.OnRateLimited(Now, ParseRetryAfterSeconds(Response));
+		if (!Verdict.Reason.IsEmpty())
+		{
+			SetStatusReason(Verdict.Reason);
+		}
+		UE_LOG(LogRavensight, Warning, TEXT("track/batch refused for now (%s), retrying in %.0fs"),
+			*FailReason, Queue.SecondsUntilNextAttempt(Now));
+		OnFlushFailed.Broadcast(FailReason);
+		ScheduleRetry();
+		return;
+
+	default:
+		// BackOff: offline, a timeout, a 5xx, or a batch 401 past the re
+		// open cap. Events are kept.
+		if (Code == 401)
+		{
+			Queue.OnUnauthorized();
+		}
+		Log(FString::Printf(TEXT("batch flush failed (HTTP %d), will retry"), Code));
+		Queue.OnTransportFailure(Now);
+		OnFlushFailed.Broadcast(FailReason);
 		ScheduleRetry();
 		return;
 	}
-
-	const FString Reason = ExtractError(Body, FString::Printf(TEXT("http_%d"), Code));
-	UE_LOG(LogRavensight, Warning, TEXT("batch flush failed (HTTP %d), will retry"), Code);
-	Queue.OnTransportFailure(Now);
-	OnFlushFailed.Broadcast(Reason);
-	ScheduleRetry();
 }
 
 // --- Server kill switch -----------------------------------------------------
 
 void URavensightSubsystem::CheckServerSettings()
 {
+	if (!bInitialized || bStoppedForRun || bSettingsRequestPending || bKeyRefused || !Queue.IsActive())
+	{
+		return;
+	}
+
+	bSettingsRequestPending = true;
+
 	const FHttpRequestRef Request = MakeRequest(TEXT("GET"), TEXT("/settings"));
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSettingsResponse);
 
 	if (!Request->ProcessRequest())
 	{
+		bSettingsRequestPending = false;
 		UE_LOG(LogRavensight, Warning, TEXT("settings check could not start, assuming tracking is enabled"));
 		AfterSettingsChecked();
 	}
@@ -391,10 +732,20 @@ void URavensightSubsystem::CheckServerSettings()
 
 void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)
 {
-	bool bServerEnabled = true;
+	bSettingsRequestPending = false;
 
-	if (bConnectedSuccessfully && Response.IsValid() && Response->GetResponseCode() == 200)
+	if (bStoppedForRun)
 	{
+		return;
+	}
+
+	const FRavensightResponseVerdict Verdict = Classify(ERavensightEndpoint::Settings, Response, bConnectedSuccessfully);
+
+	switch (Verdict.Action)
+	{
+	case ERavensightResponseAction::Accept:
+	{
+		bool bServerEnabled = true;
 		const TSharedPtr<FJsonObject> Parsed = ParseJsonObject(ResponseBody(Response));
 		if (Parsed.IsValid())
 		{
@@ -404,15 +755,41 @@ void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttp
 				bServerEnabled = bParsed;
 			}
 		}
-	}
-	else
-	{
-		// An unreachable settings endpoint must not silently stop analytics.
-		// Same call as the Godot SDK makes: assume on.
-		UE_LOG(LogRavensight, Warning, TEXT("could not read settings, assuming tracking is enabled"));
+
+		if (!bServerEnabled)
+		{
+			bSettingsChecked = true;
+			StopForRun(RavensightReason::TrackingDisabled, TEXT("server"));
+			return;
+		}
+		break;
 	}
 
-	Queue.SetServerTrackingEnabled(bServerEnabled);
+	case ERavensightResponseAction::FatalKey:
+		// A refused key is never "assume tracking is enabled". The queue is
+		// kept and an explicit Flush makes one more attempt.
+		bSettingsChecked = true;
+		RefuseKey();
+		return;
+
+	case ERavensightResponseAction::KillSwitch:
+		bSettingsChecked = true;
+		StopForRun(Verdict.Reason, TEXT("server"));
+		return;
+
+	case ERavensightResponseAction::PlaytestStop:
+		bSettingsChecked = true;
+		StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
+		return;
+
+	default:
+		// Offline, rate limited or a server error. An unreachable settings
+		// endpoint must not silently stop analytics, so assume on; the
+		// session request that follows backs off on its own.
+		UE_LOG(LogRavensight, Warning, TEXT("could not read settings, assuming tracking is enabled"));
+		break;
+	}
+
 	AfterSettingsChecked();
 }
 
@@ -420,31 +797,25 @@ void URavensightSubsystem::AfterSettingsChecked()
 {
 	bSettingsChecked = true;
 
-	if (!Queue.IsServerTrackingEnabled())
+	if (!Queue.IsActive() || bStoppedForRun)
 	{
-		UE_LOG(LogRavensight, Log, TEXT("Tracking disabled by the server kill switch. Nothing will be sent this run."));
-		StopTimers();
-		OnTrackingDisabled.Broadcast(TEXT("server"));
 		return;
 	}
 
-	if (bTrackLifecycleEvents)
-	{
-		// Enqueuing this also gets the session started, exactly as the Godot
-		// SDK does on boot.
-		TrackEvent(TEXT("game_started"), TMap<FString, FString>());
-	}
-	else
-	{
-		FlushInternal(false);
-	}
+	QueueGameStartedOnce();
+	FlushInternal(false);
 }
 
 // --- Session ----------------------------------------------------------------
 
-void URavensightSubsystem::EnsureSession()
+void URavensightSubsystem::EnsureSession(bool bExplicit)
 {
-	if (!bInitialized || bSessionRequestPending || !Queue.IsActive())
+	if (!bInitialized || bStoppedForRun || bSessionRequestPending || !bSettingsChecked || !Queue.IsActive())
+	{
+		return;
+	}
+
+	if (bKeyRefused && !bExplicit)
 	{
 		return;
 	}
@@ -470,8 +841,9 @@ void URavensightSubsystem::EnsureSession()
 	if (!Request->ProcessRequest())
 	{
 		bSessionRequestPending = false;
-		UE_LOG(LogRavensight, Error, TEXT("session request could not start"));
+		UE_LOG(LogRavensight, Warning, TEXT("session request could not start"));
 		Queue.OnTransportFailure(NowSeconds());
+		SetStatusReason(RavensightReason::SessionFailed);
 		OnSessionFailed.Broadcast(TEXT("request_not_started"));
 		ScheduleRetry();
 	}
@@ -481,20 +853,22 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 {
 	bSessionRequestPending = false;
 
-	const double Now = NowSeconds();
-
-	if (!bConnectedSuccessfully || !Response.IsValid())
+	if (bStoppedForRun || !Queue.IsActive())
 	{
-		Queue.OnTransportFailure(Now);
-		OnSessionFailed.Broadcast(TEXT("unreachable"));
-		ScheduleRetry();
 		return;
 	}
 
-	const int32 Code = Response->GetResponseCode();
-	const FString Body = ResponseBody(Response);
+	const double Now = NowSeconds();
+	const bool bAnswered = bConnectedSuccessfully && Response.IsValid();
+	const int32 Code = bAnswered ? Response->GetResponseCode() : 0;
+	const FString Body = bAnswered ? ResponseBody(Response) : FString();
+	const FString FailReason = bAnswered ? ExtractError(Body, FString::Printf(TEXT("http_%d"), Code)) : FString(TEXT("unreachable"));
 
-	if (Code == 201)
+	const FRavensightResponseVerdict Verdict = Classify(ERavensightEndpoint::Session, Response, bConnectedSuccessfully);
+
+	switch (Verdict.Action)
+	{
+	case ERavensightResponseAction::Accept:
 	{
 		const TSharedPtr<FJsonObject> Parsed = ParseJsonObject(Body);
 		FString Token;
@@ -511,8 +885,17 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 				ExpiresAt = Now + ExpiresIn;
 			}
 
+			// A session opened, so the key is good after all.
+			bKeyRefused = false;
+			if (!bStarted)
+			{
+				bStarted = true;
+				StartFlushTimer();
+			}
+
 			Queue.SetSession(Token, ExpiresAt);
 			Queue.ResetBackoff();
+			SetStatusReason(FString());
 
 			Log(TEXT("session ready"));
 			OnSessionReady.Broadcast();
@@ -521,47 +904,73 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			return;
 		}
 
-		UE_LOG(LogRavensight, Error, TEXT("session response was missing a token"));
+		UE_LOG(LogRavensight, Warning, TEXT("session response was missing a token"));
 		Queue.OnTransportFailure(Now);
+		SetStatusReason(RavensightReason::SessionFailed);
 		OnSessionFailed.Broadcast(TEXT("malformed_response"));
 		ScheduleRetry();
 		return;
 	}
 
-	if (Code == 429)
-	{
-		const double RetryAfter = ParseRetryAfterSeconds(Response);
-		Queue.OnRateLimited(Now, RetryAfter);
+	case ERavensightResponseAction::FatalKey:
+		RefuseKey();
+		OnSessionFailed.Broadcast(RavensightReason::InvalidKey);
+		return;
 
-		const FString Reason = ExtractError(Body, TEXT("rate_limited"));
-		UE_LOG(LogRavensight, Warning, TEXT("session creation rate limited (%s), retrying in %.0fs"),
-			*Reason, Queue.SecondsUntilNextAttempt(Now));
+	case ERavensightResponseAction::KillSwitch:
+		StopForRun(Verdict.Reason, TEXT("server"));
+		return;
 
-		OnSessionFailed.Broadcast(Reason);
+	case ERavensightResponseAction::PlaytestStop:
+		StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
+		OnSessionFailed.Broadcast(FailReason);
+		return;
+
+	case ERavensightResponseAction::WaitRetryAfter:
+		Queue.OnRateLimited(Now, ParseRetryAfterSeconds(Response));
+		SetStatusReason(Verdict.Reason);
+		UE_LOG(LogRavensight, Warning, TEXT("session creation refused for now (%s), retrying in %.0fs"),
+			*FailReason, Queue.SecondsUntilNextAttempt(Now));
+		OnSessionFailed.Broadcast(FailReason);
+		ScheduleRetry();
+		return;
+
+	default:
+		Log(FString::Printf(TEXT("session creation failed (HTTP %d), will retry"), Code));
+		Queue.OnTransportFailure(Now);
+		SetStatusReason(Verdict.Reason.IsEmpty() ? FString(RavensightReason::SessionFailed) : Verdict.Reason);
+		OnSessionFailed.Broadcast(FailReason);
 		ScheduleRetry();
 		return;
 	}
-
-	const FString Reason = ExtractError(Body, FString::Printf(TEXT("http_%d"), Code));
-	UE_LOG(LogRavensight, Error, TEXT("session creation failed (HTTP %d)"), Code);
-	Queue.OnTransportFailure(Now);
-	OnSessionFailed.Broadcast(Reason);
-	ScheduleRetry();
 }
 
 // --- Feedback ---------------------------------------------------------------
 
+TArray<FString> URavensightSubsystem::GetFeedbackCategories()
+{
+	return RavensightProtocol::FeedbackCategories();
+}
+
 void URavensightSubsystem::SubmitFeedback(const FString& Message, const FString& FeedbackCategory, int32 Rating)
 {
-	if (Message.TrimStartAndEnd().IsEmpty())
+	// Validated locally first: a bad category or rating never costs a request.
+	const FString Invalid = RavensightProtocol::ValidateFeedback(Message, FeedbackCategory, Rating);
+	if (!Invalid.IsEmpty())
 	{
-		OnFeedbackResult.Broadcast(false, TEXT("empty_message"));
+		OnFeedbackResult.Broadcast(false, Invalid);
 		return;
 	}
 
-	if (!bInitialized || !Queue.IsActive())
+	if (!bInitialized || !Queue.IsActive() || bStoppedForRun)
 	{
-		OnFeedbackResult.Broadcast(false, TEXT("tracking_disabled"));
+		OnFeedbackResult.Broadcast(false, RavensightReason::Disabled);
+		return;
+	}
+
+	if (bKeyRefused)
+	{
+		OnFeedbackResult.Broadcast(false, RavensightReason::InvalidKey);
 		return;
 	}
 
@@ -600,28 +1009,46 @@ void URavensightSubsystem::SubmitFeedback(const FString& Message, const FString&
 
 void URavensightSubsystem::HandleFeedbackResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully)
 {
-	if (!bConnectedSuccessfully || !Response.IsValid())
+	const bool bAnswered = bConnectedSuccessfully && Response.IsValid();
+	if (!bAnswered)
 	{
 		OnFeedbackResult.Broadcast(false, TEXT("unreachable"));
 		return;
 	}
 
 	const int32 Code = Response->GetResponseCode();
-	if (Code == 201)
+	const FString Reason = ExtractError(ResponseBody(Response), FString::Printf(TEXT("http_%d"), Code));
+	const FRavensightResponseVerdict Verdict = Classify(ERavensightEndpoint::Feedback, Response, bConnectedSuccessfully);
+
+	switch (Verdict.Action)
 	{
+	case ERavensightResponseAction::Accept:
 		OnFeedbackResult.Broadcast(true, FString());
 		return;
-	}
 
-	if (Code == 401)
-	{
+	case ERavensightResponseAction::RefreshSession:
 		// Let the next call succeed rather than silently retrying a message
 		// the player thinks they already sent.
 		Queue.OnUnauthorized();
 		EnsureSession();
+		break;
+
+	case ERavensightResponseAction::FatalKey:
+		RefuseKey();
+		break;
+
+	case ERavensightResponseAction::KillSwitch:
+		StopForRun(Verdict.Reason, TEXT("server"));
+		break;
+
+	case ERavensightResponseAction::PlaytestStop:
+		StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
+		break;
+
+	default:
+		break;
 	}
 
-	const FString Reason = ExtractError(ResponseBody(Response), FString::Printf(TEXT("http_%d"), Code));
 	UE_LOG(LogRavensight, Warning, TEXT("feedback submission failed (HTTP %d)"), Code);
 	OnFeedbackResult.Broadcast(false, Reason);
 }
@@ -630,7 +1057,9 @@ void URavensightSubsystem::HandleFeedbackResponse(FHttpRequestPtr Request, FHttp
 
 void URavensightSubsystem::FetchSuggestions()
 {
-	if (!bInitialized)
+	// While tracking is off nothing touches the network: same callback, an
+	// empty list, no request.
+	if (!bInitialized || !Queue.IsActive() || bStoppedForRun || bKeyRefused)
 	{
 		OnSuggestionsReceived.Broadcast(false, TArray<FString>());
 		return;
@@ -650,9 +1079,24 @@ void URavensightSubsystem::HandleSuggestionsResponse(FHttpRequestPtr Request, FH
 {
 	TArray<FString> Suggestions;
 
-	if (!bConnectedSuccessfully || !Response.IsValid() || Response->GetResponseCode() != 200)
+	const FRavensightResponseVerdict Verdict = Classify(ERavensightEndpoint::Suggestions, Response, bConnectedSuccessfully);
+	if (Verdict.Action != ERavensightResponseAction::Accept)
 	{
-		const int32 Code = Response.IsValid() ? Response->GetResponseCode() : 0;
+		const int32 Code = (bConnectedSuccessfully && Response.IsValid()) ? Response->GetResponseCode() : 0;
+
+		if (Verdict.Action == ERavensightResponseAction::FatalKey)
+		{
+			RefuseKey();
+		}
+		else if (Verdict.Action == ERavensightResponseAction::KillSwitch)
+		{
+			StopForRun(Verdict.Reason, TEXT("server"));
+		}
+		else if (Verdict.Action == ERavensightResponseAction::PlaytestStop)
+		{
+			StopForRun(Verdict.Reason, TEXT("playtest_job_closed"));
+		}
+
 		UE_LOG(LogRavensight, Warning, TEXT("fetch suggestions failed (HTTP %d)"), Code);
 		OnSuggestionsReceived.Broadcast(false, Suggestions);
 		return;
@@ -700,7 +1144,7 @@ bool URavensightSubsystem::IsSessionReady() const
 
 bool URavensightSubsystem::IsTrackingActive() const
 {
-	return Queue.IsActive();
+	return Queue.IsActive() && !bStoppedForRun && !bKeyRefused;
 }
 
 int32 URavensightSubsystem::GetQueuedEventCount() const
@@ -711,6 +1155,21 @@ int32 URavensightSubsystem::GetQueuedEventCount() const
 FString URavensightSubsystem::GetDeviceId() const
 {
 	return DeviceId;
+}
+
+FString URavensightSubsystem::GetStatusReason() const
+{
+	return StatusReason;
+}
+
+FString URavensightSubsystem::GetSessionToken() const
+{
+	return Queue.GetSessionToken();
+}
+
+bool URavensightSubsystem::IsPlaytest() const
+{
+	return !PlaytestToken.IsEmpty();
 }
 
 // --- Timers -----------------------------------------------------------------
@@ -740,7 +1199,7 @@ void URavensightSubsystem::StopTimers()
 void URavensightSubsystem::ScheduleRetry()
 {
 	UGameInstance* GameInstance = GetGameInstance();
-	if (!GameInstance || bShuttingDown)
+	if (!GameInstance || bShuttingDown || bStoppedForRun || bKeyRefused)
 	{
 		return;
 	}
@@ -757,7 +1216,7 @@ void URavensightSubsystem::OnFlushTimer()
 
 void URavensightSubsystem::OnRetryTimer()
 {
-	if (!Queue.IsActive())
+	if (!Queue.IsActive() || bStoppedForRun || bKeyRefused)
 	{
 		return;
 	}
@@ -779,7 +1238,7 @@ void URavensightSubsystem::BindApplicationDelegates()
 		this, &URavensightSubsystem::OnApplicationWillDeactivate);
 
 	BackgroundHandle = FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddUObject(
-		this, &URavensightSubsystem::OnApplicationWillDeactivate);
+		this, &URavensightSubsystem::OnApplicationWillEnterBackground);
 
 	ForegroundHandle = FCoreDelegates::ApplicationHasEnteredForegroundDelegate.AddUObject(
 		this, &URavensightSubsystem::OnApplicationEnteredForeground);
@@ -805,29 +1264,79 @@ void URavensightSubsystem::UnbindApplicationDelegates()
 
 void URavensightSubsystem::OnApplicationWillDeactivate()
 {
-	if (!bInitialized || !Queue.IsActive())
+	// Desktop focus loss is not an exit and sends no event. A flush is fine.
+	if (!bInitialized || !Queue.IsActive() || bStoppedForRun)
 	{
 		return;
 	}
 
-	if (bTrackLifecycleEvents)
+	FlushInternal(true);
+}
+
+void URavensightSubsystem::OnApplicationWillEnterBackground()
+{
+	if (!bInitialized || !bStarted || !Queue.IsActive() || bStoppedForRun)
+	{
+		return;
+	}
+
+	if (bTrackPauseEvents)
 	{
 		TrackEvent(TEXT("game_paused"), TMap<FString, FString>());
+	}
+
+	if (IsMobilePlatform())
+	{
+		BackgroundedAtSeconds = NowSeconds();
 	}
 
 	// The most important flush on mobile: iOS and Android can suspend or kill
 	// the process without ever returning to the foreground.
 	FlushInternal(true);
+
+	if (IsMobilePlatform())
+	{
+		WriteBackgroundMarker();
+	}
 }
 
 void URavensightSubsystem::OnApplicationEnteredForeground()
 {
-	if (!bInitialized || !Queue.IsActive() || !bTrackLifecycleEvents)
+	if (!bInitialized)
 	{
 		return;
 	}
 
-	TrackEvent(TEXT("game_resumed"), TMap<FString, FString>());
+	if (IsMobilePlatform())
+	{
+		DeleteBackgroundMarker();
+
+		const double BackgroundedAt = BackgroundedAtSeconds;
+		BackgroundedAtSeconds = 0.0;
+
+		const bool bCanSend = bStarted && Queue.IsActive() && !bStoppedForRun;
+		if (bCanSend && RavensightProtocol::ShouldEndSessionAfterBackground(NowSeconds(), BackgroundedAt, SessionTimeoutSeconds))
+		{
+			// Thirty minutes or more away ends the session: game_exited at
+			// the moment the app left, under the old token, then a new
+			// session with game_started now, opened on the next flush.
+			const FString OldToken = Queue.GetSessionToken();
+			if (bTrackLifecycleEvents && !OldToken.IsEmpty() && !bKeyRefused)
+			{
+				SendExitUnderToken(OldToken, BackgroundedAt);
+			}
+
+			Queue.InvalidateSession();
+			Lifecycle.ResetForNewSession();
+			QueueGameStartedOnce();
+			return;
+		}
+	}
+
+	if (bTrackPauseEvents && bStarted && Queue.IsActive() && !bStoppedForRun)
+	{
+		TrackEvent(TEXT("game_resumed"), TMap<FString, FString>());
+	}
 }
 
 void URavensightSubsystem::OnWorldBeginTearDown(UWorld* World)
@@ -840,6 +1349,119 @@ void URavensightSubsystem::OnWorldBeginTearDown(UWorld* World)
 	FlushInternal(true);
 }
 
+void URavensightSubsystem::WriteBackgroundMarker()
+{
+	// A Playtest run persists nothing. Without a session there is nothing
+	// the next launch could report.
+	if (!GConfig || IsPlaytest() || BackgroundedAtSeconds <= 0.0)
+	{
+		return;
+	}
+
+	const FString Token = Queue.GetSessionToken();
+	if (Token.IsEmpty())
+	{
+		return;
+	}
+
+	GConfig->SetString(SaveSection, MarkerTokenKey, *Token, GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerExpiresAtKey, *FString::Printf(TEXT("%.0f"), Queue.GetSessionExpiresAt()), GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerBackgroundedAtKey, *FString::Printf(TEXT("%.0f"), BackgroundedAtSeconds), GGameUserSettingsIni);
+	GConfig->Flush(false, GGameUserSettingsIni);
+}
+
+void URavensightSubsystem::DeleteBackgroundMarker()
+{
+	if (!GConfig)
+	{
+		return;
+	}
+
+	FString Existing;
+	if (!GConfig->GetString(SaveSection, MarkerTokenKey, Existing, GGameUserSettingsIni) || Existing.IsEmpty())
+	{
+		return;
+	}
+
+	// An empty token reads as "no marker".
+	GConfig->SetString(SaveSection, MarkerTokenKey, TEXT(""), GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerExpiresAtKey, TEXT(""), GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerBackgroundedAtKey, TEXT(""), GGameUserSettingsIni);
+	GConfig->Flush(false, GGameUserSettingsIni);
+}
+
+void URavensightSubsystem::ReportMarkerExitFromLastRun()
+{
+	if (!IsMobilePlatform() || IsPlaytest() || !GConfig)
+	{
+		return;
+	}
+
+	FString Token;
+	FString ExpiresAtText;
+	FString BackgroundedAtText;
+	GConfig->GetString(SaveSection, MarkerTokenKey, Token, GGameUserSettingsIni);
+	if (Token.IsEmpty())
+	{
+		return;
+	}
+	GConfig->GetString(SaveSection, MarkerExpiresAtKey, ExpiresAtText, GGameUserSettingsIni);
+	GConfig->GetString(SaveSection, MarkerBackgroundedAtKey, BackgroundedAtText, GGameUserSettingsIni);
+
+	const double ExpiresAt = FCString::Atod(*ExpiresAtText);
+	const double BackgroundedAt = FCString::Atod(*BackgroundedAtText);
+
+	// The last run went to the background and never came back, most likely
+	// swiped away. Report its exit once, before anything else, then forget
+	// the marker whatever the answer.
+	if (bTrackLifecycleEvents && BackgroundedAt > 0.0
+		&& RavensightProtocol::ShouldReportMarkerExit(NowSeconds(), Token, ExpiresAt, !Queue.IsLocallyEnabled()))
+	{
+		SendExitUnderToken(Token, BackgroundedAt);
+	}
+
+	DeleteBackgroundMarker();
+}
+
+void URavensightSubsystem::SendExitUnderToken(const FString& Token, double ExitedAtSeconds)
+{
+	const TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+	Entry->SetStringField(TEXT("event"), TEXT("game_exited"));
+	Entry->SetObjectField(TEXT("data"), MakeShared<FJsonObject>());
+	Entry->SetNumberField(TEXT("timestamp"), FMath::FloorToDouble(ExitedAtSeconds));
+
+	TArray<TSharedPtr<FJsonValue>> EventValues;
+	EventValues.Add(MakeShared<FJsonValueObject>(Entry));
+
+	const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
+	Body->SetArrayField(TEXT("events"), EventValues);
+
+	// One attempt, no retry, and the answer is not read: the old session is
+	// over either way.
+	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/track/batch"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("X-Session-Token"), Token);
+	Request->SetContentAsString(WriteJson(Body));
+	Request->ProcessRequest();
+
+	Log(TEXT("reported game_exited for a session that ended in the background"));
+}
+
+void URavensightSubsystem::PumpUntilIdle(double BudgetSeconds)
+{
+	const double StartedAt = FPlatformTime::Seconds();
+	FHttpManager& HttpManager = FHttpModule::Get().GetHttpManager();
+
+	// Completion delegates run from the HTTP manager's tick, so tick it by
+	// hand while the session and batch requests settle, never past the budget.
+	while ((Queue.IsFlushInProgress() || bSessionRequestPending)
+		&& (FPlatformTime::Seconds() - StartedAt) < BudgetSeconds)
+	{
+		HttpManager.Tick(0.0f);
+		FPlatformProcess::Sleep(0.01f);
+	}
+}
+
 // --- Helpers ----------------------------------------------------------------
 
 FHttpRequestRef URavensightSubsystem::MakeRequest(const FString& Verb, const FString& Path) const
@@ -848,12 +1470,51 @@ FHttpRequestRef URavensightSubsystem::MakeRequest(const FString& Verb, const FSt
 	Request->SetVerb(Verb);
 	Request->SetURL(ApiUrl + Path);
 	Request->SetTimeout(RequestTimeoutSeconds);
+
+	if (!PlaytestToken.IsEmpty())
+	{
+		// The bare token, on every request. The server also accepts a
+		// "Bearer " prefix, but every SDK sends it bare.
+		Request->SetHeader(TEXT("X-Ravensight-Playtest"), PlaytestToken);
+	}
+
 	return Request;
+}
+
+FRavensightResponseVerdict URavensightSubsystem::Classify(
+	ERavensightEndpoint Endpoint,
+	const FHttpResponsePtr& Response,
+	bool bConnectedSuccessfully,
+	int32 BatchSize,
+	int32 InConsecutiveBatchUnauthorized)
+{
+	FRavensightResponseInput Input;
+	Input.Endpoint = Endpoint;
+	Input.BatchSize = BatchSize;
+	Input.ConsecutiveBatchUnauthorized = InConsecutiveBatchUnauthorized;
+
+	if (bConnectedSuccessfully && Response.IsValid())
+	{
+		Input.Status = Response->GetResponseCode();
+		Input.Error = ExtractError(ResponseBody(Response), FString());
+		Input.bHasRetryAfter = ParseRetryAfterSeconds(Response) > 0.0;
+	}
+
+	return RavensightProtocol::ClassifyResponse(Input);
 }
 
 double URavensightSubsystem::NowSeconds()
 {
 	return static_cast<double>(FDateTime::UtcNow().ToUnixTimestamp());
+}
+
+bool URavensightSubsystem::IsMobilePlatform()
+{
+#if PLATFORM_IOS || PLATFORM_ANDROID
+	return true;
+#else
+	return false;
+#endif
 }
 
 FString URavensightSubsystem::ResolveGameVersion()
@@ -881,16 +1542,23 @@ FString URavensightSubsystem::ResolveDeviceId()
 	// the local game user settings is enough to tell installs apart and
 	// carries nothing about the player or the device.
 	FString Saved;
-	if (GConfig && GConfig->GetString(DeviceIdSection, DeviceIdKey, Saved, GGameUserSettingsIni) && !Saved.IsEmpty())
+	if (GConfig && GConfig->GetString(SaveSection, DeviceIdKey, Saved, GGameUserSettingsIni) && !Saved.IsEmpty())
 	{
+		// An existing saved id is never rewritten.
 		return Saved;
 	}
 
+	return GenerateDeviceId();
+}
+
+FString URavensightSubsystem::GenerateDeviceId()
+{
+	// Same format since 0.1.0: "dev_" and a lower case GUID with hyphens.
 	const FString Generated = TEXT("dev_") + FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
 
 	if (GConfig)
 	{
-		GConfig->SetString(DeviceIdSection, DeviceIdKey, *Generated, GGameUserSettingsIni);
+		GConfig->SetString(SaveSection, DeviceIdKey, *Generated, GGameUserSettingsIni);
 		GConfig->Flush(false, GGameUserSettingsIni);
 	}
 

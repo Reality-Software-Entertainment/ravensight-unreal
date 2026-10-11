@@ -63,12 +63,12 @@ int32 FRavensightQueue::DropHead(int32 Count)
 
 void FRavensightQueue::SetEnabled(bool bInEnabled)
 {
-	if (bInEnabled == bEnabled)
+	if (bInEnabled == bEnabledSetting)
 	{
 		return;
 	}
 
-	bEnabled = bInEnabled;
+	bEnabledSetting = bInEnabled;
 	if (!bInEnabled)
 	{
 		Clear();

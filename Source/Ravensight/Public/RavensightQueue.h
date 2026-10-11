@@ -154,10 +154,10 @@ public:
 	 * queue. Separate from the player's opt out so neither can undo the other.
 	 */
 	void SetEnabled(bool bInEnabled);
-	bool IsEnabled() const { return bEnabled; }
+	bool IsEnabled() const { return bEnabledSetting; }
 
 	/** True only when the Enabled setting, the server and the local toggle all allow tracking. */
-	bool IsActive() const { return bEnabled && bServerTrackingEnabled && bLocallyEnabled; }
+	bool IsActive() const { return bEnabledSetting && bServerTrackingEnabled && bLocallyEnabled; }
 
 	// --- Session -----------------------------------------------------------
 
@@ -240,7 +240,7 @@ private:
 	TArray<FRavensightEvent> Events;
 	int32 MaxQueueSize = RavensightLimits::DefaultQueueCap;
 
-	bool bEnabled = true;
+	bool bEnabledSetting = true;
 	bool bServerTrackingEnabled = true;
 	bool bLocallyEnabled = true;
 	bool bFlushInProgress = false;

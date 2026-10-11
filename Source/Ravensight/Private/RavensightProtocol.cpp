@@ -11,7 +11,7 @@ namespace
 		return Endpoint == ERavensightEndpoint::Feedback || Endpoint == ERavensightEndpoint::Suggestions;
 	}
 
-	FRavensightResponseVerdict Verdict(ERavensightResponseAction Action, const TCHAR* Reason = TEXT(""))
+	FRavensightResponseVerdict MakeVerdict(ERavensightResponseAction Action, const TCHAR* Reason = TEXT(""))
 	{
 		FRavensightResponseVerdict Out;
 		Out.Action = Action;
@@ -27,7 +27,7 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 
 	if (Status >= 200 && Status < 300)
 	{
-		return Verdict(ERavensightResponseAction::Accept);
+		return MakeVerdict(ERavensightResponseAction::Accept);
 	}
 
 	// The three 403 bodies that are not about the key come first: they are
@@ -36,17 +36,17 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 	{
 		if (Input.Error == TEXT("tracking_disabled"))
 		{
-			return Verdict(ERavensightResponseAction::KillSwitch, RavensightReason::TrackingDisabled);
+			return MakeVerdict(ERavensightResponseAction::KillSwitch, RavensightReason::TrackingDisabled);
 		}
 		if (Input.Error == TEXT("playtest_job_closed"))
 		{
-			return Verdict(ERavensightResponseAction::PlaytestStop, RavensightReason::PlaytestJobClosed);
+			return MakeVerdict(ERavensightResponseAction::PlaytestStop, RavensightReason::PlaytestJobClosed);
 		}
 		if (Input.Error == TEXT("invalid_playtest_token"))
 		{
-			return Verdict(ERavensightResponseAction::PlaytestStop, RavensightReason::SessionFailed);
+			return MakeVerdict(ERavensightResponseAction::PlaytestStop, RavensightReason::SessionFailed);
 		}
-		return Verdict(ERavensightResponseAction::FatalKey, RavensightReason::InvalidKey);
+		return MakeVerdict(ERavensightResponseAction::FatalKey, RavensightReason::InvalidKey);
 	}
 
 	if (Status == 401)
@@ -57,45 +57,45 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 		{
 			if (Input.ConsecutiveBatchUnauthorized <= RavensightProtocol::MaxBatchReauthInARow)
 			{
-				return Verdict(ERavensightResponseAction::RefreshSession);
+				return MakeVerdict(ERavensightResponseAction::RefreshSession);
 			}
-			return Verdict(ERavensightResponseAction::BackOff);
+			return MakeVerdict(ERavensightResponseAction::BackOff);
 		}
 		if (Endpoint == ERavensightEndpoint::Feedback)
 		{
-			return Verdict(ERavensightResponseAction::RefreshSession);
+			return MakeVerdict(ERavensightResponseAction::RefreshSession);
 		}
-		return Verdict(ERavensightResponseAction::FatalKey, RavensightReason::InvalidKey);
+		return MakeVerdict(ERavensightResponseAction::FatalKey, RavensightReason::InvalidKey);
 	}
 
 	if (IsCallerReported(Endpoint))
 	{
-		return Verdict(ERavensightResponseAction::Fail);
+		return MakeVerdict(ERavensightResponseAction::Fail);
 	}
 
 	if (Status == 0)
 	{
-		return Verdict(ERavensightResponseAction::BackOff, RavensightReason::Offline);
+		return MakeVerdict(ERavensightResponseAction::BackOff, RavensightReason::Offline);
 	}
 
 	if (Status == 429)
 	{
-		return Verdict(ERavensightResponseAction::WaitRetryAfter, RavensightReason::RateLimited);
+		return MakeVerdict(ERavensightResponseAction::WaitRetryAfter, RavensightReason::RateLimited);
 	}
 
 	if (Status == 503 && Input.bHasRetryAfter)
 	{
-		return Verdict(
+		return MakeVerdict(
 			ERavensightResponseAction::WaitRetryAfter,
 			Endpoint == ERavensightEndpoint::Session ? RavensightReason::SessionFailed : TEXT(""));
 	}
 
 	if (Status == 400 && Endpoint == ERavensightEndpoint::Batch)
 	{
-		return Verdict(Input.BatchSize > 1 ? ERavensightResponseAction::HalveBatch : ERavensightResponseAction::DropHead);
+		return MakeVerdict(Input.BatchSize > 1 ? ERavensightResponseAction::HalveBatch : ERavensightResponseAction::DropHead);
 	}
 
-	return Verdict(
+	return MakeVerdict(
 		ERavensightResponseAction::BackOff,
 		Endpoint == ERavensightEndpoint::Session ? RavensightReason::SessionFailed : TEXT(""));
 }
@@ -141,7 +141,13 @@ FString RavensightProtocol::ValidateFeedback(const FString& Message, const FStri
 		return TEXT("empty_message");
 	}
 
-	if (!Category.IsEmpty() && !FeedbackCategories().Contains(Category))
+	// Case sensitive, like the server: FString's own == ignores case.
+	const bool bKnownCategory = FeedbackCategories().ContainsByPredicate([&Category](const FString& Known)
+	{
+		return Known.Equals(Category, ESearchCase::CaseSensitive);
+	});
+
+	if (!Category.IsEmpty() && !bKnownCategory)
 	{
 		return TEXT("invalid_category");
 	}

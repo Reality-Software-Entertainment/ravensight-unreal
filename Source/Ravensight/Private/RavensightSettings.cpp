@@ -4,7 +4,7 @@
 
 URavensightSettings::URavensightSettings()
 {
-	ApiUrl = TEXT("https://api.ravensight.io/api/v1");
+	ApiUrl = TEXT("https://api.ravensight.io");
 	IngestKey = FString();
 	GameVersion = FString();
 }
