@@ -86,6 +86,20 @@ public:
 		return Tail.Equals(Suffix, Case);
 	}
 
+	static FString ChrN(int32 Count, char C) { return FString(std::string(static_cast<size_t>(Count), C)); }
+
+	FString Left(int32 Count) const
+	{
+		return FString(Data.substr(0, static_cast<size_t>(Count < 0 ? 0 : Count)));
+	}
+
+	FString ToUpper() const
+	{
+		std::string Out = Data;
+		std::transform(Out.begin(), Out.end(), Out.begin(), [](unsigned char C) { return static_cast<char>(std::toupper(C)); });
+		return FString(Out);
+	}
+
 	void LeftChopInline(int32 Count)
 	{
 		Data.resize(Count >= Len() ? 0 : Data.size() - static_cast<size_t>(Count));
@@ -150,6 +164,7 @@ public:
 	void Insert(const T& Item, int32 Index) { Items.insert(Items.begin() + Index, Item); }
 	void Reserve(int32 Count) { Items.reserve(static_cast<size_t>(Count)); }
 	void Reset() { Items.clear(); }
+	void Sort() { std::sort(Items.begin(), Items.end()); }
 
 	void RemoveAt(int32 Index, int32 Count = 1)
 	{

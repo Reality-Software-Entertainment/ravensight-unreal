@@ -97,6 +97,17 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Behavior", meta = (ClampMin = "1.0", UIMax = "60.0"))
 	float RequestTimeoutSeconds = 15.0f;
 
+	/**
+	 * Opt in per session performance sampling. Once a second the frame rate
+	 * is sampled (at most 600 samples are kept), and one health event with the
+	 * median and 10th percentile frames per second, memory in MB and boot time
+	 * in milliseconds is sent when the app goes to the background or quits.
+	 * Never per frame, never more than once per session, and nothing is sent
+	 * when no sample was taken. Off by default.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Behavior")
+	bool bPerformance = false;
+
 	/** Logs every session, batch and retry decision to LogRavensight at Log verbosity. */
 	UPROPERTY(config, EditAnywhere, Category = "Diagnostics")
 	bool bVerboseLogging = false;

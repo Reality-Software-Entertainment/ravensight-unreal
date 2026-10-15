@@ -8,10 +8,12 @@ side kill switch, in one game instance subsystem with no third party
 dependencies. Everything is exposed to Blueprint, so a designer can ship it
 without writing C++.
 
-> **Beta.** Version 0.2.1 compiles in Unreal Engine 5.8.3 on macOS and its
-> automation specs pass in the editor. It has not yet run in a packaged game,
-> on an iOS or Android device, or on any other engine version. What has been
-> run is listed under [Verification status](#verification-status).
+> **Beta.** Version 0.2.1 compiled in Unreal Engine 5.8.3 on macOS and its
+> automation specs passed in the editor. Version 0.3.0 adds the typed event
+> helpers and opt in performance sampling; their engine free logic passes the
+> host check, but 0.3.0 has not been compiled in Unreal yet. Nothing has run in
+> a packaged game, on an iOS or Android device, or on any other engine version.
+> What has been run is listed under [Verification status](#verification-status).
 
 * API base: `https://api.ravensight.io` (the plugin appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
@@ -228,6 +230,52 @@ Ravensight->TrackEventJson(TEXT("run_over"), TEXT("{\"level\":\"castle\",\"rs_ki
 
 In Blueprint, add `rs_kind` as one more key on the **Track Event** Data map.
 
+### 6. Typed events
+
+Four helpers send the reserved `rs_` properties for you, so purchases, resource
+flows, progression and errors show up in the typed dashboard views and the
+analyst without hand writing keys. Each helper builds a JSON object (numbers
+stay numbers) and sends it through `TrackEventJson`, so queueing, batching,
+opt out and Playtest behave exactly as for any other event. Every helper takes
+an `Extra` map, merged first so the reserved keys win, and an `EventName`
+override; leave it empty for the default name.
+
+```cpp
+// A 4.99 USD purchase. The amount is whole minor units.
+Ravensight->TrackPurchase(499, TEXT("usd"), TEXT("gem_pack"), TEXT("gems_500"),
+    TEXT(""), TEXT("order-1042"), {}, TEXT(""));
+
+// Gold gained from a quest, then spent in a shop. Flow is "source" or "sink".
+Ravensight->TrackResource(TEXT("source"), TEXT("gold"), 120.0, TEXT("quest"), TEXT("q7"), {}, TEXT(""));
+Ravensight->TrackResource(TEXT("sink"), TEXT("gold"), 45.0, TEXT("shop"), TEXT("potion"), {}, TEXT(""));
+
+// Progression: Status is start, complete or fail; P1 to P3 narrow it down.
+Ravensight->TrackProgression(TEXT("complete"), TEXT("world1"), TEXT("level2"), TEXT(""),
+    true, 1500.0, {}, TEXT(""));
+
+// An error. Severity is debug, info, warning, error or critical.
+Ravensight->TrackError(TEXT("warning"), TEXT("Texture streaming pool is over budget"), TEXT(""), {}, TEXT(""));
+```
+
+An amount you hold as a digit string goes through `TrackPurchaseText`. The
+currency is upper cased, `Message` is cut to 200 characters and `Stack` to
+2000. The helpers do not validate money beyond passing it through: a wrong
+amount becomes a flagged event, visible on the Implementation health card,
+and the helper never throws. In Blueprint the same calls are under
+**Ravensight > Typed Events**.
+
+#### Performance sampling
+
+Turn on **Performance** in Project Settings to send one `health` event per
+session. Once a second the frame rate is sampled (a reservoir of at most 600
+samples is kept). When the app goes to the background on iOS and Android, or on
+quit, the SDK sends the median and 10th percentile frames per second
+(`rs_fps_median`, `rs_fps_p10`), memory in MB (`rs_memory_mb`) and the time from
+process start to `Init` in milliseconds (`rs_boot_ms`). It is never sent per
+frame, never more than once per session, and nothing is sent when no sample was
+taken. It is off by default. The session create request also carries
+`"sdk": "unreal/<version>"`.
+
 ## API
 
 Everything lives on `URavensightSubsystem` and everything below is Blueprint
@@ -239,6 +287,11 @@ callable.
 | `Init(IngestKey, ApiUrl, GameVersion)` | Starts the SDK. Only needed with Auto Initialize off. Later calls are ignored. |
 | `TrackEvent(EventName, Data)` | Queues an event with string valued properties. Only queues: see [How delivery works](#how-delivery-works). |
 | `TrackEventJson(EventName, JsonData)` | Queues an event with a JSON object payload, for numbers, bools, arrays or nesting. |
+| `TrackPurchase(AmountMinor, Currency, ItemType, ItemId, Cart, TransactionId, Extra, EventName)` | Typed purchase. Integer minor units, currency upper cased. Default name `purchase`. See [Typed events](#6-typed-events). |
+| `TrackPurchaseText(AmountMinor, Currency, ItemType, ItemId, Cart, TransactionId, Extra, EventName)` | The same purchase for a digit string amount, sent as a string. |
+| `TrackResource(Flow, Resource, Amount, ItemType, ItemId, Extra, EventName)` | Typed resource flow, `source` or `sink`. Default name `resource_source` or `resource_sink`. |
+| `TrackProgression(Status, P1, P2, P3, bHasScore, Score, Extra, EventName)` | Typed progression, `start`, `complete` or `fail`. Default name `progression_<status>`. |
+| `TrackError(Severity, Message, Stack, Extra, EventName)` | Typed error. Message cut to 200 characters, stack to 2000. Default name `error`. |
 | `Flush()` | Sends queued events now, ignoring the retry window. After a refused key, the one way to make another attempt. |
 | `SubmitFeedback(Message, FeedbackCategory, Rating)` | Posts player feedback. Category is empty or one of `bug`, `suggestion`, `complaint`, `praise`, `playtest`, `other`; Rating is 1 to 5, or 0 to omit. A bad category or rating fails locally with `invalid_category` or `invalid_rating` and sends nothing. While tracking is off it fails with `disabled`. Needs an open session (`no_session` otherwise). |
 | `GetFeedbackCategories()` | The six categories above. |
@@ -311,6 +364,7 @@ the server's events join this player's session.
 | Track Pause Events | off | Also sends `game_paused` on entering the background and `game_resumed` on return. |
 | Session Timeout Seconds | `1800` | iOS and Android: a background stay at least this long ends the session. |
 | Request Timeout Seconds | `15` | Per request timeout. |
+| Performance | off | Samples the frame rate once a second and sends one `health` event per session, on background (mobile) or quit. See [Performance sampling](#performance-sampling). |
 | Verbose Logging | off | Logs every session, batch and retry decision to `LogRavensight`. |
 
 Watch the SDK work with `Log LogRavensight Verbose` in the console, or turn
@@ -409,9 +463,11 @@ Source/Ravensight/
     RavensightSettings.h     UDeveloperSettings, Project Settings > Plugins
     RavensightSubsystem.h    UGameInstanceSubsystem, the entry point
     RavensightProtocol.h     response table, feedback rules, lifecycle rules
+    RavensightTypedEvents.h  typed event property sets and the health sampler, no UObject
   Private/
     RavensightQueue.cpp
     RavensightProtocol.cpp
+    RavensightTypedEvents.cpp
     RavensightSettings.cpp
     RavensightSubsystem.cpp  HTTP, timers, JSON, config, application lifecycle
     RavensightTransport.*    where requests are created and sent; the specs record them here
@@ -422,10 +478,11 @@ Source/Ravensight/
     Tests/
       RavensightQueue.spec.cpp
       RavensightProtocol.spec.cpp
+      RavensightTypedEvents.spec.cpp
       RavensightSubsystem.spec.cpp
       RavensightSpecListener.h
 Tools/
-  host-check/                runs both specs on a plain C++17 compiler
+  host-check/                runs the engine free specs on a plain C++17 compiler
 ```
 
 `FRavensightQueue` makes every decision that is easy to get wrong: what goes in

@@ -3,10 +3,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpRequest.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
+#include "RavensightTypedEvents.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "RavensightSubsystem.generated.h"
 
@@ -158,6 +160,59 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	void TrackEventJson(const FString& EventName, const FString& JsonData);
 
+	// --- Typed events -------------------------------------------------------
+	//
+	// Each helper only builds the reserved rs_ properties and sends them as a
+	// JSON object through TrackEventJson, so numbers stay numbers and queueing,
+	// batching, opt out and the Playtest path are unchanged. Extra is merged
+	// first, so the reserved keys win. An empty EventName uses the default
+	// name. Nothing is validated beyond what is passed through: a wrong value
+	// becomes a flagged event on the dashboard's Implementation health card.
+
+	/**
+	 * A real money purchase. AmountMinor is whole minor units (499 is 4.99 in
+	 * USD). Currency is a 3 letter code and is upper cased. Cart and
+	 * TransactionId are optional. Default event name "purchase".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Typed Events", meta = (AutoCreateRefTerm = "Extra"))
+	void TrackPurchase(int64 AmountMinor, const FString& Currency, const FString& ItemType, const FString& ItemId,
+		const FString& Cart, const FString& TransactionId, const TMap<FString, FString>& Extra, const FString& EventName);
+
+	/**
+	 * The same purchase for an amount you hold as a digit string, such as
+	 * "1234567890123". Sent as a string, untouched.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Typed Events", meta = (AutoCreateRefTerm = "Extra"))
+	void TrackPurchaseText(const FString& AmountMinor, const FString& Currency, const FString& ItemType, const FString& ItemId,
+		const FString& Cart, const FString& TransactionId, const TMap<FString, FString>& Extra, const FString& EventName);
+
+	/**
+	 * An in game resource flow. Flow is "source" (gained) or "sink" (spent).
+	 * ItemType and ItemId are optional. Default event name "resource_source"
+	 * or "resource_sink".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Typed Events", meta = (AutoCreateRefTerm = "Extra"))
+	void TrackResource(const FString& Flow, const FString& Resource, double Amount, const FString& ItemType,
+		const FString& ItemId, const TMap<FString, FString>& Extra, const FString& EventName);
+
+	/**
+	 * A progression step. Status is "start", "complete" or "fail". P1 is
+	 * required; P2 and P3 narrow it (world, level, area). The score is only
+	 * sent when bHasScore is true. Default event name "progression_start",
+	 * "progression_complete" or "progression_fail".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Typed Events", meta = (AutoCreateRefTerm = "Extra"))
+	void TrackProgression(const FString& Status, const FString& P1, const FString& P2, const FString& P3,
+		bool bHasScore, double Score, const TMap<FString, FString>& Extra, const FString& EventName);
+
+	/**
+	 * An error. Severity is debug, info, warning, error or critical. Message
+	 * is cut to 200 characters and Stack to 2000. Default event name "error".
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Typed Events", meta = (AutoCreateRefTerm = "Extra"))
+	void TrackError(const FString& Severity, const FString& Message, const FString& Stack,
+		const TMap<FString, FString>& Extra, const FString& EventName);
+
 	/** Sends queued events now, ignoring the retry window. */
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	void Flush();
@@ -259,7 +314,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.2.1". */
+	/** The plugin version, "0.3.0". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
@@ -277,6 +332,17 @@ private:
 	void SetStatusReason(const FString& Reason);
 	/** bAtFront puts it ahead of events the game tracked before Init. */
 	void QueueGameStartedOnce(bool bAtFront = false);
+
+	/** Sends a typed event as a JSON object through TrackEventJson. */
+	void SendTyped(const FRavensightTypedEvent& Event);
+
+	/** Once a second: samples the frame rate into the health reservoir. */
+	bool OnHealthTick(float DeltaTime);
+	void StartHealthSampling();
+	void StopHealthSampling();
+
+	/** Sends the one health event of this session, if sampling is on and any sample exists. */
+	void SendHealthOnce();
 
 	/** Validates, tags and queues one event. TrackEventJson and the lifecycle events share it. */
 	void EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront);
@@ -420,6 +486,14 @@ private:
 	bool bTrackLifecycleEvents = true;
 	bool bTrackPauseEvents = false;
 	bool bVerboseLogging = false;
+
+	/** Opt in performance sampling (the bPerformance setting). */
+	bool bPerformance = false;
+	FRavensightHealthSampler HealthSampler;
+	FTSTicker::FDelegateHandle HealthTickerHandle;
+
+	/** Milliseconds from process start to Init, or 0 when unknown. */
+	double BootMs = 0.0;
 
 	FTimerHandle FlushTimerHandle;
 	FTimerHandle RetryTimerHandle;

@@ -2,6 +2,34 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.3.0] - 2026-10-15
+
+Not yet compiled in Unreal. The engine free logic passes the host check
+(`bash Tools/host-check/run.sh`); the subsystem changes, the new setting and
+the Blueprint signatures need an editor build.
+
+### Added
+
+* Typed event helpers on `URavensightSubsystem`, Blueprint callable under
+  Ravensight > Typed Events: `TrackPurchase` (and `TrackPurchaseText` for a
+  digit string amount), `TrackResource`, `TrackProgression` and `TrackError`.
+  Each sends the reserved `rs_` properties as a JSON object through
+  `TrackEventJson`, so numbers stay numbers. Extra properties merge first and
+  the reserved keys win; an event name override is optional.
+* Opt in performance sampling, the `Performance` project setting (off by
+  default). An `FTSTicker` samples the frame rate once a second into a
+  reservoir of at most 600 samples, and one `health` event (median and 10th
+  percentile fps, memory in MB, boot time in ms) is sent per session, on
+  background entry on iOS and Android and on quit, never from the ticker.
+* `RavensightTypedEvents`, the engine free property builders and health
+  sampler, with the `Ravensight.TypedEvents` automation spec, also run by the
+  host check.
+* The session create request now carries `"sdk": "unreal/0.3.0"`.
+
+### Changed
+
+* Version 0.3.0 in `Ravensight.uplugin` and `RavensightVersion::Sdk`.
+
 ## [0.2.1] - 2026-10-10
 
 First release compiled in Unreal. Still a beta: not yet run in a packaged

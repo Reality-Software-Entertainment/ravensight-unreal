@@ -10,8 +10,8 @@ depend on generated `.generated.h` files that only UnrealHeaderTool produces.
 The engine checks below are the real ones.
 
 The one thing that does run without the engine is `host-check/` (see
-[Host check](#host-check) below): the queue, the protocol table and their
-specs, which use no UObject at all.
+[Host check](#host-check) below): the queue, the protocol table, the typed
+event builders and health sampler, and their specs, which use no UObject at all.
 
 ## The fast path
 
@@ -76,7 +76,8 @@ of a shipping build entirely.
 bash Tools/host-check/run.sh
 ```
 
-Compiles `RavensightQueue.cpp`, `RavensightProtocol.cpp` and both spec files,
+Compiles `RavensightQueue.cpp`, `RavensightProtocol.cpp`,
+`RavensightTypedEvents.cpp` and their spec files,
 unchanged, with any C++17 compiler (`CXX` overrides `c++`) and
 `-Wall -Wextra -Wshadow -Werror`, against stand-in headers in
 `host-check/include/` for the handful of engine types they use (`FString`,
