@@ -38,6 +38,12 @@ namespace
 	const TCHAR* const DeviceIdKey = TEXT("DeviceId");
 	const TCHAR* const TrackingEnabledKey = TEXT("TrackingEnabled");
 
+	/** Written only with the Consent setting on Opt In, once the player has said yes. */
+	const TCHAR* const OptInKey = TEXT("OptIn");
+
+	/** The per event id key inside each event's data. */
+	const TCHAR* const EventIdKey = TEXT("rs_event_id");
+
 	/** iOS and Android background marker, so a swipe killed app can report its exit next launch. */
 	const TCHAR* const MarkerTokenKey = TEXT("BackgroundSessionToken");
 	const TCHAR* const MarkerExpiresAtKey = TEXT("BackgroundSessionExpiresAt");
@@ -80,6 +86,8 @@ void URavensightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	Queue.SetMaxQueueSize(Settings->MaxQueueSize);
 	Queue.SetEnabled(Settings->bEnabled);
+	Consent = Settings->Consent;
+	StartUnixSeconds = FDateTime::UtcNow().ToUnixTimestamp();
 
 	// The player's saved choice is read before anything else can happen, so
 	// an opted out player's machine never reaches the network. A Playtest run
@@ -100,8 +108,16 @@ void URavensightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 
 	if (Settings->IngestKey.TrimStartAndEnd().IsEmpty())
 	{
-		UE_LOG(LogRavensight, Warning,
-			TEXT("No ingest key set. Fill in Project Settings > Plugins > Ravensight, or call Init from code. Nothing will be sent until then."));
+		// Inert: no file written, no request, no timer, every call a no-op.
+		// A public repository can ship with no key, so a clone or a
+		// development build sends nothing.
+		bNoKey = true;
+		SetStatusReason(RavensightReason::NoKey);
+		if (!Settings->bOptional)
+		{
+			UE_LOG(LogRavensight, Warning,
+				TEXT("No ingest key, so analytics is off for this run. Fill in Project Settings > Plugins > Ravensight or call Init from code (tick Optional to silence this line)."));
+		}
 		return;
 	}
 
@@ -167,14 +183,31 @@ void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApi
 		return;
 	}
 
+	const URavensightSettings* Settings = URavensightSettings::Get();
+
 	IngestKey = InIngestKey.TrimStartAndEnd();
 	if (IngestKey.IsEmpty())
 	{
-		UE_LOG(LogRavensight, Warning, TEXT("Init called with an empty ingest key. Nothing will be sent."));
+		// Inert, as with an empty key in Project Settings. A later Init with
+		// a key still starts the plugin.
+		bNoKey = true;
+		Queue.Clear();
+		SetStatusReason(RavensightReason::NoKey);
+		if (!Settings->bOptional)
+		{
+			UE_LOG(LogRavensight, Warning, TEXT("Init called with an empty ingest key. Nothing will be sent."));
+		}
 		return;
 	}
 
-	const URavensightSettings* Settings = URavensightSettings::Get();
+	bNoKey = false;
+	Distribution = RavensightProtocol::ValidDistribution(Settings->Distribution);
+	if (Distribution.IsEmpty() && !Settings->Distribution.TrimStartAndEnd().IsEmpty())
+	{
+		UE_LOG(LogRavensight, Warning,
+			TEXT("The Distribution label is over %d characters or has a control character, so it is not sent."),
+			RavensightProtocol::MaxDistributionLength);
+	}
 
 	ApiUrl = NormalizeApiUrl(InApiUrl.IsEmpty() ? Settings->ApiUrl : InApiUrl);
 	GameVersion = InGameVersion.IsEmpty() ? ResolveGameVersion() : InGameVersion;
@@ -200,9 +233,31 @@ void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApi
 		DeviceId = TEXT("pt-") + PlaytestRunId;
 		Platform = PlaytestPlatform;
 	}
+	else if (Consent == ERavensightConsent::OptIn && !Queue.IsLocallyEnabled())
+	{
+		// Opt In before the player's yes: no device id is made or read.
+		DeviceId.Reset();
+	}
 	else
 	{
 		DeviceId = ResolveDeviceId();
+	}
+
+	// Events tracked before Init were given an id without the device part,
+	// since there was no device id yet. None has been sent, so add it now.
+	if (!DeviceId.IsEmpty())
+	{
+		const FString Prefix = RavensightProtocol::EventIdPrefix(DeviceId);
+		for (int32 Index = 0; Index < Queue.Num(); ++Index)
+		{
+			const TSharedPtr<FJsonObject> Data = ParseJsonObject(Queue.GetAt(Index).DataJson);
+			FString Id;
+			if (Data.IsValid() && Data->TryGetStringField(EventIdKey, Id) && Id.StartsWith(TEXT("-")))
+			{
+				Data->SetStringField(EventIdKey, Prefix + Id);
+				Queue.ReplaceDataAt(Index, WriteJson(Data.ToSharedRef()));
+			}
+		}
 	}
 
 	Log(FString::Printf(TEXT("initialized against %s as %s on %s%s"),
@@ -309,6 +364,13 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 		return;
 	}
 
+	if (bInitialized && DeviceId.IsEmpty())
+	{
+		// The first yes with Consent on Opt In: only now is an id made, or
+		// the one kept from an earlier yes read back.
+		DeviceId = ResolveDeviceId();
+	}
+
 	Log(TEXT("tracking opted in"));
 	StartIfAllowed();
 }
@@ -321,17 +383,41 @@ void URavensightSubsystem::SaveTrackingEnabled(bool bEnabled)
 	}
 
 	GConfig->SetBool(SaveSection, TrackingEnabledKey, bEnabled, GGameUserSettingsIni);
+	if (bEnabled && URavensightSettings::Get()->Consent == ERavensightConsent::OptIn)
+	{
+		GConfig->SetBool(SaveSection, OptInKey, true, GGameUserSettingsIni);
+	}
+	else if (!bEnabled)
+	{
+		// The device id is kept; ResetDeviceId forgets it.
+		GConfig->RemoveKey(SaveSection, OptInKey, GGameUserSettingsIni);
+	}
 	GConfig->Flush(false, GGameUserSettingsIni);
 }
 
 bool URavensightSubsystem::LoadTrackingEnabled()
+{
+	return LoadTrackingChoice(URavensightSettings::Get()->Consent);
+}
+
+bool URavensightSubsystem::LoadTrackingChoice(ERavensightConsent InConsent)
 {
 	bool bSaved = true;
 	if (GConfig)
 	{
 		GConfig->GetBool(SaveSection, TrackingEnabledKey, bSaved, GGameUserSettingsIni);
 	}
-	return bSaved;
+	if (!bSaved || InConsent != ERavensightConsent::OptIn)
+	{
+		return bSaved;
+	}
+
+	bool bOptedIn = false;
+	if (GConfig)
+	{
+		GConfig->GetBool(SaveSection, OptInKey, bOptedIn, GGameUserSettingsIni);
+	}
+	return bOptedIn;
 }
 
 void URavensightSubsystem::SetEnabled(bool bInEnabled)
@@ -362,6 +448,23 @@ FString URavensightSubsystem::ResetDeviceId()
 	if (IsPlaytest())
 	{
 		UE_LOG(LogRavensight, Log, TEXT("ResetDeviceId ignored during a Playtest run; the saved device id is unchanged."));
+		return DeviceId;
+	}
+
+	if (Consent == ERavensightConsent::OptIn && !Queue.IsLocallyEnabled())
+	{
+		// Opt In without a current yes: forget a saved id and make none. The
+		// next yes makes a fresh one.
+		if (GConfig)
+		{
+			GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+			GConfig->Flush(false, GGameUserSettingsIni);
+		}
+		DeviceId.Reset();
+		BumpQueueGeneration();
+		Queue.Clear();
+		Queue.InvalidateSession();
+		Log(TEXT("device id forgotten; a new one is made on the next yes"));
 		return DeviceId;
 	}
 
@@ -471,6 +574,40 @@ void URavensightSubsystem::RefuseKey()
 	}
 }
 
+void URavensightSubsystem::EndRunForKey()
+{
+	if (bStoppedForRun)
+	{
+		return;
+	}
+
+	bKeyRefused = true;
+	if (!bKeyRefusedLogged)
+	{
+		bKeyRefusedLogged = true;
+		UE_LOG(LogRavensight, Warning,
+			TEXT("Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key."));
+	}
+
+	// Queue cleared, timers stopped, nothing more sent; the next launch tries
+	// the key again.
+	StopForRun(RavensightReason::InvalidKey, TEXT("key"));
+}
+
+FString URavensightSubsystem::NextEventId()
+{
+	if (EventNonce.IsEmpty())
+	{
+		// The platform GUID generator, which the engine backs with the
+		// system's secure random source on each platform (uuid_generate on
+		// Apple, CoCreateGuid on Windows). The first 32 bits of a version 4
+		// GUID are all random.
+		EventNonce = FString::Printf(TEXT("%08x"), FGuid::NewGuid().A);
+	}
+	++EventCounter;
+	return RavensightProtocol::EventId(DeviceId, StartUnixSeconds, EventNonce, EventCounter);
+}
+
 // --- Tracking ---------------------------------------------------------------
 
 void URavensightSubsystem::TrackEvent(const FString& EventName, const TMap<FString, FString>& Data)
@@ -497,7 +634,7 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		return;
 	}
 
-	if (!Queue.IsActive() || bStoppedForRun)
+	if (!Queue.IsActive() || bStoppedForRun || bNoKey)
 	{
 		return;
 	}
@@ -514,13 +651,14 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		}
 	}
 
+	if (!Parsed.IsValid())
+	{
+		Parsed = MakeShared<FJsonObject>();
+	}
+
 	if (IsPlaytest())
 	{
 		// The same synthetic tags every SDK puts on a Playtest run's events.
-		if (!Parsed.IsValid())
-		{
-			Parsed = MakeShared<FJsonObject>();
-		}
 		Parsed->SetBoolField(TEXT("synthetic"), true);
 		Parsed->SetStringField(TEXT("persona"), PlaytestPersona);
 		Parsed->SetStringField(TEXT("pt_job"), PlaytestJobId);
@@ -529,7 +667,26 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		Parsed->SetStringField(TEXT("pt_tier"), TEXT("T2_driven_build"));
 	}
 
-	DataJson = Parsed.IsValid() ? WriteJson(Parsed.ToSharedRef()) : FString(TEXT("{}"));
+	// Inside the event's data, so a batch sent again after a failure carries
+	// the same id and the server can recognise it.
+	Parsed->SetStringField(EventIdKey, NextEventId());
+	DataJson = WriteJson(Parsed.ToSharedRef());
+
+	// The size the server checks: the data as JSON, in UTF-8 bytes. Bigger
+	// events are dropped here rather than refused with a 400 later.
+	const FTCHARToUTF8 Utf8Data(*DataJson);
+	if (Utf8Data.Length() > RavensightProtocol::MaxEventBytes)
+	{
+		if (!bTooLargeLogged)
+		{
+			bTooLargeLogged = true;
+			UE_LOG(LogRavensight, Warning,
+				TEXT("Dropped event '%s': its data is larger than %d bytes as JSON (further drops are not logged)."),
+				*EventName, RavensightProtocol::MaxEventBytes);
+		}
+		OnFlushFailed.Broadcast(TEXT("event_too_large"));
+		return;
+	}
 
 	const int64 Timestamp = FDateTime::UtcNow().ToUnixTimestamp();
 	const FRavensightEvent Event(EventName, DataJson, Timestamp);
@@ -805,10 +962,10 @@ void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttp
 	}
 
 	case ERavensightResponseAction::FatalKey:
-		// A refused key is never "assume tracking is enabled". The queue is
-		// kept and an explicit Flush makes one more attempt.
+		// A refused key is never "assume tracking is enabled", and a retry
+		// cannot help: the run ends here.
 		bSettingsChecked = true;
-		RefuseKey();
+		EndRunForKey();
 		return;
 
 	case ERavensightResponseAction::KillSwitch:
@@ -875,6 +1032,10 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	Body->SetStringField(TEXT("deviceId"), DeviceId);
 	Body->SetStringField(TEXT("gameVersion"), GameVersion);
 	Body->SetStringField(TEXT("platform"), Platform);
+	if (!Distribution.IsEmpty())
+	{
+		Body->SetStringField(TEXT("distribution"), Distribution);
+	}
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/session"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
@@ -970,8 +1131,8 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 	}
 
 	case ERavensightResponseAction::FatalKey:
-		RefuseKey();
 		OnSessionFailed.Broadcast(RavensightReason::InvalidKey);
+		EndRunForKey();
 		return;
 
 	case ERavensightResponseAction::KillSwitch:
@@ -1197,6 +1358,11 @@ bool URavensightSubsystem::IsSessionReady() const
 bool URavensightSubsystem::IsTrackingActive() const
 {
 	return Queue.IsActive() && !bStoppedForRun && !bKeyRefused;
+}
+
+bool URavensightSubsystem::IsEnabled() const
+{
+	return bInitialized && IsTrackingActive();
 }
 
 int32 URavensightSubsystem::GetQueuedEventCount() const
@@ -1489,7 +1655,9 @@ void URavensightSubsystem::SendExitUnderToken(const FString& Token, double Exite
 {
 	const TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
 	Entry->SetStringField(TEXT("event"), TEXT("game_exited"));
-	Entry->SetObjectField(TEXT("data"), MakeShared<FJsonObject>());
+	const TSharedRef<FJsonObject> ExitData = MakeShared<FJsonObject>();
+	ExitData->SetStringField(EventIdKey, NextEventId());
+	Entry->SetObjectField(TEXT("data"), ExitData);
 	Entry->SetNumberField(TEXT("timestamp"), FMath::FloorToDouble(ExitedAtSeconds));
 
 	TArray<TSharedPtr<FJsonValue>> EventValues;

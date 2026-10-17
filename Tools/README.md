@@ -107,6 +107,18 @@ engine API moved between 5.x releases.
 
 ## What was verified in Unreal
 
+For 0.3.0, on 2026-10-16, the same way (Unreal Engine 5.8, Xcode 27.0, a
+scratch host project with the plugin copied under `Plugins/`): the editor
+target built with warnings and shadowed variables as errors, with no
+warnings; `RunUAT.sh BuildPlugin -TargetPlatforms=Mac` succeeded for the
+editor and the game in Development and Shipping; `Automation RunTests
+Ravensight` ran 99 tests, 99 passed; `bash Tools/host-check/run.sh` ran 74
+cases, 0 failed. The host check's stand-in `FString` gained `operator[]`,
+`AppendChar` and `+=`, and `FMath` gained `FRand`, for the new
+`RavensightProtocol` helpers and the queue's jitter.
+
+The 0.2.1 record:
+
 For 0.2.1, on 2026-10-10, with Unreal Engine 5.8.3 and Xcode 27.0 on an
 Apple silicon Mac, in a scratch C++ host project with the plugin under
 `Plugins/`:

@@ -2,6 +2,81 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.3.0] - 2026-10-16
+
+For games whose builds or source anyone can download. A project that sets
+only its key and none of the new settings behaves as on 0.2.1, except for
+the changes listed first. Still a beta: not yet run in a packaged game or on
+a device.
+
+### Changes for 0.2.1 projects
+
+* A `401` or `403` to the settings check or to `POST /session` (other than
+  `tracking_disabled` and a refused Playtest token) now ends the run: the
+  queue is cleared, the timers stop, nothing more is sent, and
+  `OnTrackingDisabled` fires with the new source `key`. In 0.2.1 the events
+  stayed queued and `Flush()` made one more attempt. The status reason is
+  still `invalid_key`, logged once. A batch `401` still opens a new session
+  first; a later batch `403` still only stops the automatic retries.
+* Retry waits carry plus or minus 20 percent jitter, never under half a
+  second and never over 5 minutes. `Retry-After` is still obeyed exactly.
+  `FRavensightQueue::SetRandomSource` replaces the source; one that returns
+  0.5 gives the 0.2.1 ladder exactly.
+* Every event's data gains an `rs_event_id` key, and an event with no data is
+  sent with that one key instead of `{}`.
+* An event whose data is over 8,192 bytes as JSON is dropped before it is
+  queued, with one warning for the run and `OnFlushFailed("event_too_large")`.
+  In 0.2.1 it was sent and dropped on the server's `400`.
+* `Init` with an empty key, or auto initialize with an empty Ingest Key,
+  sets the status reason to `no_key` and drops anything tracked so far.
+* `LoadTrackingEnabled()` reads the choice for the project's Consent setting;
+  with the default it returns what it did before.
+
+### Added
+
+* **Inert without a key.** An empty Ingest Key writes nothing to
+  `GameUserSettings.ini`, makes no request and starts no timer, and every
+  call is a no-op until an `Init` with a key. One warning, silenced by the new
+  **Optional** setting.
+* **`IsEnabled()`**, true only while the plugin is collecting, and
+  `GetDistribution()`.
+* **Consent** (`ERavensightConsent`, Opt Out by default, or Opt In), a project
+  setting. With Opt In nothing is sent, no device id is made and tracked
+  events are dropped until `SetTrackingEnabled(true)`. The yes is saved as
+  `[Ravensight] OptIn` in `GameUserSettings.ini`; a no removes it and keeps
+  the device id. Events tracked right after the yes are queued while the
+  settings check runs. `ResetDeviceId` without a current yes forgets the
+  saved id and makes none.
+* **Distribution**, a project setting: a label of at most 40 characters, sent
+  on `POST /session` as `distribution`. A label that is too long or has a
+  control character is not sent and is logged once.
+* **`rs_event_id`** on every event, including `game_exited` sent under an old
+  session: the first 16 characters of the device id, the start time in hex,
+  an 8 hex character launch nonce from `FGuid::NewGuid`, and a counter.
+  Events tracked before `Init` get the device part when `Init` runs. A batch
+  sent again carries the same ids. `RavensightProtocol::EventId`,
+  `EventIdPrefix` and `ValidDistribution` are pure and covered by the host
+  check.
+* README: a "Public builds" section and a compatibility table.
+* Specs: the jitter (`Ravensight.Queue`, 4 cases), the distribution label and
+  `rs_event_id` (`Ravensight.Protocol`, 4 cases), and in `Ravensight.Subsystem`
+  (13 cases) an inert start, Init with an empty key then a real one, Opt In
+  before and after the yes, revoking, the distribution on the session body,
+  a refused key on the settings check and on the session, a batch `401`
+  still refreshing, the id shape, prefix and uniqueness, a resend carrying
+  the same ids, and the 8 KB cap.
+
+### Verified
+
+* Unreal Engine 5.8 on macOS (Xcode 27.0), a scratch host project: the
+  editor target builds with warnings and shadowed variables as errors, with
+  no warnings; `RunUAT.sh BuildPlugin -TargetPlatforms=Mac` succeeds for the
+  editor and the game in Development and Shipping; the automation specs run
+  headless in the editor, **99 tests, 99 passed**; the host check, 74 cases,
+  0 failed.
+* Not run: a packaged game, iOS, Android, Windows, Linux, and any engine
+  version other than 5.8.
+
 ## [0.2.1] - 2026-10-10
 
 First release compiled in Unreal. Still a beta: not yet run in a packaged

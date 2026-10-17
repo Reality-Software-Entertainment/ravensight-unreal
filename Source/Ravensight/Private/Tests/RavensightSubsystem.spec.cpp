@@ -24,8 +24,12 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Interfaces/IHttpRequest.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Misc/ConfigCacheIni.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "RavensightSettings.h"
 #include "RavensightSpecListener.h"
 #include "RavensightSubsystem.h"
@@ -37,6 +41,7 @@ namespace
 	const TCHAR* const SaveSection = TEXT("Ravensight");
 	const TCHAR* const TrackingEnabledKey = TEXT("TrackingEnabled");
 	const TCHAR* const DeviceIdKey = TEXT("DeviceId");
+	const TCHAR* const OptInKey = TEXT("OptIn");
 
 	/** A canned answer, as the HTTP module would hand it to a completion delegate. */
 	class FRavensightFakeResponse final : public IHttpResponse
@@ -81,6 +86,74 @@ namespace
 		const auto Text = StringCast<TCHAR>(reinterpret_cast<const UTF8CHAR*>(Bytes.GetData()), Bytes.Num());
 		return FString::ConstructFromPtrSize(Text.Get(), Text.Length());
 	}
+
+	TSharedPtr<FJsonObject> JsonOf(const FHttpRequestPtr& Request)
+	{
+		TSharedPtr<FJsonObject> Object;
+		const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(BodyOf(Request));
+		FJsonSerializer::Deserialize(Reader, Object);
+		return Object;
+	}
+
+	/** The event names of a batch request, in order. */
+	TArray<FString> EventNamesOf(const FHttpRequestPtr& Request)
+	{
+		TArray<FString> Names;
+		const TSharedPtr<FJsonObject> Body = JsonOf(Request);
+		const TArray<TSharedPtr<FJsonValue>>* Events = nullptr;
+		if (Body.IsValid() && Body->TryGetArrayField(TEXT("events"), Events) && Events)
+		{
+			for (const TSharedPtr<FJsonValue>& Event : *Events)
+			{
+				Names.Add(Event->AsObject()->GetStringField(TEXT("event")));
+			}
+		}
+		return Names;
+	}
+
+	/** The rs_event_id of each event in a batch request, in order. */
+	TArray<FString> EventIdsOf(const FHttpRequestPtr& Request)
+	{
+		TArray<FString> Ids;
+		const TSharedPtr<FJsonObject> Body = JsonOf(Request);
+		const TArray<TSharedPtr<FJsonValue>>* Events = nullptr;
+		if (Body.IsValid() && Body->TryGetArrayField(TEXT("events"), Events) && Events)
+		{
+			for (const TSharedPtr<FJsonValue>& Event : *Events)
+			{
+				FString Id;
+				Event->AsObject()->GetObjectField(TEXT("data"))->TryGetStringField(TEXT("rs_event_id"), Id);
+				Ids.Add(Id);
+			}
+		}
+		return Ids;
+	}
+
+	/** ^[A-Za-z0-9_-]{1,64}$ */
+	bool IsEventIdShape(const FString& Id)
+	{
+		if (Id.Len() < 1 || Id.Len() > 64)
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < Id.Len(); ++Index)
+		{
+			const TCHAR Char = Id[Index];
+			const bool bOk = (Char >= TCHAR('a') && Char <= TCHAR('z')) || (Char >= TCHAR('A') && Char <= TCHAR('Z'))
+				|| (Char >= TCHAR('0') && Char <= TCHAR('9')) || Char == TCHAR('_') || Char == TCHAR('-');
+			if (!bOk)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool HasSavedKey(const TCHAR* Key)
+	{
+		FString Value;
+		return GConfig->GetString(SaveSection, Key, Value, GGameUserSettingsIni) && !Value.IsEmpty();
+	}
 }
 
 BEGIN_DEFINE_SPEC(
@@ -99,12 +172,21 @@ BEGIN_DEFINE_SPEC(
 	bool bSavedEnabled = true;
 	bool bSavedTrackLifecycleEvents = true;
 	float SavedFlushIntervalSeconds = 5.0f;
+	FString SavedIngestKey;
+	FString SavedDistribution;
+	bool bSavedOptional = false;
+	ERavensightConsent SavedConsent = ERavensightConsent::OptOut;
 
 	/** The saved [Ravensight] keys, put back in AfterEach. */
 	bool bHadTrackingEnabled = false;
 	bool bSavedTrackingEnabled = true;
 	bool bHadDeviceId = false;
 	FString SavedDeviceId;
+	bool bHadOptIn = false;
+	bool bSavedOptIn = false;
+
+	/** Init, then answers the settings check and the session as a healthy server would. */
+	URavensightSubsystem* StartReady();
 
 	/** A new game instance with its own new subsystem, as a launch would create it. */
 	URavensightSubsystem* StartInstance();
@@ -162,6 +244,21 @@ void FRavensightSubsystemSpec::Listen(URavensightSubsystem* Subsystem)
 	Subsystem->OnSuggestionsReceived.AddDynamic(Listener, &URavensightSpecListener::HandleSuggestions);
 }
 
+URavensightSubsystem* FRavensightSubsystemSpec::StartReady()
+{
+	URavensightSubsystem* Subsystem = StartInstance();
+	Subsystem->Init(SpecKey);
+	if (Requests.Num() >= 1)
+	{
+		Answer(Requests.Last(), 200, TEXT("{\"trackingEnabled\":true}"));
+	}
+	if (Requests.Num() >= 2)
+	{
+		Answer(Requests.Last(), 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+	}
+	return Subsystem;
+}
+
 FString FRavensightSubsystemSpec::SavedDeviceIdNow() const
 {
 	FString Value;
@@ -187,13 +284,22 @@ void FRavensightSubsystemSpec::Define()
 		bSavedEnabled = Settings->bEnabled;
 		bSavedTrackLifecycleEvents = Settings->bTrackLifecycleEvents;
 		SavedFlushIntervalSeconds = Settings->FlushIntervalSeconds;
+		SavedIngestKey = Settings->IngestKey;
+		SavedDistribution = Settings->Distribution;
+		bSavedOptional = Settings->bOptional;
+		SavedConsent = Settings->Consent;
 		Settings->bAutoInitialize = false;
 		Settings->bEnabled = true;
 		Settings->bTrackLifecycleEvents = true;
 		Settings->FlushIntervalSeconds = 5.0f;
+		Settings->Distribution = FString();
+		Settings->bOptional = false;
+		Settings->Consent = ERavensightConsent::OptOut;
 
 		bHadTrackingEnabled = GConfig->GetBool(SaveSection, TrackingEnabledKey, bSavedTrackingEnabled, GGameUserSettingsIni);
 		bHadDeviceId = GConfig->GetString(SaveSection, DeviceIdKey, SavedDeviceId, GGameUserSettingsIni);
+		bHadOptIn = GConfig->GetBool(SaveSection, OptInKey, bSavedOptIn, GGameUserSettingsIni);
+		GConfig->RemoveKey(SaveSection, OptInKey, GGameUserSettingsIni);
 		URavensightSubsystem::SaveTrackingEnabled(true);
 
 		Listener = NewObject<URavensightSpecListener>();
@@ -218,6 +324,19 @@ void FRavensightSubsystemSpec::Define()
 		Settings->bEnabled = bSavedEnabled;
 		Settings->bTrackLifecycleEvents = bSavedTrackLifecycleEvents;
 		Settings->FlushIntervalSeconds = SavedFlushIntervalSeconds;
+		Settings->IngestKey = SavedIngestKey;
+		Settings->Distribution = SavedDistribution;
+		Settings->bOptional = bSavedOptional;
+		Settings->Consent = SavedConsent;
+
+		if (bHadOptIn)
+		{
+			GConfig->SetBool(SaveSection, OptInKey, bSavedOptIn, GGameUserSettingsIni);
+		}
+		else
+		{
+			GConfig->RemoveKey(SaveSection, OptInKey, GGameUserSettingsIni);
+		}
 
 		if (bHadTrackingEnabled)
 		{
@@ -497,6 +616,297 @@ void FRavensightSubsystemSpec::Define()
 
 			TestEqual(TEXT("returned id"), Subsystem->ResetDeviceId(), FString(TEXT("pt-run42")));
 			TestEqual(TEXT("saved id"), SavedDeviceIdNow(), FString(TEXT("dev_saved_before_the_run")));
+		});
+	});
+	Describe("a start with no ingest key", [this]()
+	{
+		It("is inert: no request, no saved device id, every call a no-op, status no_key", [this]()
+		{
+			URavensightSettings* Settings = GetMutableDefault<URavensightSettings>();
+			Settings->IngestKey = FString();
+			Settings->bAutoInitialize = true;
+			GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+
+			URavensightSubsystem* Subsystem = StartInstance();
+			Listen(Subsystem);
+			Subsystem->TrackEvent(TEXT("level_completed"), TMap<FString, FString>());
+			Subsystem->Flush();
+			Subsystem->FetchSuggestions();
+			Subsystem->SubmitFeedback(TEXT("hello"));
+
+			TestEqual(TEXT("requests"), Requests.Num(), 0);
+			TestEqual(TEXT("status reason"), Subsystem->GetStatusReason(), FString(TEXT("no_key")));
+			TestFalse(TEXT("IsEnabled"), Subsystem->IsEnabled());
+			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), 0);
+			TestTrue(TEXT("no device id"), Subsystem->GetDeviceId().IsEmpty());
+			TestFalse(TEXT("no saved device id"), HasSavedKey(DeviceIdKey));
+		});
+
+		It("Init with an empty key is inert, and a later Init with a key starts", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->TrackEvent(TEXT("early"), TMap<FString, FString>());
+			Subsystem->Init(FString());
+
+			TestEqual(TEXT("requests while inert"), Requests.Num(), 0);
+			TestEqual(TEXT("status reason"), Subsystem->GetStatusReason(), FString(TEXT("no_key")));
+			TestEqual(TEXT("queued while inert"), Subsystem->GetQueuedEventCount(), 0);
+
+			Subsystem->Init(SpecKey);
+			if (TestEqual(TEXT("requests after a real Init"), Requests.Num(), 1))
+			{
+				TestTrue(TEXT("settings check"), Requests[0]->GetURL().EndsWith(TEXT("/api/v1/settings")));
+			}
+			TestTrue(TEXT("IsEnabled"), Subsystem->IsEnabled());
+		});
+	});
+
+	Describe("Consent on Opt In", [this]()
+	{
+		It("before the yes makes no device id, sends nothing and drops events", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			GConfig->RemoveKey(SaveSection, TrackingEnabledKey, GGameUserSettingsIni);
+			GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Subsystem->TrackEvent(TEXT("before_yes"), TMap<FString, FString>());
+			Subsystem->Flush();
+
+			TestEqual(TEXT("requests"), Requests.Num(), 0);
+			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), 0);
+			TestTrue(TEXT("no device id"), Subsystem->GetDeviceId().IsEmpty());
+			TestFalse(TEXT("no saved device id"), HasSavedKey(DeviceIdKey));
+			TestFalse(TEXT("saved choice"), URavensightSubsystem::LoadTrackingEnabled());
+			TestFalse(TEXT("IsEnabled"), Subsystem->IsEnabled());
+			TestEqual(TEXT("status reason"), Subsystem->GetStatusReason(), FString(TEXT("disabled")));
+		});
+
+		It("the yes is saved, makes the id, and events right after it wait for the settings check", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			GConfig->RemoveKey(SaveSection, TrackingEnabledKey, GGameUserSettingsIni);
+			GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Subsystem->SetTrackingEnabled(true);
+
+			bool bOptIn = false;
+			GConfig->GetBool(SaveSection, OptInKey, bOptIn, GGameUserSettingsIni);
+			TestTrue(TEXT("OptIn saved"), bOptIn);
+			TestTrue(TEXT("saved choice"), URavensightSubsystem::LoadTrackingEnabled());
+			TestTrue(TEXT("device id made"), Subsystem->GetDeviceId().StartsWith(TEXT("dev_")));
+			TestEqual(TEXT("device id saved"), SavedDeviceIdNow(), Subsystem->GetDeviceId());
+
+			Subsystem->TrackEvent(TEXT("after_yes"), TMap<FString, FString>());
+			if (!TestEqual(TEXT("only the settings check so far"), Requests.Num(), 1))
+			{
+				return;
+			}
+			TestEqual(TEXT("queued while the check runs"), Subsystem->GetQueuedEventCount(), 2);
+
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2))
+			{
+				return;
+			}
+			TestTrue(TEXT("session under the new id"), BodyOf(Requests[1]).Contains(Subsystem->GetDeviceId()));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_yes\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3))
+			{
+				return;
+			}
+			const TArray<FString> Names = EventNamesOf(Requests[2]);
+			TestTrue(TEXT("game_started first"), Names.Num() == 2 && Names[0] == TEXT("game_started") && Names[1] == TEXT("after_yes"));
+		});
+
+		It("saying no again keeps the device id; the next launch does not read it before a yes", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			GConfig->RemoveKey(SaveSection, TrackingEnabledKey, GGameUserSettingsIni);
+			GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+
+			URavensightSubsystem* First = StartInstance();
+			First->Init(SpecKey);
+			First->SetTrackingEnabled(true);
+			const FString Id = First->GetDeviceId();
+			First->SetTrackingEnabled(false);
+
+			TestFalse(TEXT("OptIn removed"), HasSavedKey(OptInKey));
+			TestEqual(TEXT("device id kept"), SavedDeviceIdNow(), Id);
+			StopInstance(First);
+			Requests.Reset();
+
+			URavensightSubsystem* Second = StartInstance();
+			Second->Init(SpecKey);
+			TestTrue(TEXT("not read before a yes"), Second->GetDeviceId().IsEmpty());
+			TestEqual(TEXT("no request"), Requests.Num(), 0);
+
+			Second->SetTrackingEnabled(true);
+			TestEqual(TEXT("the same id after a new yes"), Second->GetDeviceId(), Id);
+		});
+	});
+
+	Describe("the Distribution setting", [this]()
+	{
+		It("is sent on the session body", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Distribution = TEXT("native-release");
+			StartReady();
+			if (TestTrue(TEXT("session request"), Requests.Num() >= 2))
+			{
+				TestTrue(TEXT("distribution"), BodyOf(Requests[1]).Contains(TEXT("\"distribution\":\"native-release\"")));
+			}
+		});
+
+		It("is not sent when unset, too long or holding a control character", [this]()
+		{
+			const TArray<FString> Labels = { FString(), TEXT("12345678901234567890123456789012345678901"), TEXT("web\ndemo") };
+			for (const FString& Label : Labels)
+			{
+				GetMutableDefault<URavensightSettings>()->Distribution = Label;
+				Requests.Reset();
+				URavensightSubsystem* Subsystem = StartReady();
+				if (TestTrue(TEXT("session request"), Requests.Num() >= 2))
+				{
+					TestFalse(TEXT("no distribution"), BodyOf(Requests[1]).Contains(TEXT("distribution")));
+				}
+				StopInstance(Subsystem);
+			}
+		});
+	});
+
+	Describe("a refused key", [this]()
+	{
+		It("on the settings check ends the run: queue cleared, nothing more sent", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->OnTrackingDisabled.AddDynamic(Listener, &URavensightSpecListener::HandleTrackingDisabled);
+			Subsystem->Init(SpecKey);
+			Subsystem->TrackEvent(TEXT("queued_before_the_answer"), TMap<FString, FString>());
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1))
+			{
+				return;
+			}
+			Answer(Requests[0], 401, TEXT("{\"error\":\"invalid_api_key\"}"));
+
+			Subsystem->TrackEvent(TEXT("after"), TMap<FString, FString>());
+			Subsystem->Flush();
+			Subsystem->SetTrackingEnabled(true);
+
+			TestEqual(TEXT("requests"), Requests.Num(), 1);
+			TestEqual(TEXT("status reason"), Subsystem->GetStatusReason(), FString(TEXT("invalid_key")));
+			TestFalse(TEXT("IsEnabled"), Subsystem->IsEnabled());
+			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), 0);
+			TestTrue(TEXT("tracking disabled by the key"), Listener->TrackingDisabledSources.Contains(FString(TEXT("key"))));
+		});
+
+		It("on POST /session ends the run too", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2))
+			{
+				return;
+			}
+			Answer(Requests[1], 403, TEXT("{\"error\":\"game_inactive_key\"}"));
+
+			Subsystem->TrackEvent(TEXT("after"), TMap<FString, FString>());
+			Subsystem->Flush();
+
+			TestEqual(TEXT("requests"), Requests.Num(), 2);
+			TestEqual(TEXT("status reason"), Subsystem->GetStatusReason(), FString(TEXT("invalid_key")));
+			TestFalse(TEXT("IsEnabled"), Subsystem->IsEnabled());
+			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), 0);
+		});
+
+		It("a batch 401 still opens a new session first", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3))
+			{
+				return;
+			}
+			Answer(Requests[2], 401, TEXT("{\"error\":\"invalid_session\"}"));
+
+			if (TestEqual(TEXT("a new session request"), Requests.Num(), 4))
+			{
+				TestTrue(TEXT("session"), Requests[3]->GetURL().EndsWith(TEXT("/api/v1/session")));
+			}
+			TestTrue(TEXT("IsEnabled"), Subsystem->IsEnabled());
+			TestTrue(TEXT("still queued"), Subsystem->GetQueuedEventCount() > 0);
+		});
+	});
+
+	Describe("rs_event_id", [this]()
+	{
+		It("is on every event, well formed, unique and led by the device id", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->TrackEvent(TEXT("before_init"), TMap<FString, FString>());
+			Subsystem->Init(SpecKey);
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			Subsystem->TrackEvent(TEXT("after_init"), TMap<FString, FString>());
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3))
+			{
+				return;
+			}
+
+			const TArray<FString> Ids = EventIdsOf(Requests[2]);
+			TestEqual(TEXT("three events"), Ids.Num(), 3);
+			const FString Prefix = Subsystem->GetDeviceId().Left(16) + TEXT("-");
+			TSet<FString> Unique;
+			for (const FString& Id : Ids)
+			{
+				TestTrue(*FString::Printf(TEXT("shape of %s"), *Id), IsEventIdShape(Id));
+				TestTrue(*FString::Printf(TEXT("prefix of %s"), *Id), Id.StartsWith(Prefix));
+				Unique.Add(Id);
+			}
+			TestEqual(TEXT("unique"), Unique.Num(), Ids.Num());
+		});
+
+		It("a batch sent again after a failure carries the same ids", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3))
+			{
+				return;
+			}
+			const TArray<FString> First = EventIdsOf(Requests[2]);
+			Answer(Requests[2], 500, TEXT("{\"error\":\"internal\"}"));
+
+			Subsystem->Flush();
+			if (!TestEqual(TEXT("resent"), Requests.Num(), 4))
+			{
+				return;
+			}
+			TestTrue(TEXT("same ids"), EventIdsOf(Requests[3]) == First && First.Num() > 0);
+		});
+	});
+
+	Describe("an event over 8,192 bytes", [this]()
+	{
+		It("is dropped before it is queued, with OnFlushFailed(event_too_large)", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->OnFlushFailed.AddDynamic(Listener, &URavensightSpecListener::HandleFlushFailed);
+			Subsystem->Init(SpecKey);
+			const int32 Before = Subsystem->GetQueuedEventCount();
+
+			const FString Big = FString::ChrN(RavensightProtocol::MaxEventBytes, TCHAR('x'));
+			Subsystem->TrackEventJson(TEXT("huge"), FString::Printf(TEXT("{\"blob\":\"%s\"}"), *Big));
+			Subsystem->TrackEventJson(TEXT("huge_again"), FString::Printf(TEXT("{\"blob\":\"%s\"}"), *Big));
+			TestEqual(TEXT("not queued"), Subsystem->GetQueuedEventCount(), Before);
+			TestEqual(TEXT("two failures"), Listener->FlushFailedReasons.Num(), 2);
+			TestTrue(TEXT("reason"), Listener->FlushFailedReasons.Num() > 0 && Listener->FlushFailedReasons[0] == TEXT("event_too_large"));
+
+			const FString Fits = FString::ChrN(7000, TCHAR('y'));
+			Subsystem->TrackEventJson(TEXT("fits"), FString::Printf(TEXT("{\"blob\":\"%s\"}"), *Fits));
+			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), Before + 1);
 		});
 	});
 }

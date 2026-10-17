@@ -16,7 +16,7 @@
 namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
-	inline constexpr const TCHAR* Sdk = TEXT("0.2.1");
+	inline constexpr const TCHAR* Sdk = TEXT("0.3.0");
 }
 
 /**
@@ -32,6 +32,9 @@ namespace RavensightReason
 	inline constexpr const TCHAR* RateLimited = TEXT("rate_limited");
 	inline constexpr const TCHAR* SessionFailed = TEXT("session_failed");
 	inline constexpr const TCHAR* PlaytestJobClosed = TEXT("playtest_job_closed");
+
+	/** Started with no ingest key. Inert: nothing is stored or sent. */
+	inline constexpr const TCHAR* NoKey = TEXT("no_key");
 }
 
 /** Which request an answer belongs to. The same status means different things on different endpoints. */
@@ -124,6 +127,30 @@ namespace RavensightProtocol
 
 	/** Every request is abandoned after this long. Seconds. */
 	inline constexpr double DefaultRequestTimeoutSeconds = 15.0;
+
+	/** The largest event the API accepts: its data as JSON, in UTF-8 bytes. */
+	inline constexpr int32 MaxEventBytes = 8192;
+
+	/** The longest distribution label sent on the session. */
+	inline constexpr int32 MaxDistributionLength = 40;
+
+	/**
+	 * The distribution label as it will be sent on POST /session, trimmed, or
+	 * empty when it is unset or not sendable: over MaxDistributionLength
+	 * characters, or holding a control character.
+	 */
+	RAVENSIGHT_API FString ValidDistribution(const FString& InLabel);
+
+	/**
+	 * rs_event_id: the first 16 characters of the device id, the start time
+	 * in hex, the launch nonce and a counter, joined by "-". Any character
+	 * outside A-Z, a-z, 0-9, "_" and "-" becomes "_", so the result always
+	 * matches ^[A-Za-z0-9_-]{1,64}$ for an 8 character nonce.
+	 */
+	RAVENSIGHT_API FString EventId(const FString& DeviceId, int64 StartUnixSeconds, const FString& Nonce, int64 Counter);
+
+	/** The device id part of an rs_event_id alone: its first 16 characters, made safe. */
+	RAVENSIGHT_API FString EventIdPrefix(const FString& DeviceId);
 
 	/** Maps one HTTP answer to one action. Pure. */
 	RAVENSIGHT_API FRavensightResponseVerdict ClassifyResponse(const FRavensightResponseInput& Input);

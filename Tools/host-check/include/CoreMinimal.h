@@ -16,6 +16,7 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <initializer_list>
 #include <map>
@@ -31,6 +32,8 @@ using TCHAR = char;
 using int32 = std::int32_t;
 using int64 = std::int64_t;
 using uint8 = std::uint8_t;
+using uint32 = std::uint32_t;
+using uint64 = std::uint64_t;
 
 template <typename T>
 decltype(auto) MoveTemp(T&& Value) { return std::move(Value); }
@@ -57,6 +60,7 @@ struct FMath
 	template <typename T> static T Max(T A, T B) { return A > B ? A : B; }
 	template <typename T> static T Min(T A, T B) { return A < B ? A : B; }
 	template <typename T> static T Clamp(T V, T Lo, T Hi) { return V < Lo ? Lo : (V > Hi ? Hi : V); }
+	static float FRand() { return static_cast<float>(std::rand()) / (static_cast<float>(RAND_MAX) + 1.0f); }
 };
 
 class FString
@@ -85,6 +89,11 @@ public:
 		const FString Tail(Data.substr(Data.size() - Suffix.Data.size()));
 		return Tail.Equals(Suffix, Case);
 	}
+
+	const TCHAR& operator[](int32 Index) const { return Data[static_cast<size_t>(Index)]; }
+	void AppendChar(TCHAR Char) { Data.push_back(Char); }
+	FString& operator+=(const FString& Other) { Data += Other.Data; return *this; }
+	FString& operator+=(const char* Other) { Data += Other; return *this; }
 
 	void LeftChopInline(int32 Count)
 	{

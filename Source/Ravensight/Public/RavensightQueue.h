@@ -34,6 +34,9 @@ namespace RavensightLimits
 
 	/** Floor on any scheduled retry, so a zero delay never busy loops. */
 	inline constexpr double MinRetrySeconds = 0.5;
+
+	/** Retry waits are the backoff plus or minus this fraction. */
+	inline constexpr double Jitter = 0.2;
 }
 
 /** One queued analytics event. Data is carried as an already serialized JSON object. */
@@ -132,6 +135,16 @@ public:
 	int32 EnqueueAtFront(const FRavensightEvent& Event);
 
 	int32 Num() const { return Events.Num(); }
+
+	/** The queued event at Index, oldest first. Index must be in range. */
+	const FRavensightEvent& GetAt(int32 Index) const { return Events[Index]; }
+
+	/**
+	 * Replaces the data of a queued event that has never been sent, for the
+	 * subsystem to give events tracked before Init their device id prefix.
+	 * Ignored while a batch is in flight or for an index out of range.
+	 */
+	void ReplaceDataAt(int32 Index, const FString& InDataJson);
 	bool IsEmpty() const { return Events.Num() == 0; }
 	const TArray<FRavensightEvent>& GetEvents() const { return Events; }
 
@@ -220,8 +233,22 @@ public:
 	/** Back to the 10 second first delay, with no pending retry window. */
 	void ResetBackoff();
 
-	/** Opens a retry window of the current backoff, then doubles it up to the ceiling. */
+	/**
+	 * Opens a retry window of the current backoff plus or minus 20 percent
+	 * (never under MinRetrySeconds, never over MaxBackoffSeconds), then
+	 * doubles the backoff up to the ceiling. The jitter keeps many copies of a
+	 * game that lost the network together from coming back together.
+	 */
 	void ScheduleBackoff(double NowSeconds);
+
+	/** A source of 0 <= x < 1 for the jitter. Null, the default, uses FMath::FRand. */
+	using FRandomSource = double (*)();
+
+	/** Replaces the jitter source. A source that returns 0.5 gives the unjittered ladder. */
+	void SetRandomSource(FRandomSource InSource) { RandomSource = InSource; }
+
+	/** The jittered wait for one backoff step. Random is 0 <= x < 1; 0.5 returns the step itself. */
+	static double JitteredWaitSeconds(double InBackoffSeconds, double Random);
 
 	/** 0 when a request may go out now, otherwise the wait remaining. */
 	double SecondsUntilNextAttempt(double NowSeconds) const;
@@ -240,6 +267,8 @@ public:
 	FRavensightQueueStats GetStats() const;
 
 private:
+	FRandomSource RandomSource = nullptr;
+
 	/** Removes oldest events until the queue fits the cap. Returns how many went. */
 	int32 TrimToCap(int32 Headroom);
 

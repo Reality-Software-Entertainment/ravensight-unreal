@@ -61,6 +61,15 @@ int32 FRavensightQueue::EnqueueAtFront(const FRavensightEvent& Event)
 	return Dropped;
 }
 
+void FRavensightQueue::ReplaceDataAt(int32 Index, const FString& InDataJson)
+{
+	if (bFlushInProgress || Index < 0 || Index >= Events.Num())
+	{
+		return;
+	}
+	Events[Index].DataJson = InDataJson;
+}
+
 void FRavensightQueue::Clear()
 {
 	DroppedCount += Events.Num();
@@ -251,8 +260,17 @@ void FRavensightQueue::ResetBackoff()
 
 void FRavensightQueue::ScheduleBackoff(double NowSeconds)
 {
-	NextAttemptAtSeconds = NowSeconds + BackoffSeconds;
+	const double Random = RandomSource ? RandomSource() : static_cast<double>(FMath::FRand());
+	NextAttemptAtSeconds = NowSeconds + JitteredWaitSeconds(BackoffSeconds, Random);
 	BackoffSeconds = FMath::Min(BackoffSeconds * 2.0, RavensightLimits::MaxBackoffSeconds);
+}
+
+double FRavensightQueue::JitteredWaitSeconds(double InBackoffSeconds, double Random)
+{
+	// NaN fails both comparisons and lands on 0.
+	const double Clamped = Random >= 1.0 ? 1.0 : (Random > 0.0 ? Random : 0.0);
+	const double Factor = 1.0 - RavensightLimits::Jitter + 2.0 * RavensightLimits::Jitter * Clamped;
+	return FMath::Clamp(InBackoffSeconds * Factor, RavensightLimits::MinRetrySeconds, RavensightLimits::MaxBackoffSeconds);
 }
 
 double FRavensightQueue::SecondsUntilNextAttempt(double NowSeconds) const

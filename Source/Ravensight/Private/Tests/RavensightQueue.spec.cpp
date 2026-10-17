@@ -15,6 +15,14 @@
 
 #if WITH_DEV_AUTOMATION_TESTS
 
+namespace RavensightQueueSpecRandom
+{
+	/** The middle of the jitter range: the unjittered ladder. */
+	double Middle() { return 0.5; }
+	double Lowest() { return 0.0; }
+	double Highest() { return 0.999999; }
+}
+
 BEGIN_DEFINE_SPEC(
 	FRavensightQueueSpec,
 	"Ravensight.Queue",
@@ -51,6 +59,9 @@ void FRavensightQueueSpec::Define()
 	BeforeEach([this]()
 	{
 		Queue = MakeUnique<FRavensightQueue>();
+		// The exact waits below are the unjittered ladder; the jitter has its
+		// own cases.
+		Queue->SetRandomSource(&RavensightQueueSpecRandom::Middle);
 		Now = 1'700'000'000.0;
 	});
 
@@ -293,6 +304,56 @@ void FRavensightQueueSpec::Define()
 			Queue->ResetBackoff();
 			TestEqual(TEXT("reset"), Queue->GetBackoffSeconds(), RavensightLimits::DefaultRetrySeconds);
 			TestEqual(TEXT("no window"), Queue->SecondsUntilNextAttempt(Now), 0.0);
+		});
+	});
+
+	Describe("the retry jitter", [this]()
+	{
+		It("is plus or minus 20 percent, within the floor and the ceiling", [this]()
+		{
+			TestEqual(TEXT("lowest"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.0), 8.0);
+			TestEqual(TEXT("middle"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.5), 10.0);
+			const double High = FRavensightQueue::JitteredWaitSeconds(10.0, 0.999999);
+			TestTrue(TEXT("highest at most 12"), High <= 12.0 && High > 11.99);
+			TestEqual(TEXT("never under the floor"), FRavensightQueue::JitteredWaitSeconds(0.1, 0.0), RavensightLimits::MinRetrySeconds);
+			TestEqual(TEXT("never over the ceiling"), FRavensightQueue::JitteredWaitSeconds(300.0, 0.999999), RavensightLimits::MaxBackoffSeconds);
+		});
+
+		It("jitters each wait while the ladder itself still doubles", [this]()
+		{
+			Fill(1);
+			Queue->SetRandomSource(&RavensightQueueSpecRandom::Lowest);
+			Queue->ScheduleBackoff(Now);
+			TestEqual(TEXT("first wait"), Queue->SecondsUntilNextAttempt(Now), 8.0);
+			Queue->ScheduleBackoff(Now);
+			TestEqual(TEXT("second wait"), Queue->SecondsUntilNextAttempt(Now), 16.0);
+
+			Queue->SetRandomSource(&RavensightQueueSpecRandom::Highest);
+			Queue->ScheduleBackoff(Now);
+			const double Third = Queue->SecondsUntilNextAttempt(Now);
+			TestTrue(TEXT("third wait"), Third > 47.9 && Third <= 48.0);
+		});
+
+		It("stays in range with the default random source", [this]()
+		{
+			Queue->SetRandomSource(nullptr);
+			for (int32 Round = 0; Round < 200; ++Round)
+			{
+				Queue->ResetBackoff();
+				Queue->ScheduleBackoff(Now);
+				const double Wait = Queue->SecondsUntilNextAttempt(Now);
+				if (!TestTrue(TEXT("between 8 and 12 seconds"), Wait >= 8.0 && Wait <= 12.0))
+				{
+					break;
+				}
+			}
+		});
+
+		It("leaves an exact Retry-After alone", [this]()
+		{
+			Queue->SetRandomSource(&RavensightQueueSpecRandom::Lowest);
+			Queue->OnRateLimited(Now, 42.0);
+			TestEqual(TEXT("exact"), Queue->SecondsUntilNextAttempt(Now), 42.0);
 		});
 	});
 

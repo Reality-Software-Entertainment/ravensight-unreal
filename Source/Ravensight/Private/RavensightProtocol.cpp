@@ -100,6 +100,101 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 		Endpoint == ERavensightEndpoint::Session ? RavensightReason::SessionFailed : TEXT(""));
 }
 
+FString RavensightProtocol::ValidDistribution(const FString& InLabel)
+{
+	const FString Label = InLabel.TrimStartAndEnd();
+	if (Label.IsEmpty() || Label.Len() > MaxDistributionLength)
+	{
+		return FString();
+	}
+
+	for (int32 Index = 0; Index < Label.Len(); ++Index)
+	{
+		const uint32 Code = static_cast<uint32>(Label[Index]);
+		if (Code < 0x20 || (Code >= 0x7F && Code <= 0x9F))
+		{
+			return FString();
+		}
+	}
+
+	return Label;
+}
+
+namespace
+{
+	/** Lower case hex of a non negative value, without a prefix. */
+	FString Hex(int64 Value)
+	{
+		static const TCHAR Digits[] = TEXT("0123456789abcdef");
+		uint64 Remaining = Value < 0 ? 0 : static_cast<uint64>(Value);
+		FString Reversed;
+		do
+		{
+			Reversed.AppendChar(Digits[Remaining % 16]);
+			Remaining /= 16;
+		} while (Remaining > 0);
+
+		FString Out;
+		for (int32 Index = Reversed.Len() - 1; Index >= 0; --Index)
+		{
+			Out.AppendChar(Reversed[Index]);
+		}
+		return Out;
+	}
+
+	/** Decimal of a non negative value. */
+	FString Decimal(int64 Value)
+	{
+		uint64 Remaining = Value < 0 ? 0 : static_cast<uint64>(Value);
+		FString Reversed;
+		do
+		{
+			Reversed.AppendChar(static_cast<TCHAR>('0' + static_cast<int32>(Remaining % 10)));
+			Remaining /= 10;
+		} while (Remaining > 0);
+
+		FString Out;
+		for (int32 Index = Reversed.Len() - 1; Index >= 0; --Index)
+		{
+			Out.AppendChar(Reversed[Index]);
+		}
+		return Out;
+	}
+
+	bool IsIdChar(TCHAR Char)
+	{
+		return (Char >= 'a' && Char <= 'z') || (Char >= 'A' && Char <= 'Z') || (Char >= '0' && Char <= '9') || Char == '_' || Char == '-';
+	}
+}
+
+FString RavensightProtocol::EventIdPrefix(const FString& DeviceId)
+{
+	FString Out;
+	const int32 PrefixLength = FMath::Min(DeviceId.Len(), 16);
+	for (int32 Index = 0; Index < PrefixLength; ++Index)
+	{
+		const TCHAR Char = DeviceId[Index];
+		Out.AppendChar(IsIdChar(Char) ? Char : TCHAR('_'));
+	}
+	return Out;
+}
+
+FString RavensightProtocol::EventId(const FString& DeviceId, int64 StartUnixSeconds, const FString& Nonce, int64 Counter)
+{
+	FString Out = EventIdPrefix(DeviceId);
+	Out += TEXT("-");
+	Out += Hex(StartUnixSeconds);
+	Out += TEXT("-");
+	for (int32 Index = 0; Index < Nonce.Len(); ++Index)
+	{
+		const TCHAR Char = Nonce[Index];
+		Out.AppendChar(IsIdChar(Char) ? Char : TCHAR('_'));
+	}
+	Out += TEXT("-");
+	Out += Decimal(Counter);
+	return Out;
+}
+
 FString RavensightProtocol::NormalizeApiUrl(const FString& InUrl)
 {
 	FString Raw = InUrl.TrimStartAndEnd();

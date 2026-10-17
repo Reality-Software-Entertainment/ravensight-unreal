@@ -6,6 +6,21 @@
 #include "Engine/DeveloperSettings.h"
 #include "RavensightSettings.generated.h"
 
+/** When the plugin may start collecting. */
+UENUM(BlueprintType)
+enum class ERavensightConsent : uint8
+{
+	/** The default: on until the player opts out with SetTrackingEnabled(false). */
+	OptOut UMETA(DisplayName = "Opt Out"),
+
+	/**
+	 * Off until the player says yes with SetTrackingEnabled(true). Before the
+	 * yes no device id is made, nothing is sent and tracked events are
+	 * dropped. The yes is saved under [Ravensight] OptIn in GameUserSettings.ini.
+	 */
+	OptIn UMETA(DisplayName = "Opt In"),
+};
+
 /**
  * Project Settings > Plugins > Ravensight.
  *
@@ -41,9 +56,26 @@ public:
 	 * switch and read this game's design suggestions. It cannot read
 	 * analytics, read feedback or touch your account. Rotate it from the
 	 * dashboard at any time.
+	 *
+	 * For a public build use a gt_pub_... key, injected at build time and
+	 * never committed. Empty makes the plugin inert: nothing is stored or
+	 * sent, and the status reason is no_key.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Connection")
 	FString IngestKey;
+
+	/** Silences the one warning an inert start (no ingest key) logs. */
+	UPROPERTY(config, EditAnywhere, Category = "Connection")
+	bool bOptional = false;
+
+	/**
+	 * A short label sent on the session as "distribution", such as
+	 * "native-release" or "web-demo", so you can tell builds apart. At most
+	 * 40 characters and no control characters; anything else is not sent and
+	 * is logged once. Empty sends none.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Connection")
+	FString Distribution;
 
 	/** Reported to the server as the client's game version. Empty uses the project version. */
 	UPROPERTY(config, EditAnywhere, Category = "Connection")
@@ -64,6 +96,14 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Behavior")
 	bool bAutoInitialize = true;
+
+	/**
+	 * Opt Out (the default) keeps the 0.2 behaviour: on until the player opts
+	 * out. Opt In sends nothing and makes no device id until the player's
+	 * SetTrackingEnabled(true).
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Behavior")
+	ERavensightConsent Consent = ERavensightConsent::OptOut;
 
 	/** Seconds between automatic flush attempts. 0 flushes only on demand. */
 	UPROPERTY(config, EditAnywhere, Category = "Behavior", meta = (ClampMin = "0.0", UIMax = "60.0"))

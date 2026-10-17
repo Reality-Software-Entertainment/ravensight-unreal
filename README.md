@@ -8,7 +8,7 @@ side kill switch, in one game instance subsystem with no third party
 dependencies. Everything is exposed to Blueprint, so a designer can ship it
 without writing C++.
 
-> **Beta.** Version 0.2.1 compiles in Unreal Engine 5.8.3 on macOS and its
+> **Beta.** Version 0.3.0 compiles in Unreal Engine 5.8.3 on macOS and its
 > automation specs pass in the editor. It has not yet run in a packaged game,
 > on an iOS or Android device, or on any other engine version. What has been
 > run is listed under [Verification status](#verification-status).
@@ -17,11 +17,43 @@ without writing C++.
 * Docs: https://ravensight.io/docs/
 * Privacy: a random per-install device id, no advertising identifier, a saved player opt-out (`SetTrackingEnabled(false)`), no tracking permission prompt needed. What your store label can say: https://ravensight.io/docs/#privacy-label
 * Unreal Engine 5.1 or newer by design; so far built and tested on 5.8.3 only
+* Public builds (demos, jam entries, open source games): no key means no
+  analytics, an opt-in consent mode and a distribution label. See
+  [Public builds](#public-builds).
+
+## Compatibility
+
+| ravensight-unreal | Engine by design | Engine built and spec tested | Server features it uses |
+| --- | --- | --- | --- |
+| 0.2.1 | 5.1 or newer | 5.8.3 on macOS | Sessions, batches, settings, feedback, Playtest header. |
+| 0.3.0 | 5.1 or newer | 5.8.3 on macOS | As 0.2.1, plus `distribution` on `POST /session`, `rs_event_id` in each event's data (the server drops a repeat), and public `gt_pub_` keys. A server that ignores the new field still accepts every request. |
 
 ## Verification status
 
 **Beta. Compiled and spec tested in Unreal Engine 5.8.3 on macOS; not yet run
 in a packaged game or on a device.**
+
+For 0.3.0, on 2026-10-16, with Unreal Engine 5.8 (installed build) and Xcode
+27.0 on an Apple silicon Mac, in a scratch C++ host project with the plugin
+copied under `Plugins/`:
+
+* **Editor build.** `Build.sh HostGameEditor Mac Development` with warnings
+  and shadowed variables as errors: no warnings, no errors.
+* **`RunUAT.sh BuildPlugin -TargetPlatforms=Mac`**: succeeded, the editor
+  and the game in Development and Shipping (so the specs compile out of
+  Shipping as before).
+* **Automation specs in the editor**, headless (`UnrealEditor-Cmd` with
+  `-nullrhi`): 99 tests, 99 passed, 0 failed, 0 not run. That is
+  `Ravensight.Queue` (28), `Ravensight.Protocol` (46) and
+  `Ravensight.Subsystem` (25). Several passing tests carry a warning: the
+  SDK's own warning lines for a refused key, an inert start, an oversized
+  event and a bad distribution label, which those cases cause on purpose,
+  and the editor's iOS device probe.
+* **Host check.** `bash Tools/host-check/run.sh`: 74 cases, 0 failed.
+* Not run for 0.3.0: the host project's own Mac game target, and everything
+  listed as not run below.
+
+What follows is the 0.2.1 record.
 
 What was run, on 2026-10-10, with Unreal Engine 5.8.3 (installed build) and
 Xcode 27.0 on an Apple silicon Mac:
@@ -111,7 +143,7 @@ git submodule update --init --recursive
 ```
 
 Pin a release with `cd Plugins/Ravensight && git checkout <tag>`, for
-example `v0.2.0`.
+example `v0.3.0`.
 
 ### Blueprint only projects
 
@@ -128,8 +160,9 @@ Open **Edit > Project Settings**, scroll the left hand list to the **Plugins**
 group at the bottom, and select **Ravensight**. The panel has two sections:
 
 * **Connection**: `Api Url` (already filled in with
-  `https://api.ravensight.io`), `Ingest Key`, `Game Version`.
-* **Behavior**: enabled, auto initialize, flush interval, queue size,
+  `https://api.ravensight.io`), `Ingest Key`, `Optional`, `Distribution`,
+  `Game Version`.
+* **Behavior**: enabled, auto initialize, consent, flush interval, queue size,
   lifecycle and pause events, session timeout, request timeout, plus a
   **Diagnostics** section with verbose logging.
 
@@ -250,11 +283,13 @@ callable.
 | `SetPlaytestContext(Token, RunId, JobId, Persona)` | Marks the run as a Playtest run, for platforms where the runner cannot set the environment. Call before `Init`. |
 | `IsSessionReady()` | True once a session token exists and has not expired. |
 | `IsTrackingActive()` | True when the Enabled setting, the kill switch, the player's choice and the key all allow sending. |
+| `IsEnabled()` | True only while the plugin is collecting: started with a key and not switched off by the Enabled setting, the player, the server or a refused key. False before `Init` and while inert. |
+| `GetDistribution()` | The distribution label sent on the session, empty when none is sent. |
 | `GetStatusReason()` | Why the SDK is not ready, or empty when it is. See [Status reasons](#status-reasons). |
 | `GetSessionToken()` | The current session token, empty until a session opens. |
 | `IsPlaytest()` | True during a Ravensight Playtest run. |
 | `GetQueuedEventCount()` | Events waiting to be sent. |
-| `GetDeviceId()` | The device identifier this install reports. |
+| `GetDeviceId()` | The device identifier this install reports. Empty before `Init`, while inert, and with Consent on Opt In before the first yes. |
 
 ### Delegates
 
@@ -265,10 +300,10 @@ all of them.
 | --- | --- |
 | `OnSessionReady` | A session token has been issued and events can go out. |
 | `OnSessionFailed(Reason)` | Session creation failed. The SDK retries on its own, except after a refused key. |
-| `OnTrackingDisabled(Source)` | Once, when tracking stops for the rest of the run. Source is `server` for the kill switch (from `GET /settings` or a `403 tracking_disabled`), or `playtest_job_closed` when a Playtest job has ended. |
+| `OnTrackingDisabled(Source)` | Once, when tracking stops for the rest of the run. Source is `server` for the kill switch (from `GET /settings` or a `403 tracking_disabled`), `playtest_job_closed` when a Playtest job has ended, or `key` when the settings check or `POST /session` refused the ingest key. |
 | `OnStatusChanged(Reason)` | The status reason changed. Empty means ready. |
 | `OnEventsFlushed(Count)` | A batch was accepted by the server. |
-| `OnFlushFailed(Reason)` | A batch flush failed. Informational: the retry is automatic. |
+| `OnFlushFailed(Reason)` | A batch flush failed. Informational: the retry is automatic. `event_too_large`: one event's data was over 8,192 bytes as JSON and it was dropped before it was queued, never sent. |
 | `OnFeedbackResult(bSuccess, Reason)` | A feedback submission finished. Reason is empty on success. |
 | `OnSuggestionsReceived(bSuccess, Suggestions)` | EXPERIMENTAL. Each entry is one suggestion as a JSON object string. |
 
@@ -282,10 +317,11 @@ otherwise one of the values every Ravensight SDK uses:
 
 | Reason | Meaning |
 | --- | --- |
-| `disabled` | The Enabled setting is off, or the player opted out. Nothing is sent. |
-| `invalid_key` | The ingest key was refused (a `401`, or a `403` other than the three below). Automatic retries stop for the run, events keep queueing up to the cap, and `Flush()` makes one more attempt. Logged once as a warning: `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ key.` |
+| `no_key` | Started with no ingest key. Inert: nothing is stored or sent until an `Init` with a key. Logged once unless Optional is ticked. |
+| `disabled` | The Enabled setting is off, or the player opted out (or, with Consent on Opt In, has not said yes yet). Nothing is sent. |
+| `invalid_key` | The ingest key was refused. On the settings check or `POST /session` (a `401`, or a `403` other than the three below) the run ends: the queue is cleared, nothing more is sent, and `OnTrackingDisabled` fires with `key`. On a later batch `403`, automatic retries stop, events keep queueing up to the cap, and `Flush()` makes one more attempt. Logged once as a warning: `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.` |
 | `tracking_disabled` | The kill switch is on for your game. The queue is cleared and nothing more is sent this run. |
-| `offline` | The server could not be reached. Retried from 10 seconds, doubling to 5 minutes. |
+| `offline` | The server could not be reached. Retried from 10 seconds, doubling to 5 minutes, each wait plus or minus 20 percent. |
 | `rate_limited` | A `429`. Retried after exactly `Retry-After` seconds. |
 | `session_failed` | A session could not be opened for another reason, or a Playtest token was refused or arrived without a run id. |
 | `playtest_job_closed` | The Playtest job for this run has ended. Nothing more is sent this run. |
@@ -301,10 +337,13 @@ the server's events join this player's session.
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | Api Url | `https://api.ravensight.io` | Only change this if you self host. Whitespace and trailing slashes are trimmed, a trailing `/api/v1` is accepted, and `/api/v1` is appended. Empty means the default. |
-| Ingest Key | none | Your publishable `gt_live_...` key. |
+| Ingest Key | none | Your publishable `gt_live_...` key, or a public build's `gt_pub_...` key. Empty makes the plugin inert. |
+| Optional | off | Silences the one warning an inert start (no ingest key) logs. |
+| Distribution | empty | A short label sent on the session, such as `native-release`. At most 40 characters, no control characters. Empty sends none. |
 | Game Version | empty | Empty uses the project version from Project Settings. |
 | Enabled | on | Off means no request of any kind until `SetEnabled(true)`. Not saved between runs, and separate from the player's own choice. |
 | Auto Initialize | on | Off waits for an explicit `Init` call. |
+| Consent | Opt Out | Opt Out: on until the player opts out. Opt In: nothing is sent and no device id is made until `SetTrackingEnabled(true)`. |
 | Flush Interval Seconds | `5` | How often queued events are sent. `0` sends only at 50 queued, on `Flush`, on background and on quit. |
 | Max Queue Size | `500` | Queue cap. Oldest events are dropped first. |
 | Track Lifecycle Events | on | Sends `game_started` once per session and `game_exited` once on quit. |
@@ -316,6 +355,82 @@ the server's events join this player's session.
 Watch the SDK work with `Log LogRavensight Verbose` in the console, or turn
 Verbose Logging on to get the same lines at normal verbosity in a packaged
 build.
+
+## Public builds
+
+For a game anyone can download, fork or play: a demo, a game jam entry, an
+open source project. A project that sets only its key behaves as on 0.2.1,
+apart from the refused key and jitter changes listed in the CHANGELOG.
+
+* **Use a public key, injected at build time.** Create a public `gt_pub_...`
+  key for the game in the dashboard and never commit it. Leave **Ingest Key**
+  empty in the committed `Config/DefaultGame.ini`, and have your release build
+  supply it, for example by writing it into the staged copy of the config in
+  the build job only, or by turning **Auto Initialize** off and calling
+  `Init` with a value from a header your build script generates and your
+  `.gitignore` lists:
+
+  ```cpp
+  // Source/YourGame/Generated/RavensightBuildKey.h, written by the build script, gitignored
+  #define RAVENSIGHT_BUILD_KEY TEXT("gt_pub_...")
+
+  Ravensight->Init(RAVENSIGHT_BUILD_KEY);
+  ```
+
+  Ship a placeholder header with an empty key in the repository so a clone
+  still compiles.
+* **No key, no analytics.** With an empty key the plugin is inert: it writes
+  nothing to `GameUserSettings.ini`, makes no request, starts no timer, and
+  every call is a quiet no-op. `GetStatusReason()` is `no_key`. It logs one
+  warning; tick **Optional** to silence it. So a clone or a development build
+  sends nothing. A later `Init` with a key still starts it.
+* **`IsEnabled()`** is true only while the plugin is collecting. Use it to
+  skip work that only feeds analytics.
+* **Consent: Opt In** sends nothing until the player says yes. No device id is
+  made and not even the settings check is sent before
+  `SetTrackingEnabled(true)`. Events tracked before the yes are dropped, not
+  held for later; events tracked right after it are queued while the settings
+  check runs. The yes is saved as `[Ravensight] OptIn` in
+  `GameUserSettings.ini`, beside the existing `TrackingEnabled`, and
+  `SetTrackingEnabled(false)` removes it. Saying no again stops everything but
+  keeps the device id; `ResetDeviceId()` forgets it. `LoadTrackingEnabled()`
+  reports the choice for the project's Consent setting, also before `Init`,
+  so the settings checkbox always shows the right state. The default,
+  **Opt Out**, keeps the 0.2.1 behaviour.
+* **Distribution** is a short label of your own, such as `native-release`,
+  `web-demo` or `jam-build`, sent on the session as `distribution` so you can
+  tell builds apart. At most 40 characters and no control characters; a label
+  that breaks either rule is not sent and is logged once. Empty sends none.
+* **`rs_event_id`** is added to every event's data: the first 16 characters of
+  the device id (characters outside `A-Z`, `a-z`, `0-9`, `_` and `-` become
+  `_`), the start time in hex, an 8 hex character value made once per launch
+  from the platform's GUID generator (`FGuid::NewGuid`, backed by the system's
+  secure random source), and a counter. It always matches
+  `^[A-Za-z0-9_-]{1,64}$`. Events tracked before `Init` get the device part
+  when `Init` runs. A batch sent again after a failure carries the same ids,
+  and the server drops a repeat. The queue lives in memory, so events still
+  queued when the game exits are not sent on the next launch.
+* **A refused key ends the run.** A `401` or `403` to the settings check or to
+  opening a session (other than `tracking_disabled` and a refused Playtest
+  token) means the key was revoked, rotated or is wrong, and a retry cannot
+  help. The plugin stops for the rest of the run: queue cleared, timers
+  stopped, nothing more sent, one warning, `OnTrackingDisabled("key")`. A
+  later `SetTrackingEnabled(true)` saves the choice but restarts nothing; the
+  next launch tries the key again. A `401` on a batch still means the session
+  expired: a new one is opened first.
+* **Jitter.** A failed request is retried after the backoff plus or minus 20
+  percent, never sooner than half a second and never later than 5 minutes. A
+  server's `Retry-After` is obeyed exactly.
+* **Events over 8,192 bytes** of data as JSON (what the server checks; the
+  name and timestamp are not counted) are dropped before they are queued,
+  with one warning for the run and `OnFlushFailed("event_too_large")` for
+  each.
+
+What a request carries: the settings check sends only the `X-API-Key`
+header; the session sends `deviceId`, `gameVersion`, `platform` and, when
+set, `distribution`; a batch sends `events`, each with `event`, `data` and
+`timestamp`; feedback sends `message` and the optional `category` and
+`rating`.
 
 ## About your ingest key
 
@@ -336,8 +451,15 @@ your account. Rotate it from the dashboard at any time.
 * **Queue.** Events accumulate up to Max Queue Size. Past that the oldest are
   dropped so the newest are kept. The queue lives in memory only.
 * **Failures keep events.** Offline, a timeout or a server error keeps every
-  event and retries from 10 seconds, doubling to a 5 minute ceiling. A `429`,
-  or a `503` that sends `Retry-After`, waits exactly that many seconds.
+  event and retries from 10 seconds, doubling to a 5 minute ceiling, each wait
+  plus or minus 20 percent (never under half a second) so many players who
+  lost the network together do not come back together. A `429`, or a `503`
+  that sends `Retry-After`, waits exactly that many seconds.
+* **Event ids.** Every event's data carries an `rs_event_id`, so a batch sent
+  again after a failure is recognised as the same events.
+* **Oversized events.** An event whose data is over 8,192 bytes as JSON is
+  dropped before it is queued, with one warning for the run and
+  `OnFlushFailed("event_too_large")` for each.
 * **A batch the server refuses.** A `400` on a batch halves it and retries; a
   single event that still gets a `400` (too large, a bad name) is dropped,
   counted in `GetQueue().GetStats().Dropped`, logged once, and the rest of the
@@ -462,7 +584,7 @@ UnrealEditor-Cmd YourProject.uproject \
   -ReportExportPath="$PWD/AutomationReport"
 ```
 
-On Unreal Engine 5.8.3 on macOS: 78 tests, 78 passed.
+On Unreal Engine 5.8.3 on macOS: 99 tests, 99 passed (0.3.0).
 
 Without the engine, on any machine with a C++17 compiler:
 

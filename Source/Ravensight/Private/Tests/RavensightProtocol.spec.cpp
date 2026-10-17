@@ -20,6 +20,25 @@
 
 namespace RavensightProtocolSpecHelpers
 {
+	/** ^[A-Za-z0-9_-]{1,64}$, without a regex engine. */
+	bool IsEventIdShape(const FString& Id)
+	{
+		if (Id.Len() < 1 || Id.Len() > 64)
+		{
+			return false;
+		}
+		for (int32 Index = 0; Index < Id.Len(); ++Index)
+		{
+			const TCHAR Char = Id[Index];
+			const bool bOk = (Char >= 'a' && Char <= 'z') || (Char >= 'A' && Char <= 'Z') || (Char >= '0' && Char <= '9') || Char == '_' || Char == '-';
+			if (!bOk)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	FRavensightResponseVerdict Answer(ERavensightEndpoint Endpoint, int32 Status, const FString& Error = FString(), int32 BatchSize = 0, int32 BatchUnauthorizedInARow = 0, bool bRetryAfter = false)
 	{
 		FRavensightResponseInput Input;
@@ -159,6 +178,46 @@ void FRavensightProtocolSpec::Define()
 			TestTrue(TEXT("feedback 429"), IsAction(Answer(ERavensightEndpoint::Feedback, 429), ERavensightResponseAction::Fail));
 			TestTrue(TEXT("feedback 401 refreshes"), IsAction(Answer(ERavensightEndpoint::Feedback, 401), ERavensightResponseAction::RefreshSession));
 			TestTrue(TEXT("suggestions offline"), IsAction(Answer(ERavensightEndpoint::Suggestions, 0), ERavensightResponseAction::Fail));
+		});
+	});
+
+	Describe("the distribution label", [this]()
+	{
+		It("is sent trimmed when it is 1 to 40 characters", [this]()
+		{
+			TestEqual(TEXT("plain"), RavensightProtocol::ValidDistribution(TEXT("native-release")), FString(TEXT("native-release")));
+			TestEqual(TEXT("trimmed"), RavensightProtocol::ValidDistribution(TEXT("  web-demo ")), FString(TEXT("web-demo")));
+			TestEqual(TEXT("forty"), RavensightProtocol::ValidDistribution(TEXT("1234567890123456789012345678901234567890")),
+				FString(TEXT("1234567890123456789012345678901234567890")));
+		});
+
+		It("is not sent when empty, over 40 characters or holding a control character", [this]()
+		{
+			TestTrue(TEXT("empty"), RavensightProtocol::ValidDistribution(FString()).IsEmpty());
+			TestTrue(TEXT("forty one"), RavensightProtocol::ValidDistribution(TEXT("12345678901234567890123456789012345678901")).IsEmpty());
+			TestTrue(TEXT("newline"), RavensightProtocol::ValidDistribution(TEXT("web\ndemo")).IsEmpty());
+			TestTrue(TEXT("tab"), RavensightProtocol::ValidDistribution(TEXT("web\tdemo")).IsEmpty());
+			TestTrue(TEXT("delete"), RavensightProtocol::ValidDistribution(TEXT("web\x7f")).IsEmpty());
+		});
+	});
+
+	Describe("rs_event_id", [this]()
+	{
+		It("is the device id prefix, the start time in hex, the nonce and a counter", [this]()
+		{
+			TestEqual(TEXT("parts"),
+				RavensightProtocol::EventId(TEXT("dev_0123456789abcdef0123456789abcdef"), 1760000000, TEXT("0a1b2c3d"), 5),
+				FString(TEXT("dev_0123456789ab-68e77800-0a1b2c3d-5")));
+		});
+
+		It("always matches ^[A-Za-z0-9_-]{1,64}$", [this]()
+		{
+			using namespace RavensightProtocolSpecHelpers;
+			TestTrue(TEXT("a guid device id"), IsEventIdShape(RavensightProtocol::EventId(TEXT("dev_6f9619ff-8b86-d011-b42d-00cf4fc964ff"), 1760000000, TEXT("0a1b2c3d"), 1)));
+			TestTrue(TEXT("a playtest device id"), IsEventIdShape(RavensightProtocol::EventId(TEXT("pt-run.42/a b"), 1760000000, TEXT("0a1b2c3d"), 99)));
+			TestTrue(TEXT("no device id yet"), IsEventIdShape(RavensightProtocol::EventId(FString(), 0, TEXT("0a1b2c3d"), 1)));
+			TestTrue(TEXT("a large counter"), IsEventIdShape(RavensightProtocol::EventId(TEXT("dev_0123456789abcdef"), 1760000000, TEXT("ffffffff"), 9223372036854775807LL)));
+			TestEqual(TEXT("unsafe characters become underscores"), RavensightProtocol::EventIdPrefix(TEXT("pt-run.42/a b")), FString(TEXT("pt-run_42_a_b")));
 		});
 	});
 

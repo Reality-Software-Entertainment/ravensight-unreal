@@ -7,6 +7,7 @@
 #include "Interfaces/IHttpRequest.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
+#include "RavensightSettings.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "RavensightSubsystem.generated.h"
 
@@ -23,14 +24,15 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightSessionFailed, const FStr
 
 /**
  * Fired once when tracking stops for the rest of the run: "server" for the
- * kill switch (from GET /settings or a 403 tracking_disabled), or
- * "playtest_job_closed" when a Playtest run's job has ended.
+ * kill switch (from GET /settings or a 403 tracking_disabled),
+ * "playtest_job_closed" when a Playtest run's job has ended, or "key" when
+ * the settings check or POST /session refused the ingest key.
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightTrackingDisabled, const FString&, Source);
 
 /**
  * Fired whenever the status reason changes. Empty means ready; otherwise one
- * of disabled, invalid_key, tracking_disabled, offline, rate_limited,
+ * of no_key, disabled, invalid_key, tracking_disabled, offline, rate_limited,
  * session_failed or playtest_job_closed.
  */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightStatusChanged, const FString&, Reason);
@@ -38,7 +40,11 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightStatusChanged, const FStr
 /** Fired after a batch is accepted by the server. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightEventsFlushed, int32, Count);
 
-/** Fired when a batch flush fails. The SDK retries on its own, so this is informational. */
+/**
+ * Fired when a batch flush fails. The SDK retries on its own, so this is
+ * informational. "event_too_large": one event's data was over 8,192 bytes as
+ * JSON, and it was dropped before it was queued, never sent.
+ */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightFlushFailed, const FString&, Reason);
 
 /** Fired with the result of SubmitFeedback. Reason is empty on success. */
@@ -106,12 +112,17 @@ public:
 	/**
 	 * Writes the player's choice without a running subsystem, for code that
 	 * runs before the game instance exists. The subsystem reads it when it
-	 * starts.
+	 * starts. With the Consent setting on Opt In, a yes also saves
+	 * [Ravensight] OptIn; a no always removes it. The device id is kept.
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	static void SaveTrackingEnabled(bool bEnabled);
 
-	/** The saved player choice. True when nothing has been saved. */
+	/**
+	 * The saved player choice for the project's Consent setting. Opt Out:
+	 * true when nothing has been saved. Opt In: true only once the player
+	 * said yes. Use it for the starting state of a settings checkbox.
+	 */
 	UFUNCTION(BlueprintPure, Category = "Ravensight")
 	static bool LoadTrackingEnabled();
 
@@ -199,8 +210,21 @@ public:
 	bool IsTrackingActive() const;
 
 	/**
+	 * True only while the plugin is running and collecting: it was started
+	 * with a key, and nobody switched it off (the Enabled setting, the
+	 * player, the server, or a refused key). False before Init and while
+	 * inert. Use it to skip work that only feeds analytics.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Ravensight")
+	bool IsEnabled() const;
+
+	/** The distribution label sent on the session, or empty when none is sent. */
+	UFUNCTION(BlueprintPure, Category = "Ravensight")
+	FString GetDistribution() const { return Distribution; }
+
+	/**
 	 * Why the SDK is not ready. Empty when ready or not started; otherwise
-	 * disabled, invalid_key, tracking_disabled, offline, rate_limited,
+	 * no_key, disabled, invalid_key, tracking_disabled, offline, rate_limited,
 	 * session_failed or playtest_job_closed. OnStatusChanged fires on change.
 	 */
 	UFUNCTION(BlueprintPure, Category = "Ravensight")
@@ -221,7 +245,11 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Ravensight")
 	int32 GetQueuedEventCount() const;
 
-	/** The generated, non advertising device identifier this install reports. */
+	/**
+	 * The generated, non advertising device identifier this install reports.
+	 * Empty before Init, while inert, and with Consent on Opt In before the
+	 * first yes.
+	 */
 	UFUNCTION(BlueprintPure, Category = "Ravensight")
 	FString GetDeviceId() const;
 
@@ -259,7 +287,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.2.1". */
+	/** The plugin version, "0.3.0". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
@@ -271,8 +299,21 @@ private:
 	/** Stops for the rest of the run: kill switch or Playtest stop. */
 	void StopForRun(const FString& Reason, const FString& Source);
 
-	/** The ingest key was refused: automatic retries stop, the queue is kept. */
+	/** A later batch refused the key: automatic retries stop, the queue is kept. */
 	void RefuseKey();
+
+	/**
+	 * The settings check or POST /session refused the key (revoked, rotated
+	 * or wrong). A retry cannot help: the run ends, the queue is cleared and
+	 * a later SetTrackingEnabled(true) restarts nothing.
+	 */
+	void EndRunForKey();
+
+	/** The next rs_event_id for this launch. */
+	FString NextEventId();
+
+	/** The saved choice for a consent mode. */
+	static bool LoadTrackingChoice(ERavensightConsent InConsent);
 
 	void SetStatusReason(const FString& Reason);
 	/** bAtFront puts it ahead of events the game tracked before Init. */
@@ -373,6 +414,17 @@ private:
 	FString DeviceId;
 	FString StatusReason;
 
+	/** Sent on POST /session when not empty. Validated by RavensightProtocol::ValidDistribution. */
+	FString Distribution;
+
+	/** The Consent project setting, read once in Initialize. */
+	ERavensightConsent Consent = ERavensightConsent::OptOut;
+
+	/** rs_event_id parts: the launch time, a secure random nonce and a counter. */
+	int64 StartUnixSeconds = 0;
+	FString EventNonce;
+	int64 EventCounter = 0;
+
 	/** Playtest context. Token empty outside a Playtest run. */
 	FString PlaytestToken;
 	FString PlaytestRunId;
@@ -380,6 +432,9 @@ private:
 	FString PlaytestPersona;
 
 	bool bInitialized = false;
+
+	/** Started with no ingest key: every call is a no-op until an Init with a key. */
+	bool bNoKey = false;
 	bool bStarted = false;
 	bool bSettingsChecked = false;
 	bool bSettingsRequestPending = false;
@@ -393,6 +448,7 @@ private:
 	bool bKeyRefused = false;
 	bool bKeyRefusedLogged = false;
 	bool bDroppedEventLogged = false;
+	bool bTooLargeLogged = false;
 	bool bMarkerChecked = false;
 
 	/** Shrinks after a 400 on /track/batch, back to MaxBatchSize after a 202. */

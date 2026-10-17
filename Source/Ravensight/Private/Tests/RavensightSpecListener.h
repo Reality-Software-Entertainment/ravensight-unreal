@@ -33,6 +33,21 @@ public:
 		LastSuggestionCount = Suggestions.Num();
 	}
 
+	UFUNCTION()
+	void HandleFlushFailed(const FString& Reason)
+	{
+		FlushFailedReasons.Add(Reason);
+	}
+
+	UFUNCTION()
+	void HandleTrackingDisabled(const FString& Source)
+	{
+		TrackingDisabledSources.Add(Source);
+	}
+
+	TArray<FString> FlushFailedReasons;
+	TArray<FString> TrackingDisabledSources;
+
 	int32 FeedbackCalls = 0;
 	bool bLastFeedbackSuccess = false;
 	FString LastFeedbackReason;
