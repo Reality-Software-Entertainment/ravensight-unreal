@@ -94,6 +94,19 @@ public:
 	void AppendChar(TCHAR Char) { Data.push_back(Char); }
 	FString& operator+=(const FString& Other) { Data += Other.Data; return *this; }
 	FString& operator+=(const char* Other) { Data += Other; return *this; }
+	static FString ChrN(int32 Count, char C) { return FString(std::string(static_cast<size_t>(Count), C)); }
+
+	FString Left(int32 Count) const
+	{
+		return FString(Data.substr(0, static_cast<size_t>(Count < 0 ? 0 : Count)));
+	}
+
+	FString ToUpper() const
+	{
+		std::string Out = Data;
+		std::transform(Out.begin(), Out.end(), Out.begin(), [](unsigned char C) { return static_cast<char>(std::toupper(C)); });
+		return FString(Out);
+	}
 
 	void LeftChopInline(int32 Count)
 	{
@@ -159,6 +172,7 @@ public:
 	void Insert(const T& Item, int32 Index) { Items.insert(Items.begin() + Index, Item); }
 	void Reserve(int32 Count) { Items.reserve(static_cast<size_t>(Count)); }
 	void Reset() { Items.clear(); }
+	void Sort() { std::sort(Items.begin(), Items.end()); }
 
 	void RemoveAt(int32 Index, int32 Count = 1)
 	{

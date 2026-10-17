@@ -17,6 +17,12 @@ namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
 	inline constexpr const TCHAR* Sdk = TEXT("0.3.0");
+
+	/** "unreal/<version>", sent as "sdk" on the session create request. */
+	inline FString SdkTag()
+	{
+		return FString(TEXT("unreal/")) + FString(Sdk);
+	}
 }
 
 /**

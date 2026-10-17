@@ -4,9 +4,11 @@
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Containers/Ticker.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "HAL/PlatformMemory.h"
 #include "HAL/PlatformMisc.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
@@ -14,9 +16,11 @@
 #include "HttpModule.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/App.h"
 #include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/CoreDelegates.h"
+#include "Math/UnrealMathUtility.h"
 #include "Misc/Guid.h"
 #include "Misc/Parse.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
@@ -83,6 +87,7 @@ void URavensightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	bTrackLifecycleEvents = Settings->bTrackLifecycleEvents;
 	bTrackPauseEvents = Settings->bTrackPauseEvents;
 	bVerboseLogging = Settings->bVerboseLogging;
+	bPerformance = Settings->bPerformance;
 
 	Queue.SetMaxQueueSize(Settings->MaxQueueSize);
 	Queue.SetEnabled(Settings->bEnabled);
@@ -130,6 +135,14 @@ void URavensightSubsystem::Deinitialize()
 
 	const bool bCanSend = bInitialized && bStarted && Queue.IsActive() && !bStoppedForRun;
 
+	// On quit (desktop) or the last chance (mobile, if the background send
+	// never ran). Queued ahead of the final flush; the sampler's one send
+	// rule makes a second trigger a no-op.
+	if (bCanSend)
+	{
+		SendHealthOnce();
+	}
+
 	if (bCanSend && bTrackLifecycleEvents && Lifecycle.TryClaimExited())
 	{
 		TrackEvent(TEXT("game_exited"), TMap<FString, FString>());
@@ -145,6 +158,7 @@ void URavensightSubsystem::Deinitialize()
 	}
 
 	StopTimers();
+	StopHealthSampling();
 	UnbindApplicationDelegates();
 	EndBackgroundTask();
 
@@ -214,6 +228,11 @@ void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApi
 	Platform = UGameplayStatics::GetPlatformName();
 
 	bInitialized = true;
+
+	// Process start to this call, for the health event. GStartTime is when
+	// the engine started timing, which is the earliest point the plugin can see.
+	BootMs = FMath::Max(0.0, (FPlatformTime::Seconds() - GStartTime) * 1000.0);
+	StartHealthSampling();
 
 	if (IsPlaytest())
 	{
@@ -545,6 +564,7 @@ void URavensightSubsystem::SetStatusReason(const FString& Reason)
 
 void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Source)
 {
+	StopHealthSampling();
 	if (bStoppedForRun)
 	{
 		return;
@@ -624,6 +644,135 @@ void URavensightSubsystem::TrackEvent(const FString& EventName, const TMap<FStri
 void URavensightSubsystem::TrackEventJson(const FString& EventName, const FString& JsonData)
 {
 	EnqueueEvent(EventName, JsonData, false);
+}
+
+// --- Typed events -----------------------------------------------------------
+
+namespace
+{
+	TArray<FRavensightProp> ExtraProps(const TMap<FString, FString>& Extra)
+	{
+		TArray<FRavensightProp> Props;
+		for (const TPair<FString, FString>& Pair : Extra)
+		{
+			Props.Add(FRavensightProp::MakeString(Pair.Key, Pair.Value));
+		}
+		return Props;
+	}
+}
+
+void URavensightSubsystem::SendTyped(const FRavensightTypedEvent& Event)
+{
+	// A whole number is written without a fraction, so 499 stays 499.
+	const TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	for (const FRavensightProp& Prop : Event.Props)
+	{
+		if (Prop.Kind == ERavensightPropKind::Number)
+		{
+			Payload->SetNumberField(Prop.Key, Prop.Number);
+		}
+		else
+		{
+			Payload->SetStringField(Prop.Key, Prop.Text);
+		}
+	}
+
+	TrackEventJson(Event.Name, WriteJson(Payload));
+}
+
+void URavensightSubsystem::TrackPurchase(int64 AmountMinor, const FString& Currency, const FString& ItemType, const FString& ItemId,
+	const FString& Cart, const FString& TransactionId, const TMap<FString, FString>& Extra, const FString& EventName)
+{
+	SendTyped(RavensightTyped::BuildPurchase(
+		false, AmountMinor, FString(), Currency, ItemType, ItemId, Cart, TransactionId, ExtraProps(Extra), EventName));
+}
+
+void URavensightSubsystem::TrackPurchaseText(const FString& AmountMinor, const FString& Currency, const FString& ItemType, const FString& ItemId,
+	const FString& Cart, const FString& TransactionId, const TMap<FString, FString>& Extra, const FString& EventName)
+{
+	SendTyped(RavensightTyped::BuildPurchase(
+		true, 0, AmountMinor, Currency, ItemType, ItemId, Cart, TransactionId, ExtraProps(Extra), EventName));
+}
+
+void URavensightSubsystem::TrackResource(const FString& Flow, const FString& Resource, double Amount, const FString& ItemType,
+	const FString& ItemId, const TMap<FString, FString>& Extra, const FString& EventName)
+{
+	SendTyped(RavensightTyped::BuildResource(Flow, Resource, Amount, ItemType, ItemId, ExtraProps(Extra), EventName));
+}
+
+void URavensightSubsystem::TrackProgression(const FString& Status, const FString& P1, const FString& P2, const FString& P3,
+	bool bHasScore, double Score, const TMap<FString, FString>& Extra, const FString& EventName)
+{
+	SendTyped(RavensightTyped::BuildProgression(Status, P1, P2, P3, bHasScore, Score, ExtraProps(Extra), EventName));
+}
+
+void URavensightSubsystem::TrackError(const FString& Severity, const FString& Message, const FString& Stack,
+	const TMap<FString, FString>& Extra, const FString& EventName)
+{
+	SendTyped(RavensightTyped::BuildError(Severity, Message, Stack, ExtraProps(Extra), EventName));
+}
+
+// --- Health sampling --------------------------------------------------------
+
+void URavensightSubsystem::StartHealthSampling()
+{
+	if (!bPerformance || HealthTickerHandle.IsValid())
+	{
+		return;
+	}
+
+	HealthTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+		FTickerDelegate::CreateUObject(this, &URavensightSubsystem::OnHealthTick), 1.0f);
+}
+
+void URavensightSubsystem::StopHealthSampling()
+{
+	if (HealthTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(HealthTickerHandle);
+		HealthTickerHandle.Reset();
+	}
+}
+
+bool URavensightSubsystem::OnHealthTick(float /*DeltaTime*/)
+{
+	if (bShuttingDown)
+	{
+		return false;
+	}
+
+	// Sample only while events would actually be sent, and never send from here.
+	if (Queue.IsActive() && !bStoppedForRun && !bKeyRefused)
+	{
+		// The last frame's time, read once a second.
+		const double FrameSeconds = FApp::GetDeltaTime();
+		if (FrameSeconds > 0.0)
+		{
+			HealthSampler.AddSample(1.0 / FrameSeconds, FMath::FRand());
+		}
+	}
+
+	return true;
+}
+
+void URavensightSubsystem::SendHealthOnce()
+{
+	if (!bPerformance || !bInitialized || !Queue.IsActive() || bStoppedForRun)
+	{
+		return;
+	}
+
+	FRavensightHealthSummary Summary;
+	if (!HealthSampler.TryClaimSend(Summary))
+	{
+		return;
+	}
+
+	const FPlatformMemoryStats MemoryStats = FPlatformMemory::GetStats();
+	const double MemoryMb = static_cast<double>(MemoryStats.UsedPhysical) / (1024.0 * 1024.0);
+
+	SendTyped(RavensightTyped::BuildHealth(
+		Summary.FpsMedian, Summary.FpsP10, MemoryMb > 0.0, MemoryMb, BootMs > 0.0, BootMs));
 }
 
 void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront)
@@ -1036,6 +1185,7 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	{
 		Body->SetStringField(TEXT("distribution"), Distribution);
 	}
+	Body->SetStringField(TEXT("sdk"), RavensightVersion::SdkTag());
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/session"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
@@ -1503,6 +1653,14 @@ void URavensightSubsystem::OnApplicationWillEnterBackground()
 		TrackEvent(TEXT("game_paused"), TMap<FString, FString>());
 	}
 
+	// Mobile only: the session may never return, so this is the health send.
+	// Desktop sends on quit. The sampler's one send rule keeps the other
+	// trigger from sending a second one.
+	if (IsMobilePlatform())
+	{
+		SendHealthOnce();
+	}
+
 	if (IsMobilePlatform())
 	{
 		BackgroundedAtSeconds = NowSeconds();
@@ -1555,6 +1713,7 @@ void URavensightSubsystem::OnApplicationEnteredForeground()
 
 			Queue.InvalidateSession();
 			Lifecycle.ResetForNewSession();
+			HealthSampler.ResetForNewSession();
 			QueueGameStartedOnce();
 			return;
 		}
