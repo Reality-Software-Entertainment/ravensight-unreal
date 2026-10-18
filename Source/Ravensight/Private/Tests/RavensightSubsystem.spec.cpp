@@ -971,6 +971,41 @@ void FRavensightSubsystemSpec::Define()
 		});
 	});
 
+    Describe("prepared Player Reports", [this]()
+    {
+        It("copies screenshot bytes, uploads without credentials and retries by receipt", [this]()
+        {
+            auto* Subsystem = StartReady();
+            TArray<uint8> Image = {137,80,78,71,0,1,2};
+            const FString Handle = Subsystem->PrepareReport(TEXT("stable-report"), TEXT("Door blocked"), TEXT("bug"), Image);
+            TestFalse(TEXT("prepared"), Handle.IsEmpty()); Image.Reset();
+            Subsystem->SubmitReport(Handle);
+            TestEqual(TEXT("create"), Requests.Last()->GetVerb(), FString(TEXT("POST")));
+            TestEqual(TEXT("pinned session"), Requests.Last()->GetHeader(TEXT("X-Session-Token")), FString(TEXT("tok_spec")));
+            Answer(Requests.Last(),201,TEXT("{\"id\":\"0123456789abcdef01234567\",\"status\":\"pending\"}"));
+            Answer(Requests.Last(),200,TEXT("{\"url\":\"https://storage.test/\",\"fields\":{\"key\":\"staging/test\"}}"));
+            TestEqual(TEXT("storage"),Requests.Last()->GetURL(),FString(TEXT("https://storage.test/")));
+            TestTrue(TEXT("no session"),Requests.Last()->GetHeader(TEXT("X-Session-Token")).IsEmpty());
+            TestTrue(TEXT("no ingest key"),Requests.Last()->GetHeader(TEXT("X-API-Key")).IsEmpty());
+            TestTrue(TEXT("binary content"),Requests.Last()->GetContent().Contains(137));
+            Answer(Requests.Last(),204,TEXT(""));
+            TestTrue(TEXT("finalize"),Requests.Last()->GetURL().EndsWith(TEXT("/finalize")));
+            Answer(Requests.Last(),202,TEXT("{\"id\":\"0123456789abcdef01234567\",\"status\":\"processing\"}"));
+            Subsystem->SubmitReport(Handle); TestEqual(TEXT("retry polls"),Requests.Last()->GetVerb(),FString(TEXT("GET")));
+            Answer(Requests.Last(),200,TEXT("{\"id\":\"0123456789abcdef01234567\",\"status\":\"complete\"}"));
+            Subsystem->ResetDeviceId(); const int32 Before=Requests.Num(); Subsystem->SubmitReport(Handle);
+            TestEqual(TEXT("old identity refused"),Requests.Num(),Before);
+        });
+        It("rejects invalid images and sends nothing while opted out", [this]()
+        {
+            auto* Subsystem=StartReady(); const TArray<uint8> Bad={1,2,3}; const TArray<uint8> Empty;
+            TestTrue(TEXT("bad image"),Subsystem->PrepareReport(TEXT("stable-id"),TEXT("message"),TEXT("bug"),Bad).IsEmpty());
+            const FString Handle=Subsystem->PrepareReport(TEXT("stable-id"),TEXT("message"),TEXT("bug"),Empty);
+            Subsystem->SetTrackingEnabled(false); const int32 Before=Requests.Num(); Subsystem->SubmitReport(Handle);
+            TestEqual(TEXT("no request"),Requests.Num(),Before);
+        });
+    });
+
 }
 
 #endif

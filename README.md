@@ -759,3 +759,30 @@ has been built and spec tested on macOS only (Unreal Engine 5.8.3); see
 ## License
 
 MIT. Copyright 2026 Reality Software Entertainment.
+
+### Player Reports with screenshots (held release)
+
+Use `PrepareReport(ClientId, Message, Category, Screenshot)` after the player previews
+and approves an encoded PNG, JPEG or WebP screenshot. Supply bytes from your game's own
+capture/encoding flow, at most 1,000,000 bytes. Empty bytes explicitly mean text-only;
+this API does not capture the desktop or silently fall back to text.
+
+Keep the returned handle and bind `OnReportResult(Handle, Status, ReportId, Error)`.
+Once `OnSessionReady` fires, call `SubmitReport(Handle)`. `processing` means accepted
+for sanitization, not yet in the inbox. Explicitly call `GetReportStatus(Handle)` until
+`complete` or `canceled`. On a retryable failure, call `SubmitReport` on that SAME
+handle. `CancelReport` releases an unfinished submission through the server;
+`ForgetReport` only releases local memory after the operation has finished.
+
+Preparation copies the payload/image and capture timestamp, sends no request, and keeps
+at most 16 handles. All calls must be on the game thread. The first submission pins the
+current session, and later operations do not silently open a new one. Reset identity,
+opt-out, shutdown and synthetic playtest sessions prevent submission. Weak callbacks
+reject stale responses. Storage uploads use fresh HTTPS multipart requests without
+API, session or playtest credentials. No automatic retries or polling occur.
+
+Screenshot reports reserve 20,001 weighted events; text-only reports use 1 event.
+Processing and refunds are server-authoritative. A transport error is not proof that
+nothing was charged: poll or cancel the retained handle. Server support requires Player
+Reports enabled with private storage, migrated Mongo indexes and the processing worker.
+The server strips image metadata and delivers sanitized JPEGs and thumbnails to the inbox.

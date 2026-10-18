@@ -2209,3 +2209,116 @@ FString URavensightSubsystem::GetConfigJson(const FString& Key, const FString& F
 {
 	const auto Value = ConfigValue(Key); return Value.IsValid() && (Value->Type == EJson::Object || Value->Type == EJson::Array) ? ConfigJson(Value) : Fallback;
 }
+
+#include "RavensightReportHash.h"
+
+
+FString URavensightSubsystem::PrepareReport(const FString& ClientId, const FString& Message, const FString& Category, const TArray<uint8>& Screenshot)
+{
+    check(IsInGameThread());
+    if (PreparedReports.Num() >= 16 || ClientId.Len() < 8 || ClientId.Len() > 80 || Message.TrimStartAndEnd().IsEmpty() || Message.Len() > 500 || Screenshot.Num() > 1000000 || !RavensightProtocol::ValidateFeedback(Message, Category, 0).IsEmpty()) return FString();
+    for (TCHAR C : ClientId) if (!((C >= 'a' && C <= 'z') || (C >= 'A' && C <= 'Z') || (C >= '0' && C <= '9') || C == '_' || C == '-')) return FString();
+    if (Screenshot.Num() > 0)
+    {
+        const bool Png = Screenshot.Num() >= 4 && Screenshot[0] == 137 && Screenshot[1] == 80 && Screenshot[2] == 78 && Screenshot[3] == 71;
+        const bool Jpeg = Screenshot.Num() >= 3 && Screenshot[0] == 255 && Screenshot[1] == 216 && Screenshot[2] == 255;
+        const bool Webp = Screenshot.Num() >= 12 && FMemory::Memcmp(Screenshot.GetData(), "RIFF", 4) == 0 && FMemory::Memcmp(Screenshot.GetData() + 8, "WEBP", 4) == 0;
+        if (!Png && !Jpeg && !Webp) return FString();
+    }
+    const auto Report = MakeShared<FRavensightPreparedReport>(); Report->Image = Screenshot; Report->Generation = QueueGeneration;
+    const auto Payload = MakeShared<FJsonObject>();
+    Payload->SetStringField(TEXT("clientId"), ClientId); Payload->SetStringField(TEXT("message"), Message.TrimStartAndEnd());
+    Payload->SetStringField(TEXT("category"), Category.IsEmpty() ? TEXT("other") : Category); Payload->SetNumberField(TEXT("capturedAt"), FDateTime::UtcNow().ToUnixTimestamp());
+    if (Screenshot.Num())
+    {
+        const std::string Bytes(reinterpret_cast<const char*>(Screenshot.GetData()), Screenshot.Num());
+        Payload->SetBoolField(TEXT("image"), true); Payload->SetNumberField(TEXT("bytes"), Screenshot.Num());
+        Payload->SetStringField(TEXT("sha256"), UTF8_TO_TCHAR(RavensightReportHash::sha256_hex(Bytes).c_str()));
+    }
+    Report->Payload = WriteJson(Payload);
+    const FString Handle = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    PreparedReports.Add(Handle, Report); return Handle;
+}
+
+bool URavensightSubsystem::CanSendReport(const TSharedPtr<FRavensightPreparedReport>& Report) const
+{
+    return Report.IsValid() && Report->Generation == QueueGeneration && !bShuttingDown && CurrentGate().bAllowFeedback && !IsPlaytest();
+}
+void URavensightSubsystem::SubmitReport(const FString& Handle) { ReportCommand(Handle, TEXT("submit")); }
+void URavensightSubsystem::GetReportStatus(const FString& Handle) { ReportCommand(Handle, TEXT("status")); }
+void URavensightSubsystem::CancelReport(const FString& Handle) { ReportCommand(Handle, TEXT("cancel")); }
+void URavensightSubsystem::ForgetReport(const FString& Handle)
+{
+    check(IsInGameThread()); const auto* Report = PreparedReports.Find(Handle);
+    if (Report && !(*Report)->bBusy) PreparedReports.Remove(Handle);
+}
+void URavensightSubsystem::ReportCommand(const FString& Handle, const FString& Operation)
+{
+    check(IsInGameThread());
+    const auto* Found = PreparedReports.Find(Handle);
+    if (!Found || !CanSendReport(*Found) || (*Found)->bBusy) { OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("report_unavailable")); return; }
+    const auto Report = *Found;
+    if (Report->Token.IsEmpty())
+    {
+        if (Operation != TEXT("submit") || !Queue.IsSessionValid(NowSeconds())) { OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("no_session")); return; }
+        Report->Token = Queue.GetSessionToken();
+    }
+    if (Operation != TEXT("submit") && Report->SubmissionId.IsEmpty()) { OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("report_not_submitted")); return; }
+    Report->bBusy = true;
+    SendReportStep(Handle, Report, Operation == TEXT("submit") ? (Report->SubmissionId.IsEmpty() ? TEXT("create") : TEXT("resume")) : Operation);
+}
+void URavensightSubsystem::SendReportStep(const FString& Handle, const TSharedPtr<FRavensightPreparedReport>& Report, const FString& Step)
+{
+    if (!CanSendReport(Report)) { Report->bBusy = false; OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("report_session_changed")); return; }
+    FString Path = TEXT("/reports"); FString Method = TEXT("POST");
+    if (Step != TEXT("create")) Path += TEXT("/") + Report->SubmissionId;
+    if (Step == TEXT("resume") || Step == TEXT("status")) Method = TEXT("GET");
+    else if (Step == TEXT("cancel")) Method = TEXT("DELETE");
+    else if (Step == TEXT("upload") || Step == TEXT("finalize")) Path += TEXT("/") + Step;
+    const auto Request = MakeRequest(Method, Path);
+    Request->SetHeader(TEXT("Content-Type"), TEXT("application/json")); Request->SetHeader(TEXT("X-Session-Token"), Report->Token);
+    if (Method == TEXT("POST")) Request->SetContentAsString(Step == TEXT("create") ? Report->Payload : TEXT("{}"));
+    Request->OnProcessRequestComplete().BindWeakLambda(this, [this, Handle, Report, Step](FHttpRequestPtr, FHttpResponsePtr Response, bool bConnected)
+    {
+        auto Fail = [&](const FString& Error) { Report->bBusy = false; OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), Error); };
+        if (!CanSendReport(Report)) { Fail(TEXT("report_session_changed")); return; }
+        if (!bConnected || !Response.IsValid() || Response->GetResponseCode() < 200 || Response->GetResponseCode() >= 300) { Fail(TEXT("report_request_failed")); return; }
+        TSharedPtr<FJsonObject> Body; const auto Reader = TJsonReaderFactory<>::Create(Response->GetContentAsString());
+        if (!FJsonSerializer::Deserialize(Reader, Body) || !Body.IsValid()) { Fail(TEXT("invalid_response")); return; }
+        if (Step == TEXT("upload"))
+        {
+            FString Url; const TSharedPtr<FJsonObject>* Fields = nullptr;
+            if (!Body->TryGetStringField(TEXT("url"), Url) || !Url.StartsWith(TEXT("https://")) || Url.Len() < 9 || Url.Contains(TEXT("@")) || Url.Contains(TEXT("\\")) || Url.Contains(TEXT("\r")) || Url.Contains(TEXT("\n")) || Url.Contains(TEXT(" ")) || Url.Contains(TEXT("\t")) || Url[8] == TCHAR('/') || !Body->TryGetObjectField(TEXT("fields"), Fields) || (*Fields)->Values.Num() > 32) { Fail(TEXT("invalid_upload")); return; }
+            const FString Boundary = TEXT("rs-") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+            TArray<uint8> Bytes;
+            auto Append = [&](const FString& Text) { const FTCHARToUTF8 Utf8(*Text); Bytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length()); };
+            for (const auto& Field : (*Fields)->Values)
+            {
+                FString Value; const FString FieldName(*Field.Key);
+                if (FieldName.IsEmpty() || FieldName.Len() > 100 || !Field.Value->TryGetString(Value) || Value.Len() > 16000) { Fail(TEXT("invalid_upload")); return; }
+                for (TCHAR C : FieldName) if (!FChar::IsAlnum(C) && C != '_' && C != '-') { Fail(TEXT("invalid_upload")); return; }
+                Append(TEXT("--") + Boundary + TEXT("\r\nContent-Disposition: form-data; name=\"") + FieldName + TEXT("\"\r\n\r\n") + Value + TEXT("\r\n"));
+            }
+            Append(TEXT("--") + Boundary + TEXT("\r\nContent-Disposition: form-data; name=\"file\"; filename=\"screenshot\"\r\nContent-Type: application/octet-stream\r\n\r\n"));
+            Bytes.Append(Report->Image); Append(TEXT("\r\n--") + Boundary + TEXT("--\r\n"));
+            // Fresh request, deliberately bypasses MakeRequest: no API/playtest/session credentials.
+            const auto Upload = RavensightTransport::CreateRequest(); Upload->SetURL(Url); Upload->SetVerb(TEXT("POST")); Upload->SetTimeout(30.0f);
+            Upload->SetHeader(TEXT("Content-Type"), TEXT("multipart/form-data; boundary=") + Boundary); Upload->SetContent(Bytes);
+            Upload->OnProcessRequestComplete().BindWeakLambda(this, [this, Handle, Report](FHttpRequestPtr, FHttpResponsePtr Uploaded, bool bOk)
+            {
+                if (!CanSendReport(Report) || !bOk || !Uploaded.IsValid() || Uploaded->GetResponseCode() < 200 || Uploaded->GetResponseCode() >= 300) { Report->bBusy = false; OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("upload_failed")); return; }
+                Report->bUploaded = true; SendReportStep(Handle, Report, TEXT("finalize"));
+            });
+            if (!RavensightTransport::Send(Upload)) Fail(TEXT("upload_not_started"));
+            return;
+        }
+        FString Id, Status, ReportId;
+        if (!Body->TryGetStringField(TEXT("id"), Id) || Id.Len() != 24 || !Body->TryGetStringField(TEXT("status"), Status) || (Status != TEXT("pending") && Status != TEXT("processing") && Status != TEXT("complete") && Status != TEXT("canceled"))) { Fail(TEXT("invalid_response")); return; }
+        for (TCHAR C : Id) if (!FChar::IsHexDigit(C)) { Fail(TEXT("invalid_response")); return; }
+        if (!Report->SubmissionId.IsEmpty() && Report->SubmissionId != Id) { Fail(TEXT("invalid_response")); return; }
+        Report->SubmissionId = Id;
+        if ((Step == TEXT("create") || Step == TEXT("resume")) && Status == TEXT("pending") && Report->Image.Num()) { SendReportStep(Handle, Report, Report->bUploaded ? TEXT("finalize") : TEXT("upload")); return; }
+        Body->TryGetStringField(TEXT("reportId"), ReportId); Report->bBusy = false; OnReportResult.Broadcast(Handle, Status, ReportId, TEXT(""));
+    });
+    if (!RavensightTransport::Send(Request)) { Report->bBusy = false; OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("request_not_started")); }
+}

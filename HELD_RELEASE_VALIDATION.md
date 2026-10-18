@@ -27,3 +27,17 @@ Validated locally with Unreal Engine 5.8.3 and Xcode 27 on October 17, 2026:
 The existing scratch HostGame harness was refreshed from this candidate. Its SDK HTTP requests use the fake transport; no live Ravensight service was exercised. The compiler's local staging step is not a remote deployment.
 Packaged game builds, other engine versions and physical devices were not tested for this patch.
 No pushes, tags, marketplace submissions, publishing or remote deployments were performed.
+
+## Player Reports follow-up
+
+- Engine-free host checker: **106 cases passed**, plus **4 portable SHA-256 cases**
+  covering empty input, standard vector, one-megabyte vector and embedded NUL bytes.
+- Added real Unreal subsystem automation cases for preparation, binary upload, absent
+  credentials, processing/finalization, stable retry, identity reset and opt-out.
+- Host checker does not compile the subsystem or run UnrealHeaderTool.
+- Unreal 5.8.3 Mac Development editor build passed with `-WarningsAsErrors`, including
+  UnrealHeaderTool generated Blueprint reflection. Full native automation: **136 passed**
+  (127 clean + 9 expected-warning cases), zero failures/not-run, process exit 0. Both new
+  prepared-report cases passed. Evidence: sibling `validation/unreal-reports-automation/index.json`
+  and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live S3 test.
+- No remote writes, publication or deployment. Live S3/device/game capture checks remain held.

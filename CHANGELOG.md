@@ -4,6 +4,9 @@ All notable changes to this plugin are documented here.
 
 ## [0.3.1] - Unreleased (held)
 
+- Add Blueprint prepared Player Reports, bounded encoded images, stable session-bound retries, explicit status/cancel and local handle cleanup.
+- Upload binary multipart through a fresh credential-free HTTPS request; reject stale consent/identity callbacks and keep synthetic screenshots in playtest artifacts.
+
 - Add native and Blueprint remote config getters, refresh and readiness delegate.
 - Fetch automatically at session start, cache by the complete player/build context, and reuse exact ETags.
 - Add bounded config validation and automatic experiment exposure labels at event enqueue time.

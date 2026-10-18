@@ -26,3 +26,6 @@ mkdir -p "$OUT"
   -o "$OUT/host-check"
 
 "$OUT/host-check"
+
+"$CXX" -std=c++17 -Wall -Wextra -Werror "$HERE/report-hash.cpp" -o "$OUT/report-hash"
+"$OUT/report-hash"

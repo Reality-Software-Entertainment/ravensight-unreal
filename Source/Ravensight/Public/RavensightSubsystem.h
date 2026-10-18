@@ -17,6 +17,15 @@ class FJsonObject;
 class FJsonValue;
 class UWorld;
 
+struct FRavensightPreparedReport
+{
+    FString Payload, Token, SubmissionId;
+    TArray<uint8> Image;
+    int32 Generation = 0;
+    bool bUploaded = false, bBusy = false;
+};
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(FRavensightReportResult, const FString&, Handle, const FString&, Status, const FString&, ReportId, const FString&, Error);
+
 DECLARE_LOG_CATEGORY_EXTERN(LogRavensight, Log, All);
 
 /** Fired once a session token has been issued and events can go out. */
@@ -82,6 +91,22 @@ public:
 
 	virtual void Initialize(FSubsystemCollectionBase& Collection) override;
 	virtual void Deinitialize() override;
+
+    /** Copies encoded PNG/JPEG/WebP bytes (<=1 MB). Empty bytes means text-only. No network. */
+    UFUNCTION(BlueprintCallable, Category = "Ravensight|Player Reports")
+    FString PrepareReport(const FString& ClientId, const FString& Message, const FString& Category, const TArray<uint8>& Screenshot);
+    /** Explicit submit/retry. Retain the same handle; processing means accepted, not delivered. */
+    UFUNCTION(BlueprintCallable, Category = "Ravensight|Player Reports")
+    void SubmitReport(const FString& Handle);
+    UFUNCTION(BlueprintCallable, Category = "Ravensight|Player Reports")
+    void GetReportStatus(const FString& Handle);
+    UFUNCTION(BlueprintCallable, Category = "Ravensight|Player Reports")
+    void CancelReport(const FString& Handle);
+    /** Release a finished handle from memory. Does not delete a delivered report. */
+    UFUNCTION(BlueprintCallable, Category = "Ravensight|Player Reports")
+    void ForgetReport(const FString& Handle);
+    UPROPERTY(BlueprintAssignable, Category = "Ravensight|Player Reports")
+    FRavensightReportResult OnReportResult;
 
 	// --- Access ------------------------------------------------------------
 
@@ -586,4 +611,9 @@ private:
 	FDelegateHandle BackgroundHandle;
 	FDelegateHandle ForegroundHandle;
 	FDelegateHandle TearDownHandle;
+    TMap<FString, TSharedPtr<FRavensightPreparedReport>> PreparedReports;
+    void ReportCommand(const FString& Handle, const FString& Operation);
+    void SendReportStep(const FString& Handle, const TSharedPtr<FRavensightPreparedReport>& Report, const FString& Step);
+    bool CanSendReport(const TSharedPtr<FRavensightPreparedReport>& Report) const;
+
 };
