@@ -21,6 +21,7 @@ mkdir -p "$OUT"
   "$SRC/Private/Tests/RavensightQueue.spec.cpp" \
   "$SRC/Private/Tests/RavensightProtocol.spec.cpp" \
   "$SRC/Private/Tests/RavensightTypedEvents.spec.cpp" \
+  "$SRC/Private/Tests/RavensightConfig.spec.cpp" \
   "$HERE/main.cpp" \
   -o "$OUT/host-check"
 

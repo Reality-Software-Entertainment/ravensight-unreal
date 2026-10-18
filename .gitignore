@@ -11,3 +11,5 @@ DerivedDataCache/
 .vs/
 .vscode/
 .idea/
+
+Tools/config-automation-report/

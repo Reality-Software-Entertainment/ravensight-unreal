@@ -16,7 +16,7 @@
 namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
-	inline constexpr const TCHAR* Sdk = TEXT("0.3.0");
+	inline constexpr const TCHAR* Sdk = TEXT("0.3.1");
 
 	/** "unreal/<version>", sent as "sdk" on the session create request. */
 	inline FString SdkTag()
@@ -296,3 +296,11 @@ private:
 	bool bStarted = false;
 	bool bExited = false;
 };
+
+namespace RavensightConfigProtocol
+{
+ RAVENSIGHT_API bool Name(const FString& Value, int32 Limit, bool bVariant = false);
+ RAVENSIGHT_API bool ETag(const FString& Value);
+ /** Bound nesting before invoking the engine JSON parser. */
+ RAVENSIGHT_API bool BoundedDocument(const FString& Body);
+}

@@ -163,6 +163,7 @@ BEGIN_DEFINE_SPEC(
 
 	/** Every request the subsystem tried to send, in order. None of them reached the network. */
 	TArray<FHttpRequestPtr> Requests;
+	TArray<FHttpRequestPtr> ConfigRequests;
 
 	TArray<UGameInstance*> GameInstances;
 	URavensightSpecListener* Listener = nullptr;
@@ -271,9 +272,11 @@ void FRavensightSubsystemSpec::Define()
 	BeforeEach([this]()
 	{
 		Requests.Reset();
+		ConfigRequests.Reset();
 		RavensightTransport::SetSenderForTests([this](const FHttpRequestRef& Request)
 		{
-			Requests.Add(Request);
+			if (Request->GetURL().Contains(TEXT("/ingest/config?"))) ConfigRequests.Add(Request);
+			else Requests.Add(Request);
 			return true;
 		});
 
@@ -315,6 +318,7 @@ void FRavensightSubsystemSpec::Define()
 
 		RavensightTransport::SetSenderForTests(nullptr);
 		Requests.Reset();
+		ConfigRequests.Reset();
 
 		Listener->RemoveFromRoot();
 		Listener = nullptr;
@@ -407,6 +411,7 @@ void FRavensightSubsystemSpec::Define()
 			StopInstance(First);
 
 			Requests.Reset();
+		ConfigRequests.Reset();
 
 			URavensightSubsystem* Second = StartInstance();
 			Listen(Second);
@@ -738,6 +743,7 @@ void FRavensightSubsystemSpec::Define()
 			TestEqual(TEXT("device id kept"), SavedDeviceIdNow(), Id);
 			StopInstance(First);
 			Requests.Reset();
+		ConfigRequests.Reset();
 
 			URavensightSubsystem* Second = StartInstance();
 			Second->Init(SpecKey);
@@ -768,6 +774,7 @@ void FRavensightSubsystemSpec::Define()
 			{
 				GetMutableDefault<URavensightSettings>()->Distribution = Label;
 				Requests.Reset();
+		ConfigRequests.Reset();
 				URavensightSubsystem* Subsystem = StartReady();
 				if (TestTrue(TEXT("session request"), Requests.Num() >= 2))
 				{
@@ -909,6 +916,61 @@ void FRavensightSubsystemSpec::Define()
 			TestEqual(TEXT("queued"), Subsystem->GetQueuedEventCount(), Before + 1);
 		});
 	});
+	Describe("remote configuration", [this]()
+	{
+		It("fetches at session start and keeps strict typed fallback values and ETags", [this]()
+		{
+			auto* Subsystem = StartReady();
+			if (!TestEqual(TEXT("automatic fetch"), ConfigRequests.Num(), 1)) return;
+			const FString Tag = FString(TEXT("\"")) + FString::ChrN(64, TCHAR('a')) + TEXT("\"");
+			const auto Document = MakeShared<FJsonObject>();
+			const auto Values = MakeShared<FJsonObject>(); Values->SetNumberField(TEXT("speed"), 2); Values->SetBoolField(TEXT("enabled"), true);
+			Document->SetObjectField(TEXT("values"), Values); Document->SetArrayField(TEXT("experiments"), TArray<TSharedPtr<FJsonValue>>()); Document->SetStringField(TEXT("etag"), Tag);
+			FString Body; const auto Writer = TJsonWriterFactory<TCHAR>::Create(&Body); FJsonSerializer::Serialize(Document, Writer);
+			Answer(ConfigRequests.Last(), 200, Body);
+			TestEqual(TEXT("number"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 2.0);
+			TestEqual(TEXT("wrong type"), Subsystem->GetConfigNumber(TEXT("enabled"), 9), 9.0);
+			Subsystem->FetchConfig();
+			TestEqual(TEXT("validator"), ConfigRequests.Last()->GetHeader(TEXT("If-None-Match")), Tag);
+			Answer(ConfigRequests.Last(), 304, FString());
+			TestEqual(TEXT("304 retains"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 2.0);
+			Subsystem->FetchConfig(); const auto OldRequest = ConfigRequests.Last();
+			Subsystem->ResetDeviceId(); Answer(OldRequest, 200, Body);
+			TestEqual(TEXT("old identity refused"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 9.0);
+			Subsystem->SetTrackingEnabled(false); const int32 Count = ConfigRequests.Num(); Subsystem->FetchConfig();
+			TestEqual(TEXT("no opted-out request"), ConfigRequests.Num(), Count);
+		});
+		It("applies exposures only to new events and rejects malformed replacements", [this]()
+		{
+			auto* Subsystem = StartReady();
+			if (!TestEqual(TEXT("fetch pending"), ConfigRequests.Num(), 1)) return;
+			const FString Tag = FString(TEXT("\"")) + FString::ChrN(64, TCHAR('b')) + TEXT("\"");
+			const auto Document = MakeShared<FJsonObject>(); const auto Values = MakeShared<FJsonObject>(); Values->SetNumberField(TEXT("speed"), 3);
+			const auto Experiment = MakeShared<FJsonObject>(); Experiment->SetStringField(TEXT("key"), TEXT("difficulty")); Experiment->SetStringField(TEXT("variant"), TEXT("easy"));
+			TArray<TSharedPtr<FJsonValue>> Assignments; Assignments.Add(MakeShared<FJsonValueObject>(Experiment));
+			Document->SetObjectField(TEXT("values"), Values); Document->SetArrayField(TEXT("experiments"), Assignments); Document->SetStringField(TEXT("etag"), Tag);
+			FString Body; const auto Writer = TJsonWriterFactory<TCHAR>::Create(&Body); FJsonSerializer::Serialize(Document, Writer);
+			const auto InitialBatch = Requests.Last();
+			const auto Initial = JsonOf(InitialBatch)->GetArrayField(TEXT("events"))[0]->AsObject()->GetObjectField(TEXT("data"));
+			TestFalse(TEXT("old event unlabeled"), Initial->HasField(TEXT("rs_exp_difficulty")));
+			Answer(ConfigRequests.Last(), 200, Body); Answer(InitialBatch, 202, TEXT("{}"));
+			Subsystem->TrackEventJson(TEXT("after"), TEXT("{\"rs_exp_fake\":\"spoof\"}")); Subsystem->Flush();
+			const auto New = JsonOf(Requests.Last())->GetArrayField(TEXT("events"))[0]->AsObject()->GetObjectField(TEXT("data"));
+			TestEqual(TEXT("assignment"), New->GetStringField(TEXT("rs_exp_difficulty")), FString(TEXT("easy")));
+			TestFalse(TEXT("caller label removed"), New->HasField(TEXT("rs_exp_fake")));
+			Subsystem->FetchConfig(); Answer(ConfigRequests.Last(), 200, TEXT("{\"values\":{\"speed\":99}}"));
+			TestEqual(TEXT("bad document retains snapshot"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 3.0);
+		});
+
+		It("makes no config request without opt-in consent", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			auto* Subsystem = StartInstance(); Subsystem->Init(SpecKey); Subsystem->FetchConfig();
+			TestEqual(TEXT("no network"), ConfigRequests.Num(), 0);
+			TestEqual(TEXT("fallback"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 9.0);
+		});
+	});
+
 }
 
 #endif

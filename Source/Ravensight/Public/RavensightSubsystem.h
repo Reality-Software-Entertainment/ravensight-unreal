@@ -14,12 +14,14 @@
 #include "RavensightSubsystem.generated.h"
 
 class FJsonObject;
+class FJsonValue;
 class UWorld;
 
 DECLARE_LOG_CATEGORY_EXTERN(LogRavensight, Log, All);
 
 /** Fired once a session token has been issued and events can go out. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FRavensightSessionReady);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightConfigReady, bool, bFresh);
 
 /** Fired when session creation fails. Reason is a server error code where one was given. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRavensightSessionFailed, const FString&, Reason);
@@ -254,6 +256,22 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Ravensight|Experimental")
 	void FetchSuggestions();
 
+	/** Public game values only. Fetch starts automatically for every new session. */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Config")
+	void FetchConfig();
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Config")
+	bool GetConfigBool(const FString& Key, bool Fallback = false) const;
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Config")
+	double GetConfigNumber(const FString& Key, double Fallback = 0.0) const;
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Config")
+	FString GetConfigString(const FString& Key, const FString& Fallback = TEXT("")) const;
+	/** Object or array JSON; scalar values return Fallback. */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Config")
+	FString GetConfigJson(const FString& Key, const FString& Fallback = TEXT("{}")) const;
+	/** Game-thread callback. False retains cached values after a failed fetch. */
+	UPROPERTY(BlueprintAssignable, Category = "Ravensight|Config")
+	FRavensightConfigReady OnConfigReady;
+
 	// --- State -------------------------------------------------------------
 
 	/** True once a session token exists and has not expired. */
@@ -342,7 +360,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.3.0". */
+	/** The plugin version, "0.3.1". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
@@ -392,7 +410,7 @@ private:
 	FRavensightGate CurrentGate(bool bExplicitAttempt = false) const;
 
 	/** Anything already in flight belongs to an older queue and its answer is ignored. */
-	void BumpQueueGeneration() { ++QueueGeneration; }
+	void BumpQueueGeneration();
 	void ReadPlaytestSources();
 
 	// --- Requests ----------------------------------------------------------
@@ -409,6 +427,11 @@ private:
 	void HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation);
 
 	void HandleFeedbackResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
+	void HandleConfigResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation);
+	void LoadConfigCache();
+	FString ConfigCachePath() const;
+	bool ApplyConfigDocument(const FString& Body);
+	TSharedPtr<FJsonValue> ConfigValue(const FString& Key) const;
 	void HandleSuggestionsResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
 
 	/** One POST /track/batch carrying only game_exited under a given session token. One attempt, no retry. */
@@ -479,6 +502,11 @@ private:
 	FString Platform;
 	FString DeviceId;
 	FString StatusReason;
+	TSharedPtr<FJsonObject> RemoteValues;
+	TMap<FString, FString> RemoteExperiments;
+	FString RemoteETag;
+	bool bConfigRequestPending = false;
+	bool bConfigCacheLoaded = false;
 
 	/** Sent on POST /session when not empty. Validated by RavensightProtocol::ValidDistribution. */
 	FString Distribution;

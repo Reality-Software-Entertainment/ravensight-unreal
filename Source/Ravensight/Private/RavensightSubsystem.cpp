@@ -14,6 +14,11 @@
 #include "HAL/PlatformTime.h"
 #include "HttpManager.h"
 #include "HttpModule.h"
+#include "GenericPlatform/GenericPlatformHttp.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Misc/SecureHash.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Kismet/GameplayStatics.h"
 #include "Misc/App.h"
@@ -317,6 +322,7 @@ void URavensightSubsystem::StartIfAllowed()
 	// Queued now, at the real start time and first in the queue, ahead of
 	// anything the game tracked before Init. The settings check then decides
 	// whether it is ever sent.
+	LoadConfigCache();
 	QueueGameStartedOnce(true);
 
 	if (!bSettingsChecked && !bSettingsRequestPending)
@@ -816,6 +822,15 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		Parsed->SetStringField(TEXT("pt_tier"), TEXT("T2_driven_build"));
 	}
 
+	for (auto It = Parsed->Values.CreateIterator(); It; ++It)
+	{
+		if (FString(*It.Key()).StartsWith(TEXT("rs_exp_"))) It.RemoveCurrent();
+	}
+	for (const auto& Assignment : RemoteExperiments)
+	{
+		Parsed->SetStringField(TEXT("rs_exp_") + Assignment.Key, Assignment.Value);
+	}
+
 	// Inside the event's data, so a batch sent again after a failure carries
 	// the same id and the server can recognise it.
 	Parsed->SetStringField(EventIdKey, NextEventId());
@@ -1267,6 +1282,7 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 
 			Log(TEXT("session ready"));
 			OnSessionReady.Broadcast();
+			FetchConfig();
 
 			FlushInternal(false);
 			return;
@@ -2047,4 +2063,149 @@ double URavensightSubsystem::ParseRetryAfterSeconds(const FHttpResponsePtr& Resp
 FString URavensightSubsystem::ResponseBody(const FHttpResponsePtr& Response)
 {
 	return Response.IsValid() ? Response->GetContentAsString() : FString();
+}
+
+// --- Public remote configuration --------------------------------------------
+namespace
+{
+	FString ConfigJson(const TSharedPtr<FJsonValue>& Value)
+	{
+		const auto Wrapper = MakeShared<FJsonObject>(); Wrapper->SetField(TEXT("v"), Value);
+		const FString Wrapped = WriteJson(Wrapper);
+		return Wrapped.Mid(5, Wrapped.Len() - 6);
+	}
+	bool SafeConfigValue(const TSharedPtr<FJsonValue>& Value, int32 Depth = 0)
+	{
+		if (!Value.IsValid() || Depth > 20 || (Value->Type == EJson::Number && !FMath::IsFinite(Value->AsNumber()))) return false;
+		if (Value->Type == EJson::Object)
+		{
+			for (const auto& Pair : Value->AsObject()->Values)
+			{
+				if (Pair.Key == TEXT("__proto__") || Pair.Key == TEXT("constructor") || Pair.Key == TEXT("prototype") || !SafeConfigValue(Pair.Value, Depth + 1)) return false;
+			}
+		}
+		if (Value->Type == EJson::Array)
+		{
+			for (const auto& Item : Value->AsArray()) if (!SafeConfigValue(Item, Depth + 1)) return false;
+		}
+		return true;
+	}
+}
+
+void URavensightSubsystem::BumpQueueGeneration()
+{
+	++QueueGeneration;
+	RemoteValues.Reset(); RemoteExperiments.Empty(); RemoteETag.Reset();
+	bConfigRequestPending = false; bConfigCacheLoaded = false;
+}
+
+FString URavensightSubsystem::ConfigCachePath() const
+{
+	if (IsPlaytest() || DeviceId.IsEmpty()) return FString();
+	const auto Scope = MakeShared<FJsonObject>();
+	Scope->SetStringField(TEXT("endpoint"), ApiUrl); Scope->SetStringField(TEXT("key"), IngestKey);
+	Scope->SetStringField(TEXT("device"), DeviceId); Scope->SetStringField(TEXT("platform"), Platform);
+	Scope->SetStringField(TEXT("build"), GameVersion);
+	const FString Text = WriteJson(Scope); const FTCHARToUTF8 Bytes(*Text);
+	FSHAHash Hash; FSHA1::HashBuffer(Bytes.Get(), Bytes.Length(), Hash.Hash);
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"), TEXT("config_") + Hash.ToString() + TEXT(".json"));
+}
+
+void URavensightSubsystem::LoadConfigCache()
+{
+	if (bConfigCacheLoaded || bShuttingDown || !CurrentGate().bAllowSuggestions) return;
+	bConfigCacheLoaded = true;
+	const FString Path = ConfigCachePath();
+	const int64 Size = Path.IsEmpty() ? -1 : IFileManager::Get().FileSize(*Path);
+	FString Body;
+	if (Size >= 0 && Size <= 450000 && FFileHelper::LoadFileToString(Body, *Path)) ApplyConfigDocument(Body);
+}
+
+bool URavensightSubsystem::ApplyConfigDocument(const FString& Body)
+{
+	if (!RavensightConfigProtocol::BoundedDocument(Body) || FTCHARToUTF8(*Body).Length() > 450000) return false;
+	const auto Root = ParseJsonObject(Body);
+	const TSharedPtr<FJsonObject>* Values = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* Experiments = nullptr;
+	FString ETag;
+	if (!Root.IsValid() || !Root->TryGetObjectField(TEXT("values"), Values) || !Values || !Values->IsValid()
+		|| (*Values)->Values.Num() > 50 || !Root->TryGetArrayField(TEXT("experiments"), Experiments) || !Experiments || Experiments->Num() > 10
+		|| !Root->TryGetStringField(TEXT("etag"), ETag) || !RavensightConfigProtocol::ETag(ETag)) return false;
+	for (const auto& Pair : (*Values)->Values)
+	{
+		if (!RavensightConfigProtocol::Name(FString(*Pair.Key), 64) || Pair.Key == TEXT("constructor") || Pair.Key == TEXT("prototype") || !SafeConfigValue(Pair.Value) || FTCHARToUTF8(*ConfigJson(Pair.Value)).Length() > 8192) return false;
+	}
+	TMap<FString, FString> Assignments;
+	for (const auto& Item : *Experiments)
+	{
+		if (!Item.IsValid() || Item->Type != EJson::Object) return false;
+		FString Key, Variant;
+		if (!Item->AsObject()->TryGetStringField(TEXT("key"), Key) || !Item->AsObject()->TryGetStringField(TEXT("variant"), Variant)
+			|| !RavensightConfigProtocol::Name(Key, 64) || !RavensightConfigProtocol::Name(Variant, 40, true) || Assignments.Contains(Key)) return false;
+		Assignments.Add(Key, Variant);
+	}
+	RemoteValues = *Values; RemoteExperiments = MoveTemp(Assignments); RemoteETag = ETag;
+	return true;
+}
+
+void URavensightSubsystem::FetchConfig()
+{
+	if (bShuttingDown || bConfigRequestPending || !CurrentGate().bAllowSuggestions) return;
+	LoadConfigCache();
+	const FString Path = TEXT("/ingest/config?deviceId=") + FGenericPlatformHttp::UrlEncode(DeviceId)
+		+ TEXT("&platform=") + FGenericPlatformHttp::UrlEncode(Platform) + TEXT("&gameVersion=") + FGenericPlatformHttp::UrlEncode(GameVersion);
+	const FHttpRequestRef Request = MakeRequest(TEXT("GET"), Path);
+	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
+	if (!RemoteETag.IsEmpty()) Request->SetHeader(TEXT("If-None-Match"), RemoteETag);
+	bConfigRequestPending = true;
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleConfigResponse, QueueGeneration);
+	if (!RavensightTransport::Send(Request)) { bConfigRequestPending = false; OnConfigReady.Broadcast(false); }
+}
+
+void URavensightSubsystem::HandleConfigResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation)
+{
+	if (Generation != QueueGeneration || bShuttingDown || !CurrentGate().bAllowSuggestions) return;
+	bConfigRequestPending = false;
+	const int32 Code = bConnectedSuccessfully && Response.IsValid() ? Response->GetResponseCode() : 0;
+	if (Code == 401 || Code == 403)
+	{
+		const auto Verdict = Classify(ERavensightEndpoint::Suggestions, Response, bConnectedSuccessfully);
+		if (Verdict.Action == ERavensightResponseAction::FatalKey) { BumpQueueGeneration(); RefuseKey(); return; }
+		if (Verdict.Action == ERavensightResponseAction::KillSwitch || Verdict.Action == ERavensightResponseAction::PlaytestStop) { StopForRun(Verdict.Reason, TEXT("server")); return; }
+	}
+	bool bFresh = Code == 304 && !RemoteETag.IsEmpty() && Request->GetHeader(TEXT("If-None-Match")) == RemoteETag;
+	if (Code == 200 && ApplyConfigDocument(ResponseBody(Response)))
+	{
+		bFresh = true;
+		const FString Path = ConfigCachePath();
+		if (!Path.IsEmpty())
+		{
+			IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+			const FString Temp = Path + TEXT(".tmp");
+			if (FFileHelper::SaveStringToFile(ResponseBody(Response), *Temp, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) IFileManager::Get().Move(*Path, *Temp, true, true);
+		}
+	}
+	OnConfigReady.Broadcast(bFresh);
+}
+
+TSharedPtr<FJsonValue> URavensightSubsystem::ConfigValue(const FString& Key) const
+{
+	if (!Queue.IsActive() || bStoppedForRun || bKeyRefused || !RemoteValues.IsValid()) return nullptr;
+	return RemoteValues->TryGetField(Key);
+}
+bool URavensightSubsystem::GetConfigBool(const FString& Key, bool Fallback) const
+{
+	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::Boolean ? Value->AsBool() : Fallback;
+}
+double URavensightSubsystem::GetConfigNumber(const FString& Key, double Fallback) const
+{
+	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::Number ? Value->AsNumber() : Fallback;
+}
+FString URavensightSubsystem::GetConfigString(const FString& Key, const FString& Fallback) const
+{
+	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::String ? Value->AsString() : Fallback;
+}
+FString URavensightSubsystem::GetConfigJson(const FString& Key, const FString& Fallback) const
+{
+	const auto Value = ConfigValue(Key); return Value.IsValid() && (Value->Type == EJson::Object || Value->Type == EJson::Array) ? ConfigJson(Value) : Fallback;
 }

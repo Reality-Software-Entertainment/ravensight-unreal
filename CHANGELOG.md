@@ -2,6 +2,14 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.3.1] - Unreleased (held)
+
+- Add native and Blueprint remote config getters, refresh and readiness delegate.
+- Fetch automatically at session start, cache by the complete player/build context, and reuse exact ETags.
+- Add bounded config validation and automatic experiment exposure labels at event enqueue time.
+- Clear active config and reject stale responses after opt-out or identity changes.
+- Adapt JSON key iteration to UE 5.8 shared-string keys and add config protocol/subsystem specs.
+
 ## [0.3.0] - 2026-10-16
 
 For games whose builds or source anyone can download. A project that sets

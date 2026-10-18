@@ -161,3 +161,13 @@ For 0.2.0, on 2026-10-10:
 What that does not cover: UnrealHeaderTool's rules for Blueprint exposed
 signatures, the subsystem against the engine's actual headers, and anything at
 run time in the editor or a packaged build. Those need a real build.
+
+## 0.3.1 held config candidate
+
+The October 17, 2026 config candidate was built with the installed UE 5.8.3
+editor target and Xcode 27, with warnings as errors. UHT and linking passed.
+The full editor automation suite passed 134 cases (125 clean, 9 expected-warning
+cases); the engine-free check passed 106. Config specs cover the request lifecycle,
+strict getters, conditional requests, consent, stale identity responses and exposure
+labels at enqueue time. No packaged game or physical device run is implied.
+See `HELD_RELEASE_VALIDATION.md`; all publication remains held.

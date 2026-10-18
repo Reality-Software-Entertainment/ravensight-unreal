@@ -379,3 +379,35 @@ void FRavensightLifecycleGuards::ResetForNewSession()
 {
 	bStarted = false;
 }
+
+	bool RavensightConfigProtocol::Name(const FString& Name, int32 Limit, bool bVariant)
+	{
+		if (Name.IsEmpty() || Name.Len() > Limit || Name[0] < TCHAR('a') || Name[0] > TCHAR('z')) return false;
+		for (int32 I = 0; I < Name.Len(); ++I)
+		{
+            const TCHAR C = Name[I];
+			if (!(C >= TCHAR('a') && C <= TCHAR('z')) && !(C >= TCHAR('0') && C <= TCHAR('9')) && C != TCHAR('_') && !(bVariant && C == TCHAR('-'))) return false;
+		}
+		return true;
+	}
+
+bool RavensightConfigProtocol::ETag(const FString& Value)
+{
+ if (Value.Len() != 66 || Value[0] != TCHAR('"') || Value[65] != TCHAR('"')) return false;
+ for (int32 I = 1; I < 65; ++I) if (!(Value[I] >= TCHAR('0') && Value[I] <= TCHAR('9')) && !(Value[I] >= TCHAR('a') && Value[I] <= TCHAR('f'))) return false;
+ return true;
+}
+bool RavensightConfigProtocol::BoundedDocument(const FString& Body)
+{
+ if (Body.IsEmpty() || Body.Len() > 450000) return false;
+ bool bString = false, bEscape = false; int32 Depth = 0;
+ for (int32 I = 0; I < Body.Len(); ++I)
+ {
+  const TCHAR C = Body[I];
+  if (bString) { if (bEscape) bEscape = false; else if (C == TCHAR('\\')) bEscape = true; else if (C == TCHAR('"')) bString = false; }
+  else if (C == TCHAR('"')) bString = true;
+  else if (C == TCHAR('{') || C == TCHAR('[')) { if (++Depth > 24) return false; }
+  else if (C == TCHAR('}') || C == TCHAR(']')) { if (--Depth < 0) return false; }
+ }
+ return !bString && Depth == 0;
+}

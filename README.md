@@ -19,6 +19,24 @@ without writing C++.
   analytics, an opt-in consent mode and a distribution label. See
   [Public builds](#public-builds).
 
+## Remote configuration and experiments (0.3.1, held release)
+
+Every successful session start fetches public game values through the existing ingest key. `Fetch Config` also refreshes on demand. The request uses the current device, platform and game version; the key selects the game and environment.
+
+In Blueprints, bind **On Config Ready**, then use **Get Config Bool**, **Get Config Number**, **Get Config String** or **Get Config Json**, with a safe fallback for every key. The JSON getter returns object or array JSON only. These getters never coerce types.
+
+```cpp
+const double Speed = Ravensight->GetConfigNumber(TEXT("enemy_speed"), 2.0);
+const bool ShowHint = Ravensight->GetConfigBool(TEXT("show_hint"), true);
+const FString Welcome = Ravensight->GetConfigString(TEXT("welcome_text"), TEXT("Welcome"));
+const FString Layout = Ravensight->GetConfigJson(TEXT("layout"), TEXT("{}"));
+Ravensight->FetchConfig();
+```
+
+`OnConfigReady` runs on the game thread. `bFresh` is true for an accepted response or HTTP 304; a failed refresh reports false and retains cached values. Values are cached under `Saved/Ravensight`, scoped by a hash of endpoint, key, device, platform and build. Playtests use memory only. Config files are read only after consent. Opt-out, disable and identity reset clear active values and discard late responses. A changed context starts from the supplied fallbacks. The next request reuses the exact ETag; HTTP 304 is free, while a fresh config fetch consumes one ordinary event.
+
+Active experiment assignments add `rs_exp_<experiment_key>` to new events as they are queued. Existing queued events are never relabeled, retries retain their original assignments, and caller-supplied exposure labels are removed. Documents are bounded to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments. Invalid responses preserve the last valid snapshot. Use config for public game data, never credentials or secrets.
+
 ## Compatibility
 
 | ravensight-unreal | Engine by design | Engine built and spec tested | Server features it uses |
