@@ -8,8 +8,8 @@ side kill switch, in one game instance subsystem with no third party
 dependencies. Everything is exposed to Blueprint, so a designer can ship it
 without writing C++.
 
-> **Beta.** The combined public-build and typed-event candidate passes the host check.
-> Unreal Engine 5.8.3 builds and 128 automation tests pass on macOS. Packaged games and physical mobile devices remain unverified.
+> **Beta.** Version 0.3.1 passes 106 portable checks and four report hash checks.
+> Unreal Engine 5.8.3 builds and 136 automation tests pass on macOS. Packaged games, physical mobile devices and live screenshot storage remain unverified.
 
 * API base: `https://api.ravensight.io` (the plugin appends `/api/v1`)
 * Docs: https://ravensight.io/docs/
@@ -19,7 +19,7 @@ without writing C++.
   analytics, an opt-in consent mode and a distribution label. See
   [Public builds](#public-builds).
 
-## Remote configuration and experiments (0.3.1, held release)
+## Remote configuration and experiments (0.3.1)
 
 Every successful session start fetches public game values through the existing ingest key. `Fetch Config` also refreshes on demand. The request uses the current device, platform and game version; the key selects the game and environment.
 
@@ -760,7 +760,7 @@ has been built and spec tested on macOS only (Unreal Engine 5.8.3); see
 
 MIT. Copyright 2026 Reality Software Entertainment.
 
-### Player Reports with screenshots (held release)
+### Player Reports with screenshots (0.3.1)
 
 Use `PrepareReport(ClientId, Message, Category, Screenshot)` after the player previews
 and approves an encoded PNG, JPEG or WebP screenshot. Supply bytes from your game's own
