@@ -27,6 +27,7 @@
 
 #define RAVENSIGHT_API
 #define TEXT(x) x
+#define INDEX_NONE (-1)
 
 using TCHAR = char;
 using int32 = std::int32_t;

@@ -34,7 +34,7 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 	// permanent for the run whatever endpoint answered.
 	if (Status == 403)
 	{
-		if (Input.Error == TEXT("tracking_disabled"))
+		if (Input.Error == TEXT("tracking_disabled") && Endpoint != ERavensightEndpoint::Batch)
 		{
 			return MakeVerdict(ERavensightResponseAction::KillSwitch, RavensightReason::TrackingDisabled);
 		}
@@ -45,6 +45,13 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 		if (Input.Error == TEXT("invalid_playtest_token"))
 		{
 			return MakeVerdict(ERavensightResponseAction::PlaytestStop, RavensightReason::SessionFailed);
+		}
+		if (Endpoint == ERavensightEndpoint::Batch)
+		{
+			// A refused batch keeps its events for the next launch: the key
+			// paused, a version or an origin refused, or tracking switched off.
+			return MakeVerdict(ERavensightResponseAction::StopUntilNextLaunch,
+				Input.Error == TEXT("tracking_disabled") ? RavensightReason::TrackingDisabled : RavensightReason::InvalidKey);
 		}
 		return MakeVerdict(ERavensightResponseAction::FatalKey, RavensightReason::InvalidKey);
 	}
@@ -90,9 +97,26 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 			Endpoint == ERavensightEndpoint::Session ? RavensightReason::SessionFailed : TEXT(""));
 	}
 
-	if (Status == 400 && Endpoint == ERavensightEndpoint::Batch)
+	if (Endpoint == ERavensightEndpoint::Batch)
 	{
-		return MakeVerdict(Input.BatchSize > 1 ? ERavensightResponseAction::HalveBatch : ERavensightResponseAction::DropHead);
+		if (Status == 400 && Input.Index >= 0 && Input.Index < Input.BatchSize)
+		{
+			return MakeVerdict(ERavensightResponseAction::DropIndex);
+		}
+		// A 413 is the same problem as batch_too_large: split, then drop the
+		// one event still too large. Never retried as it is.
+		if ((Status == 400 && Input.Error == TEXT("batch_too_large")) || Status == 413)
+		{
+			return MakeVerdict(Input.BatchSize > 1 ? ERavensightResponseAction::HalveBatch : ERavensightResponseAction::DropHead);
+		}
+		if (Status == 415 && Input.bCompressed)
+		{
+			return MakeVerdict(ERavensightResponseAction::ResendPlain);
+		}
+		if (Status == 400 || Status == 415)
+		{
+			return MakeVerdict(ERavensightResponseAction::DropBatch);
+		}
 	}
 
 	return MakeVerdict(

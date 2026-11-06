@@ -41,3 +41,17 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   prepared-report cases passed. Evidence: sibling `validation/unreal-reports-automation/index.json`
   and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live S3 test.
 - No remote writes, publication or deployment. Live S3/device/game capture checks remain held.
+
+## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
+
+- Engine-free host check: **124 cases passed**, including every shared delivery
+  vector (header and beacon signatures, the 8 KB measure), the error-behind-gameplay
+  queue rules and the new response table, plus 4 portable SHA-256 cases.
+- Unreal Engine 5.8.3 Mac Development editor target built with `-WarningsAsErrors`
+  (UnrealHeaderTool included) in a scratch host project.
+- Full `Ravensight` automation run: **159 passed** (149 clean, 10 with expected
+  warnings), 0 failed, 0 not run. New subsystem cases cover the queue file read back
+  under its original origin, signing over the plain body with gzip, a batch 403 kept
+  for the next launch, the session's device fields, ads and attribution, and exposure.
+- Requests went through the fake transport; no live Ravensight service, packaged
+  build or device was exercised. No push to GitHub, tag or publication.

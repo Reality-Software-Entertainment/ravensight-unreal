@@ -19,15 +19,33 @@ int32 FRavensightQueue::TrimToCap(int32 Headroom)
 	int32 Dropped = 0;
 	while (Events.Num() > Limit)
 	{
-		// Drop oldest so the newest events always survive: a player who has
-		// been offline for an hour is better served by the last minute of
-		// their session than by the first.
-		Events.RemoveAt(0);
+		// Queued errors go before any gameplay event, never from inside a
+		// batch in flight. Then the oldest goes, so the newest events always
+		// survive: a player who has been offline for an hour is better served
+		// by the last minute of their session than by the first.
+		const int32 Victim = FirstQueuedError();
+		Events.RemoveAt(Victim == INDEX_NONE ? 0 : Victim);
+		if (Victim == INDEX_NONE && InFlightCount > 0)
+		{
+			--InFlightCount;
+		}
 		++Dropped;
 	}
 
 	DroppedCount += Dropped;
 	return Dropped;
+}
+
+int32 FRavensightQueue::FirstQueuedError() const
+{
+	for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
+	{
+		if (Events[Index].bError)
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
 }
 
 int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
@@ -37,9 +55,61 @@ int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
 		return 0;
 	}
 
+	if (Event.bError && Events.Num() >= MaxQueueSize && FirstQueuedError() == INDEX_NONE)
+	{
+		// Full of gameplay events: the incoming error is the one that goes.
+		++DroppedCount;
+		return 1;
+	}
+
 	const int32 Dropped = TrimToCap(1);
-	Events.Add(Event);
+	const int32 At = Event.bError ? INDEX_NONE : FirstQueuedError();
+	if (At == INDEX_NONE)
+	{
+		Events.Add(Event);
+	}
+	else
+	{
+		Events.Insert(Event, At);
+	}
 	return Dropped;
+}
+
+int32 FRavensightQueue::Restore(const TArray<FRavensightEvent>& Restored)
+{
+	if (!IsActive() || bFlushInProgress || Restored.Num() == 0)
+	{
+		return 0;
+	}
+	TArray<FRavensightEvent> Merged;
+	Merged.Reserve(Restored.Num() + Events.Num());
+	for (const FRavensightEvent& Event : Restored)
+	{
+		Merged.Add(Event);
+	}
+	for (const FRavensightEvent& Event : Events)
+	{
+		Merged.Add(Event);
+	}
+	Events = Merged;
+	TrimToCap(0);
+	return Restored.Num();
+}
+
+void FRavensightQueue::StampOrigins(const FString& InOriginJson, const FString& InOriginSession)
+{
+	if (InOriginJson.IsEmpty())
+	{
+		return;
+	}
+	for (FRavensightEvent& Event : Events)
+	{
+		if (Event.OriginJson.IsEmpty())
+		{
+			Event.OriginJson = InOriginJson;
+			Event.OriginSession = InOriginSession;
+		}
+	}
 }
 
 int32 FRavensightQueue::EnqueueAtFront(const FRavensightEvent& Event)
@@ -74,6 +144,21 @@ void FRavensightQueue::Clear()
 {
 	DroppedCount += Events.Num();
 	Events.Reset();
+}
+
+int32 FRavensightQueue::DropAt(int32 Index, int32 Count)
+{
+	if (Index < 0 || Index >= Events.Num())
+	{
+		return 0;
+	}
+	const int32 ToDrop = FMath::Clamp(Count, 0, Events.Num() - Index);
+	if (ToDrop > 0)
+	{
+		Events.RemoveAt(Index, ToDrop);
+		DroppedCount += ToDrop;
+	}
+	return ToDrop;
 }
 
 int32 FRavensightQueue::DropHead(int32 Count)
@@ -177,7 +262,13 @@ FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce
 		return Plan;
 	}
 
-	if (!bForce && NowSeconds < NextAttemptAtSeconds)
+	if (bSendBlocked)
+	{
+		Plan.Decision = ERavensightFlushDecision::Refused;
+		return Plan;
+	}
+
+	if ((!bForce || bRetryAfterActive) && NowSeconds < NextAttemptAtSeconds)
 	{
 		Plan.Decision = ERavensightFlushDecision::BackingOff;
 		return Plan;
@@ -201,12 +292,14 @@ FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce
 
 	Plan.Decision = ERavensightFlushDecision::Send;
 	bFlushInProgress = true;
+	InFlightCount = BatchSize;
 	return Plan;
 }
 
 void FRavensightQueue::EndFlush()
 {
 	bFlushInProgress = false;
+	InFlightCount = 0;
 }
 
 // --- Responses --------------------------------------------------------------
@@ -236,6 +329,7 @@ void FRavensightQueue::OnRateLimited(double NowSeconds, double RetryAfterSeconds
 	if (RetryAfterSeconds > 0.0)
 	{
 		NextAttemptAtSeconds = NowSeconds + RetryAfterSeconds;
+		bRetryAfterActive = true;
 
 		// The server told us how long to wait, so the local backoff ladder is
 		// not advanced. Its next step still starts from wherever it was.
@@ -256,11 +350,13 @@ void FRavensightQueue::ResetBackoff()
 {
 	BackoffSeconds = RavensightLimits::DefaultRetrySeconds;
 	NextAttemptAtSeconds = 0.0;
+	bRetryAfterActive = false;
 }
 
 void FRavensightQueue::ScheduleBackoff(double NowSeconds)
 {
 	const double Random = RandomSource ? RandomSource() : static_cast<double>(FMath::FRand());
+	bRetryAfterActive = false;
 	NextAttemptAtSeconds = NowSeconds + JitteredWaitSeconds(BackoffSeconds, Random);
 	BackoffSeconds = FMath::Min(BackoffSeconds * 2.0, RavensightLimits::MaxBackoffSeconds);
 }
@@ -269,7 +365,7 @@ double FRavensightQueue::JitteredWaitSeconds(double InBackoffSeconds, double Ran
 {
 	// NaN fails both comparisons and lands on 0.
 	const double Clamped = Random >= 1.0 ? 1.0 : (Random > 0.0 ? Random : 0.0);
-	const double Factor = 1.0 - RavensightLimits::Jitter + 2.0 * RavensightLimits::Jitter * Clamped;
+	const double Factor = RavensightLimits::JitterFloor + (1.0 - RavensightLimits::JitterFloor) * Clamped;
 	return FMath::Clamp(InBackoffSeconds * Factor, RavensightLimits::MinRetrySeconds, RavensightLimits::MaxBackoffSeconds);
 }
 

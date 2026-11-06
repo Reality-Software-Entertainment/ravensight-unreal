@@ -251,10 +251,11 @@ void FRavensightQueueSpec::Define()
 			Fill(1);
 			Queue->OnRateLimited(Now, -1.0);
 
-			TestEqual(TEXT("first wait"), Queue->SecondsUntilNextAttempt(Now), RavensightLimits::DefaultRetrySeconds);
+			// 10 seconds times the jitter factor, 0.75 at the specs' random 0.5.
+			TestEqual(TEXT("first wait"), Queue->SecondsUntilNextAttempt(Now), 7.5);
 		});
 
-		It("blocks a flush until the window passes, and force overrides it", [this]()
+		It("blocks a flush until the window passes, and not even force cuts it short", [this]()
 		{
 			GiveSession(3600.0);
 			Fill(5);
@@ -264,8 +265,13 @@ void FRavensightQueueSpec::Define()
 			TestTrue(TEXT("blocked"), Blocked.Decision == ERavensightFlushDecision::BackingOff);
 
 			const FRavensightFlushPlan Forced = Queue->BeginFlush(Now, true);
-			TestTrue(TEXT("force wins"), Forced.ShouldSend());
+			TestTrue(TEXT("a Retry-After holds against force"), Forced.Decision == ERavensightFlushDecision::BackingOff);
+
+			Queue->ScheduleBackoff(Now);
+			const FRavensightFlushPlan CutShort = Queue->BeginFlush(Now, true);
+			TestTrue(TEXT("force cuts an ordinary backoff short"), CutShort.ShouldSend());
 			Queue->EndFlush();
+			Queue->OnRateLimited(Now, 30.0);
 
 			Now += 31.0;
 			const FRavensightFlushPlan Later = Queue->BeginFlush(Now, false);
@@ -273,11 +279,91 @@ void FRavensightQueueSpec::Define()
 		});
 	});
 
+	Describe("error events behind gameplay", [this]()
+	{
+		It("queues a gameplay event ahead of every queued error", [this]()
+		{
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_0"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_1"), TEXT("{}"), 1));
+
+			TestEqual(TEXT("first"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+			TestEqual(TEXT("gameplay jumped the errors"), Queue->GetEvents()[1].EventName, FString(TEXT("ev_1")));
+			TestTrue(TEXT("errors last"), Queue->GetEvents()[2].bError && Queue->GetEvents()[3].bError);
+		});
+
+		It("never inserts into a batch in flight", [this]()
+		{
+			GiveSession(3600.0);
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			const FRavensightFlushPlan Plan = Queue->BeginFlush(Now, false);
+			TestEqual(TEXT("in flight"), Plan.Batch.Num(), 1);
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_0"), TEXT("{}"), 1));
+			TestTrue(TEXT("error still first"), Queue->GetEvents()[0].bError);
+			Queue->EndFlush();
+			Queue->OnBatchAccepted(1);
+			TestEqual(TEXT("gameplay left"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+		});
+
+		It("evicts the oldest error first when full, and drops an incoming error when none is queued", [this]()
+		{
+			Queue->SetMaxQueueSize(3);
+			Queue->Enqueue(FRavensightEvent(TEXT("a"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("b"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("c"), TEXT("{}"), 1));
+			TestEqual(TEXT("three left"), Queue->Num(), 3);
+			TestFalse(TEXT("the error went"), Queue->GetEvents()[0].bError || Queue->GetEvents()[1].bError || Queue->GetEvents()[2].bError);
+			TestEqual(TEXT("incoming error dropped"), Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true)), 1);
+			TestEqual(TEXT("still three"), Queue->Num(), 3);
+			Queue->Enqueue(FRavensightEvent(TEXT("d"), TEXT("{}"), 1));
+			TestEqual(TEXT("oldest gameplay went"), Queue->GetEvents()[0].EventName, FString(TEXT("b")));
+		});
+	});
+
+	Describe("the persisted queue's merge", [this]()
+	{
+		It("puts restored events ahead of this run's and stamps origins only where missing", [this]()
+		{
+			Queue->Enqueue(FRavensightEvent(TEXT("now"), TEXT("{}"), 2));
+			TArray<FRavensightEvent> Restored;
+			FRavensightEvent Old(TEXT("old"), TEXT("{}"), 1);
+			Old.OriginJson = TEXT("{\"session\":\"ses_old\"}");
+			Old.OriginSession = TEXT("ses_old");
+			Restored.Add(Old);
+			TestEqual(TEXT("restored"), Queue->Restore(Restored), 1);
+			TestEqual(TEXT("old first"), Queue->GetEvents()[0].EventName, FString(TEXT("old")));
+			Queue->StampOrigins(TEXT("{\"session\":\"ses_new\"}"), TEXT("ses_new"));
+			TestEqual(TEXT("kept its own"), Queue->GetEvents()[0].OriginSession, FString(TEXT("ses_old")));
+			TestEqual(TEXT("stamped"), Queue->GetEvents()[1].OriginSession, FString(TEXT("ses_new")));
+		});
+
+		It("refuses a batch 403 until the next launch, keeping every event", [this]()
+		{
+			GiveSession(3600.0);
+			Fill(2);
+			Queue->SetSendBlocked(true);
+			TestTrue(TEXT("refused"), Queue->BeginFlush(Now, true).Decision == ERavensightFlushDecision::Refused);
+			TestEqual(TEXT("kept"), Queue->Num(), 2);
+		});
+
+		It("drops the event a 400 names by index", [this]()
+		{
+			Fill(3);
+			TestEqual(TEXT("one"), Queue->DropAt(1, 1), 1);
+			TestEqual(TEXT("ev_2 moved up"), Queue->GetEvents()[1].EventName, FString(TEXT("ev_2")));
+			TestEqual(TEXT("out of range"), Queue->DropAt(5, 1), 0);
+		});
+	});
+
 	Describe("the backoff ladder", [this]()
 	{
 		It("doubles from 10 seconds and caps at 300", [this]()
 		{
-			const TArray<double> Expected = { 10.0, 20.0, 40.0, 80.0, 160.0, 300.0, 300.0, 300.0 };
+			// The ladder doubles from 10 to 300; each wait is the step times the
+			// jitter factor, 0.75 at the specs' random 0.5.
+			const TArray<double> Expected = { 7.5, 15.0, 30.0, 60.0, 120.0, 225.0, 225.0, 225.0 };
 
 			for (int32 Step = 0; Step < Expected.Num(); ++Step)
 			{
@@ -309,14 +395,14 @@ void FRavensightQueueSpec::Define()
 
 	Describe("the retry jitter", [this]()
 	{
-		It("is plus or minus 20 percent, within the floor and the ceiling", [this]()
+		It("is a factor from 0.5 to 1, within the floor and the ceiling", [this]()
 		{
-			TestEqual(TEXT("lowest"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.0), 8.0);
-			TestEqual(TEXT("middle"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.5), 10.0);
+			TestEqual(TEXT("lowest"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.0), 5.0);
+			TestEqual(TEXT("middle"), FRavensightQueue::JitteredWaitSeconds(10.0, 0.5), 7.5);
 			const double High = FRavensightQueue::JitteredWaitSeconds(10.0, 0.999999);
-			TestTrue(TEXT("highest at most 12"), High <= 12.0 && High > 11.99);
+			TestTrue(TEXT("highest at most 10"), High <= 10.0 && High > 9.99);
 			TestEqual(TEXT("never under the floor"), FRavensightQueue::JitteredWaitSeconds(0.1, 0.0), RavensightLimits::MinRetrySeconds);
-			TestEqual(TEXT("never over the ceiling"), FRavensightQueue::JitteredWaitSeconds(300.0, 0.999999), RavensightLimits::MaxBackoffSeconds);
+			TestTrue(TEXT("never over the ceiling"), FRavensightQueue::JitteredWaitSeconds(300.0, 0.999999) <= RavensightLimits::MaxBackoffSeconds);
 		});
 
 		It("jitters each wait while the ladder itself still doubles", [this]()
@@ -324,14 +410,14 @@ void FRavensightQueueSpec::Define()
 			Fill(1);
 			Queue->SetRandomSource(&RavensightQueueSpecRandom::Lowest);
 			Queue->ScheduleBackoff(Now);
-			TestEqual(TEXT("first wait"), Queue->SecondsUntilNextAttempt(Now), 8.0);
+			TestEqual(TEXT("first wait"), Queue->SecondsUntilNextAttempt(Now), 5.0);
 			Queue->ScheduleBackoff(Now);
-			TestEqual(TEXT("second wait"), Queue->SecondsUntilNextAttempt(Now), 16.0);
+			TestEqual(TEXT("second wait"), Queue->SecondsUntilNextAttempt(Now), 10.0);
 
 			Queue->SetRandomSource(&RavensightQueueSpecRandom::Highest);
 			Queue->ScheduleBackoff(Now);
 			const double Third = Queue->SecondsUntilNextAttempt(Now);
-			TestTrue(TEXT("third wait"), Third > 47.9 && Third <= 48.0);
+			TestTrue(TEXT("third wait"), Third > 39.9 && Third <= 40.0);
 		});
 
 		It("stays in range with the default random source", [this]()
@@ -342,7 +428,7 @@ void FRavensightQueueSpec::Define()
 				Queue->ResetBackoff();
 				Queue->ScheduleBackoff(Now);
 				const double Wait = Queue->SecondsUntilNextAttempt(Now);
-				if (!TestTrue(TEXT("between 8 and 12 seconds"), Wait >= 8.0 && Wait <= 12.0))
+				if (!TestTrue(TEXT("between 5 and 10 seconds"), Wait >= 5.0 && Wait <= 10.0))
 				{
 					break;
 				}

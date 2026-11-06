@@ -29,6 +29,8 @@ public class Ravensight : ModuleRules
 			new string[]
 			{
 				"Projects",
+				// GRHIAdapterName, for the gpu device field on POST /session.
+				"RHI",
 			}
 		);
 

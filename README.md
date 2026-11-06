@@ -35,7 +35,7 @@ Ravensight->FetchConfig();
 
 `OnConfigReady` runs on the game thread. `bFresh` is true for an accepted response or HTTP 304; a failed refresh reports false and retains cached values. Values are cached under `Saved/Ravensight`, scoped by a hash of endpoint, key, device, platform and build. Playtests use memory only. Config files are read only after consent. Opt-out, disable and identity reset clear active values and discard late responses. A changed context starts from the supplied fallbacks. The next request reuses the exact ETag; HTTP 304 is free, while a fresh config fetch consumes one ordinary event.
 
-Active experiment assignments add `rs_exp_<experiment_key>` to new events as they are queued. Existing queued events are never relabeled, retries retain their original assignments, and caller-supplied exposure labels are removed. Documents are bounded to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments. Invalid responses preserve the last valid snapshot. Use config for public game data, never credentials or secrets.
+A fetch alone is not an exposure. The first typed read (**Get Config Bool**, **Number**, **String** or **Json**) in a session exposes the player to every experiment the config lists: the plugin queues one `rs_exposure` event, and every event queued after it in that session carries `rs_exp_<experiment_key>: <variant>`. Events queued before the read stay untagged, a new session (after the mobile background timeout) starts untagged until its own first read, and an experiment missing from a later fetch is no longer tagged. Queued events keep the tags they were queued with, across launches. A well formed `rs_exp_<key>` of your own is left alone. Documents are bounded to 50 keys, 8 KB per value, JSON depth 20 and 10 experiment assignments. Invalid responses preserve the last valid snapshot. Use config for public game data, never credentials or secrets.
 
 ## Compatibility
 
@@ -388,7 +388,7 @@ otherwise one of the values every Ravensight SDK uses:
 | `disabled` | The Enabled setting is off, or the player opted out (or, with Consent on Opt In, has not said yes yet). Nothing is sent. |
 | `invalid_key` | The ingest key was refused. On the settings check or `POST /session` (a `401`, or a `403` other than the three below) the run ends: the queue is cleared, nothing more is sent, and `OnTrackingDisabled` fires with `key`. On a later batch `403`, automatic retries stop, events keep queueing up to the cap, and `Flush()` makes one more attempt. Logged once as a warning: `Ravensight: ingest key refused (invalid_key), sending stopped for this run. Check your gt_live_ or gt_pub_ key.` |
 | `tracking_disabled` | The kill switch is on for your game. The queue is cleared and nothing more is sent this run. |
-| `offline` | The server could not be reached. Retried from 10 seconds, doubling to 5 minutes, each wait plus or minus 20 percent. |
+| `offline` | The server could not be reached. Retried from 10 seconds, doubling to 5 minutes, each wait times a random factor between 0.5 and 1. |
 | `rate_limited` | A `429`. Retried after exactly `Retry-After` seconds. |
 | `session_failed` | A session could not be opened for another reason, or a Playtest token was refused or arrived without a run id. |
 | `playtest_job_closed` | The Playtest job for this run has ended. Nothing more is sent this run. |
@@ -476,8 +476,9 @@ apart from the refused key and jitter changes listed in the CHANGELOG.
   secure random source), and a counter. It always matches
   `^[A-Za-z0-9_-]{1,64}$`. Events tracked before `Init` get the device part
   when `Init` runs. A batch sent again after a failure carries the same ids,
-  and the server drops a repeat. The queue lives in memory, so events still
-  queued when the game exits are not sent on the next launch.
+  and the server drops a repeat. Events still queued when the game exits stay
+  in the queue file and are sent on the next launch (see
+  [How delivery works](#how-delivery-works)).
 * **A refused key ends the run.** A `401` or `403` to the settings check or to
   opening a session (other than `tracking_disabled` and a refused Playtest
   token) means the key was revoked, rotated or is wrong, and a retry cannot
@@ -486,19 +487,53 @@ apart from the refused key and jitter changes listed in the CHANGELOG.
   later `SetTrackingEnabled(true)` saves the choice but restarts nothing; the
   next launch tries the key again. A `401` on a batch still means the session
   expired: a new one is opened first.
-* **Jitter.** A failed request is retried after the backoff plus or minus 20
-  percent, never sooner than half a second and never later than 5 minutes. A
-  server's `Retry-After` is obeyed exactly.
-* **Events over 8,192 bytes** of data as JSON (what the server checks; the
+* **Jitter.** A failed request is retried after the backoff times a random
+  factor between 0.5 and 1, never sooner than half a second and never later
+  than 5 minutes. A server's `Retry-After` is obeyed exactly.
+* **Events over 8,192 bytes** of data as the server measures it (JSON bytes,
+  with a typed error's message and stack counted one byte a character; the
   name and timestamp are not counted) are dropped before they are queued,
   with one warning for the run and `OnFlushFailed("event_too_large")` for
   each.
 
 What a request carries: the settings check sends only the `X-API-Key`
-header; the session sends `deviceId`, `gameVersion`, `platform` and, when
-set, `distribution`; a batch sends `events`, each with `event`, `data` and
-`timestamp`; feedback sends `message` and the optional `category` and
-`rating`.
+header; the session sends `deviceId`, `gameVersion`, `platform`, `sdk`,
+`device` (see [Device id and privacy](#device-id-and-privacy)) and, when set,
+`distribution`; a batch sends `events`, each with `event`, `data`,
+`timestamp` (unix milliseconds) and, for an event from an earlier session,
+`origin`; feedback sends `message` and the optional `category` and `rating`.
+
+## Ads and attribution
+
+```cpp
+// A paid impression in micros of the currency: 0.0015 USD is "1500".
+Ravensight->TrackAdRevenue(TEXT("admob"), TEXT("rewarded"), TEXT("level_end"), TEXT("1500"), TEXT("USD"));
+
+// A mediation callback that reports a double in major units (MAX, LevelPlay):
+Ravensight->TrackAdRevenueFromMediation(NetworkName, AdFormat, Placement, Revenue, TEXT("USD"));
+
+// Clicks, rewards and failures carry no revenue.
+Ravensight->TrackAd(TEXT("admob"), TEXT("rewarded"), TEXT("rewarded"), TEXT("level_end"), FString(), FString());
+
+// Where this install came from, once per device.
+Ravensight->SetAttribution(TEXT("store_referrer"), TEXT("google"), TEXT("spring"), FString(), FString(), 0);
+```
+
+`TrackAd` sends one `rs_ad` event. Format is `banner`, `interstitial`,
+`rewarded`, `native`, `app_open` or `other`; result is `shown`, `clicked`,
+`failed` or `rewarded`. Revenue is a digit string of whole micros, sent only
+with `shown`, always with a three letter currency, never converted.
+`TrackAdRevenueFromMediation` writes the double as its shortest exact text and
+rounds half up past six decimals on the digits, so 0.0015 is `"1500"`, never by
+multiplying a float. Each returns false and sends nothing for a value the
+server would flag, such as revenue without a currency. All four are Blueprint
+callable.
+
+`SetAttribution` sends one `rs_attribution` event per device id:
+`[Ravensight] AttributionSentFor` in `GameUserSettings.ini` makes later calls
+return false across restarts. Pass `GetDeviceId()` to an attribution partner
+as its customer user id before the partner starts, so its install callback
+names this device.
 
 ## About your ingest key
 
@@ -516,30 +551,57 @@ your account. Rotate it from the dashboard at any time.
   `EndPlay`) and on quit. Never one request per event. Up to 50 events go in
   a request, the server limit, and a flush keeps sending until the queue
   drains.
-* **Queue.** Events accumulate up to Max Queue Size. Past that the oldest are
-  dropped so the newest are kept. The queue lives in memory only.
+* **Queue.** Events accumulate up to Max Queue Size. Error events (`rs_kind`
+  `error`) queue behind gameplay events, never inside a batch in flight, and
+  when the queue is full the oldest queued error goes first, then the oldest
+  event.
+* **Persisted queue.** The queue is kept in
+  `Saved/Ravensight/queue-<hash>.json`, one file per ingest key, written
+  beside the old file and moved over it so a partial write never replaces a
+  good one. It is written at most once a second while events arrive, at once
+  after every delivered or failed batch, on background and on quit, and read
+  back when the plugin starts. Events survive a crash, a kill or a lost
+  network and go out on the next launch. At most 500 events are kept, and
+  anything older than 89 days is dropped at start. Never for a Playtest run,
+  before an opt-in yes or after an opt-out.
+* **Original session, build and platform.** Each event remembers the session
+  it was tracked under (the opaque `origin` the server returned). An event
+  sent on a later launch carries it, so the server stores it under the run it
+  happened in. On mobile, a saved exit whose session has expired is queued
+  under its origin. The origin is kept only in the queue file and never logged.
 * **Failures keep events.** Offline, a timeout or a server error keeps every
   event and retries from 10 seconds, doubling to a 5 minute ceiling, each wait
-  plus or minus 20 percent (never under half a second) so many players who
-  lost the network together do not come back together. A `429`, or a `503`
-  that sends `Retry-After`, waits exactly that many seconds.
-* **Event ids.** Every event's data carries an `rs_event_id`, so a batch sent
-  again after a failure is recognised as the same events.
-* **Oversized events.** An event whose data is over 8,192 bytes as JSON is
-  dropped before it is queued, with one warning for the run and
-  `OnFlushFailed("event_too_large")` for each.
-* **A batch the server refuses.** A `400` on a batch halves it and retries; a
-  single event that still gets a `400` (too large, a bad name) is dropped,
-  counted in `GetQueue().GetStats().Dropped`, logged once, and the rest of the
-  queue keeps draining.
+  times a random factor between 0.5 and 1 (never under half a second) so many
+  players who lost the network together do not come back together. A `429`,
+  or a `503` that sends `Retry-After`, waits exactly that many seconds.
+  `Flush`, background and quit cut a backoff short, never a `Retry-After`.
+* **Compression.** A batch of 1,024 bytes or more is sent gzip compressed.
+* **Signed requests.** When `POST /session` answers with `signing` (sessions
+  opened with a public key), every batch carries `X-Ravensight-Timestamp` and
+  `X-Ravensight-Signature: v1=<hex>`, an HMAC-SHA256 of
+  `v1:<timestamp>:<body>` over the uncompressed body, with the device clock
+  corrected by the server's time. The secret is kept in memory only.
+* **Event ids.** Every event's data carries an `rs_event_id`, kept across
+  resends and launches, so the server drops a resend whose first copy was
+  stored (within its duplicate window, 24 hours by default).
+* **Oversized events.** An event whose data is over 8,192 bytes as the server
+  measures it is dropped before it is queued, with one warning for the run
+  and `OnFlushFailed("event_too_large")` for each.
+* **A batch the server refuses.** A `400` that names an event by `index` drops
+  that event and resends the rest. A `400 batch_too_large` or a `413` halves
+  the batch and retries; a single event still refused is dropped. Any other
+  `400` drops the request's events. A `415` resends once uncompressed. Each
+  drop is counted in `GetQueue().GetStats().Dropped` and logged once.
 * **Session expiry.** A `401` on a batch clears the session token, leaves the
-  events in place, opens a new session and re sends the same batch, at most
-  twice in a row before backing off.
+  events in place, opens one new session and re sends the same batch; a second
+  `401` in a row backs off.
+* **A batch `403`** keeps the events, in the queue file, and sends nothing more
+  until the next launch.
 * **Kill switch.** `GET /settings` is read once at start, and a `403
-  tracking_disabled` from any request means the same. The queue is cleared,
-  the timers stop and nothing is sent for the rest of that run. Flip it back
-  from the dashboard and it takes effect on the next launch, no update
-  required.
+  tracking_disabled` from the settings check or the session means the same.
+  The queue is cleared, the timers stop and nothing is sent for the rest of
+  that run. Flip it back from the dashboard and it takes effect on the next
+  launch, no update required.
 * **Every request** times out after Request Timeout Seconds (15).
 
 The quit flush is best effort: `game_exited` is queued once, then the quit is
@@ -672,9 +734,19 @@ Unreal build. See `Tools/README.md` for compile checking with the engine.
 The plugin generates a random GUID on first run and stores it in the local game
 user settings ini under `[Ravensight] DeviceId`. It does not use
 `FPlatformMisc::GetDeviceId`, an advertising identifier, an IDFA, an Android
-advertising id, or any hardware identifier. Nothing about the player or the
-device is collected by the SDK itself. Only the events you choose to send leave
-the machine.
+advertising id, or any hardware identifier. Besides the events you send, the
+SDK sends:
+
+* **Device fields**, once per session on `POST /session`: `model`
+  (`FPlatformMisc::GetDeviceMakeAndModel`), `osVersion`
+  (`FPlatformMisc::GetOSVersion`, the OS name removed) and `gpu`
+  (`GRHIAdapterName`). The engine reports these without a permission prompt;
+  none is a hardware identifier. Each is at most 128 printable characters. The
+  server derives the country itself; the SDK never sends one.
+* **Attribution**, once per install, only when the game calls `SetAttribution`.
+
+The queue file under `Saved/Ravensight` holds queued events and each session's
+opaque origin stamp; never the session token or signing secret.
 
 Because no advertising identifier is involved, an iOS build does not need an App
 Tracking Transparency prompt for Ravensight. You do still need to declare a

@@ -255,6 +255,40 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	void Flush();
 
+	/**
+	 * One ad lifecycle step. Format: banner, interstitial, rewarded, native,
+	 * app_open or other. Result: shown, clicked, failed or rewarded.
+	 * RevenueMicros is whole micros of Currency as a digit string ("1500" is
+	 * 0.0015), sent only with shown. Returns false, sending nothing, for a
+	 * value the server would flag, such as revenue without a currency.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Ads")
+	bool TrackAd(const FString& Network, const FString& Format, const FString& Result,
+		const FString& Placement, const FString& RevenueMicros, const FString& Currency);
+
+	/** A paid impression: TrackAd(Network, Format, "shown", Placement, RevenueMicros, Currency). */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Ads")
+	bool TrackAdRevenue(const FString& Network, const FString& Format, const FString& Placement,
+		const FString& RevenueMicros, const FString& Currency);
+
+	/**
+	 * From a mediation impression callback that reports revenue as a double
+	 * in major units (AppLovin MAX, LevelPlay, TopOn): the format name is
+	 * mapped and the double converted on its digits, never multiplied.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Ads")
+	bool TrackAdRevenueFromMediation(const FString& Network, const FString& FormatName, const FString& Placement,
+		double Revenue, const FString& Currency);
+
+	/**
+	 * Where this install came from. Sent once per device id: a flag saved
+	 * beside the device id makes later calls return false, across restarts.
+	 * TouchTimeMs is epoch milliseconds of the click or open, 0 for none.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Ads")
+	bool SetAttribution(const FString& Source, const FString& Network, const FString& Campaign,
+		const FString& Adset, const FString& Creative, int64 TouchTimeMs);
+
 	// --- Feedback and suggestions -----------------------------------------
 
 	/**
@@ -449,7 +483,7 @@ private:
 
 	void FlushInternal(bool bForce, bool bExplicit = false);
 	void SendBatch(const TArray<FRavensightEvent>& Batch);
-	void HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation);
+	void HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation, bool bCompressed);
 
 	void HandleFeedbackResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully);
 	void HandleConfigResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation);
@@ -462,11 +496,26 @@ private:
 	/** One POST /track/batch carrying only game_exited under a given session token. One attempt, no retry. */
 	void SendExitUnderToken(const FString& Token, double ExitedAtSeconds);
 
+	// --- Persisted queue, origin and signing (DELIVERY_CONTRACT.md) ----------
+	FString QueueFilePath() const;
+	bool QueueFileAllowed() const;
+	void LoadPersistedQueue();
+	void PersistQueueSoon();
+	void PersistQueueNow();
+	void AdoptSessionAnswer(const TSharedPtr<FJsonObject>& Parsed);
+	TSharedRef<FJsonObject> DeviceFields() const;
+	static int64 NowMs();
+
+	// --- Experiment exposure (EXPOSURE_CONTRACT.md) -----------------------
+	/** A typed config read: exposes the session to every running experiment, once per session. */
+	void MarkExposed() const;
+
+
 	/** Builds a request with the shared timeout, verb and Playtest header already applied. */
 	FHttpRequestRef MakeRequest(const FString& Verb, const FString& Path) const;
 
 	/** Classifies an answer with the shared table in RavensightProtocol. */
-	static FRavensightResponseVerdict Classify(ERavensightEndpoint Endpoint, const FHttpResponsePtr& Response, bool bConnectedSuccessfully, int32 BatchSize = 0, int32 InConsecutiveBatchUnauthorized = 0);
+	static FRavensightResponseVerdict Classify(ERavensightEndpoint Endpoint, const FHttpResponsePtr& Response, bool bConnectedSuccessfully, int32 BatchSize = 0, int32 InConsecutiveBatchUnauthorized = 0, int32 RefusedIndex = -1, bool bCompressed = false);
 
 	/** Holds the quit for at most ExitFlushBudgetSeconds while a session or batch request is in flight. */
 	void PumpUntilIdle(double BudgetSeconds);
@@ -575,6 +624,29 @@ private:
 
 	/** 401s on /track/batch since the last 202. */
 	int32 ConsecutiveBatchUnauthorized = 0;
+
+	/** The current session's origin as received (JSON object text) and its session id. Kept with the queue only. */
+	FString CurrentOriginJson;
+	FString CurrentOriginSession;
+
+	/** A signing session's secret, memory only, and serverTime minus the device clock in seconds. */
+	FString SigningSecret;
+	int64 SigningOffsetSeconds = 0;
+
+	/** The persisted queue was read back this run; a change is waiting to be written. */
+	bool bQueueLoaded = false;
+	bool bQueueDirty = false;
+	double LastQueueWriteSeconds = 0.0;
+
+	/** The next batch goes out uncompressed once, after a 415. */
+	bool bSendPlainOnce = false;
+
+	/** Analytics sessions in this run, for exposure; a break already counted before the next session opened. */
+	int32 SessionEpoch = 1;
+	int32 SessionsOpened = 0;
+	bool bSessionBreakCounted = false;
+	mutable int32 ExposedEpoch = 0;
+	mutable TSet<FString> ExposedKeys;
 
 	/**
 	 * Bumped whenever the queue or the session is thrown away (opt out,
