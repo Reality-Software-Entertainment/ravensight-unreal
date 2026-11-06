@@ -14,6 +14,7 @@ OUT="${TMPDIR:-/tmp}/ravensight-host-check"
 CXX="${CXX:-c++}"
 
 mkdir -p "$OUT"
+python3 "$HERE/../scrub-vectors/generate.py" --check
 "$CXX" -std=c++17 -Wall -Wextra -Wshadow -Werror \
   -I"$HERE/include" -I"$SRC/Public" \
   "$SRC/Private/RavensightQueue.cpp" \

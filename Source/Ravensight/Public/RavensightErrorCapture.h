@@ -18,8 +18,8 @@
 //   3. an email address becomes [email]
 //   4. /Users/<name>, /home/<name> and C:\Users\<name> become ~
 //   5. IPv4 and IPv6 addresses (with a digit) become [ip]
-//   6. a run of 32 or more of [A-Za-z0-9+=_-] with a digit becomes [token]
-//      ('/' is not in the class, so file paths in stacks survive)
+//   6. a run of 32 or more of [A-Za-z0-9+/=_-] with a digit becomes [token],
+//      unless every '/' piece is empty or a path word (a file path survives)
 
 #pragma once
 

@@ -434,10 +434,78 @@ namespace
 		});
 	}
 
-	/** [A-Za-z0-9+=_-]: no '/', so a file path in a stack survives. */
-	bool IsLongRunChar(TCHAR C) { return IsAlnum(C) || Is(C, '+') || Is(C, '=') || Is(C, '_') || Is(C, '-'); }
+	/** [A-Za-z0-9+/=_-]. */
+	bool IsLongRunChar(TCHAR C) { return IsAlnum(C) || Is(C, '+') || Is(C, '/') || Is(C, '=') || Is(C, '_') || Is(C, '-'); }
 
-	/** 32 or more characters of [A-Za-z0-9+=_-] with a digit in the run. */
+	/** ^[a-z0-9]+([_-][a-z0-9]+)*$ */
+	bool IsSnakeWord(const FString& T, int32 From, int32 To)
+	{
+		bool bNeedChar = true;
+		for (int32 Index = From; Index < To; ++Index)
+		{
+			const TCHAR C = T[Index];
+			if (IsLower(C) || IsDigit(C)) { bNeedChar = false; continue; }
+			if ((Is(C, '_') || Is(C, '-')) && !bNeedChar) { bNeedChar = true; continue; }
+			return false;
+		}
+		return !bNeedChar;
+	}
+
+	/** ^[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]+)*$ */
+	bool IsPascalWord(const FString& T, int32 From, int32 To)
+	{
+		if (From >= To || !IsUpper(T[From])) return false;
+		int32 Index = From + 1;
+		while (Index < To && (IsLower(T[Index]) || IsDigit(T[Index]))) ++Index;
+		while (Index < To)
+		{
+			if (!IsUpper(T[Index])) return false;
+			const int32 Hump = ++Index;
+			while (Index < To && (IsLower(T[Index]) || IsDigit(T[Index]))) ++Index;
+			if (Index == Hump) return false;
+		}
+		return true;
+	}
+
+	/** ^[A-Z0-9]{1,6}$ */
+	bool IsShortCaps(const FString& T, int32 From, int32 To)
+	{
+		if (To - From < 1 || To - From > 6) return false;
+		for (int32 Index = From; Index < To; ++Index)
+		{
+			if (!IsUpper(T[Index]) && !IsDigit(T[Index])) return false;
+		}
+		return true;
+	}
+
+	/**
+	 * A run with a '/' whose every piece is empty or a path word under 32
+	 * characters: a file path, kept. Anything else with a '/' may be a
+	 * secret and is not.
+	 */
+	bool IsPathRun(const FString& T, int32 From, int32 To)
+	{
+		bool bSlash = false;
+		int32 PieceStart = From;
+		for (int32 Index = From; Index <= To; ++Index)
+		{
+			if (Index < To && !Is(T[Index], '/'))
+			{
+				continue;
+			}
+			bSlash = bSlash || Index < To;
+			const int32 Length = Index - PieceStart;
+			if (Length >= 32) return false;
+			if (Length > 0 && !IsSnakeWord(T, PieceStart, Index) && !IsPascalWord(T, PieceStart, Index) && !IsShortCaps(T, PieceStart, Index))
+			{
+				return false;
+			}
+			PieceStart = Index + 1;
+		}
+		return bSlash;
+	}
+
+	/** 32 or more of [A-Za-z0-9+/=_-] with a digit in the run, unless it is a path. */
 	FString ScrubLongRuns(const FString& Text)
 	{
 		FString Out;
@@ -452,8 +520,7 @@ namespace
 			}
 			const int32 Start = Index;
 			while (Index < Text.Len() && IsLongRunChar(Text[Index])) ++Index;
-			const int32 RunEnd = Index;
-			if (RunEnd - Start >= 32 && HasDigit(Text, Start, RunEnd))
+			if (Index - Start >= 32 && HasDigit(Text, Start, Index) && !IsPathRun(Text, Start, Index))
 			{
 				Out += TEXT("[token]");
 				continue;

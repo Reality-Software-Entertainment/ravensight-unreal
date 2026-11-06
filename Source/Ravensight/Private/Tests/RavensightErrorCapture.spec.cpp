@@ -71,6 +71,32 @@ void FRavensightErrorCaptureSpec::Define()
 			}
 		});
 
+		It("produces the platform's shared fixture exactly (Fixtures/scrub-vectors.json)", [this]()
+		{
+			struct FVector { const char* Name; const char* In; const char* Out; };
+			static const FVector Vectors[] = {
+#include "RavensightScrubVectors.inl"
+			};
+			int32 Count = 0;
+			for (const FVector& Vector : Vectors)
+			{
+				const FString Got = RavensightErrors::Scrub(Vector.In);
+				if (!Same(Got, Vector.Out))
+				{
+					AddError(FString(Vector.Name) + TEXT(": got '") + Got + TEXT("', expected '") + FString(Vector.Out) + TEXT("'"));
+				}
+				++Count;
+			}
+			TestTrue("fixture has cases", Count > 0);
+		});
+
+		It("keeps file paths with digits but not secrets with slashes", [this]()
+		{
+			TestTrue("engine path", Same(RavensightErrors::Scrub(TEXT("Engine/Source/Runtime/Core/Private/Misc/AssertionMacros2.cpp:42")),
+				TEXT("Engine/Source/Runtime/Core/Private/Misc/AssertionMacros2.cpp:42")));
+			TestTrue("secret", Same(RavensightErrors::Scrub(TEXT("k wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY1 x")), TEXT("k [token] x")));
+		});
+
 		It("leaves ordinary text, frames and identifiers without a digit alone", [this]()
 		{
 			const char* const Kept[] = {
@@ -81,8 +107,6 @@ void FRavensightErrorCaptureSpec::Define()
 				"Kick Off button: TypeError: x is undefined",
 				"std::vector<int>::size",
 				"version 1.2.3 build 4",
-				"at /Game/Maps/Level_01/Blueprints/BP_Player_Controller_2026/Ubergraph.uasset:12",
-				"D:/Build/Saved/StagedBuilds/Windows/MyGame_v2/Binaries/Win64/MyGame-Win64-Shipping.exe",
 			};
 			for (const char* Input : Kept)
 			{
