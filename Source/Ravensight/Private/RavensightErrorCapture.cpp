@@ -281,9 +281,12 @@ namespace
 		return Out;
 	}
 
-	bool IsHomeNameChar(TCHAR C, bool bWindows)
+	/** A home folder is the whole segment up to the next slash, quote, <, >,
+	 *  ':' or end of line, spaces included (contract 5): a name can be Jo Ann. */
+	bool IsHomeNameChar(TCHAR C)
 	{
-		return !(Is(C, '/') || IsSpace(C) || Is(C, '\'') || Is(C, '"') || (bWindows && Is(C, '\\')));
+		return !(Is(C, '/') || Is(C, '\\') || Is(C, '\'') || Is(C, '"') || Is(C, '<') || Is(C, '>')
+			|| Is(C, ':') || Is(C, '\r') || Is(C, '\n'));
 	}
 
 	FString ScrubHomes(const FString& Text)
@@ -295,18 +298,21 @@ namespace
 				return -1;
 			}
 			const TCHAR Slash = Text[Start + 2];
-			if (!(Is(Slash, '\\') || Is(Slash, '/')) || !At(Text, Start + 3, "users", true))
+			if (!(Is(Slash, '\\') || Is(Slash, '/')))
 			{
 				return -1;
 			}
-			int32 Index = Start + 8;
+			int32 Index = -1;
+			if (At(Text, Start + 3, "users", true)) Index = Start + 3 + 5;
+			else if (At(Text, Start + 3, "documents and settings", true)) Index = Start + 3 + 22;
+			if (Index < 0) return -1;
 			if (Index >= Text.Len() || !(Is(Text[Index], '\\') || Is(Text[Index], '/')))
 			{
 				return -1;
 			}
 			++Index;
 			const int32 NameStart = Index;
-			while (Index < Text.Len() && IsHomeNameChar(Text[Index], true)) ++Index;
+			while (Index < Text.Len() && IsHomeNameChar(Text[Index])) ++Index;
 			if (Index == NameStart) return -1;
 			Out = TEXT("~");
 			return Index;
@@ -319,7 +325,7 @@ namespace
 			else if (At(Windows, Start, "/home/", false)) Index = Start + 6;
 			if (Index < 0) return -1;
 			const int32 NameStart = Index;
-			while (Index < Windows.Len() && IsHomeNameChar(Windows[Index], false)) ++Index;
+			while (Index < Windows.Len() && IsHomeNameChar(Windows[Index])) ++Index;
 			if (Index == NameStart) return -1;
 			Out = TEXT("~");
 			return Index;

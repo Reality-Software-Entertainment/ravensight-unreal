@@ -57,7 +57,7 @@ void FRavensightErrorCaptureSpec::Define()
 				{ "key gt_live_ab12CD34 and gt_mcp_x", "key [token] and [token]" },
 				{ "at /Users/jacob/game/main.js:1", "at ~/game/main.js:1" },
 				{ "at /home/al/game/main.lua", "at ~/game/main.lua" },
-				{ "at C:\\Users\\Jo Ann\\x.cs", "at ~ Ann\\x.cs" },
+				{ "at C:\\Users\\Jo Ann\\x.cs", "at ~\\x.cs" },
 				{ "at C:/Users/jo/x.cs", "at ~/x.cs" },
 				{ "from 192.168.1.10 ok", "from [ip] ok" },
 				{ "from 2001:db8::1 and ::1 ok", "from [ip] and [ip] ok" },

@@ -364,7 +364,9 @@ What is sent, and what never is:
   the platform's rules: emails become `[email]`; bearer tokens, JWT shaped
   strings, `gt_` keys and long runs of key like characters with a digit
   become `[token]` (file paths are kept); IPv4 and IPv6 addresses become
-  `[ip]`; `/Users/<name>`, `/home/<name>` and `C:\Users\<name>` become `~`;
+  `[ip]`; `/Users/<name>`, `/home/<name>`, `C:\Users\<name>` and
+  `C:\Documents and Settings\<name>` become `~`, the whole name, spaces
+  included;
   a URL loses its credentials, query and fragment. Your own `TrackError`
   calls are sent as you wrote them and scrubbed by the server.
 * Never the plugin's own lines (`LogRavensight`), and never a line about its

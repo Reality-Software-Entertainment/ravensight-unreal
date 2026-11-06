@@ -18,6 +18,8 @@ All notable changes to this plugin are documented here.
 - Device caps per session: 30 captures, 3 per dedupe key, 10 trails, 6 a
   minute. Message, stack and trail are scrubbed on the device with the
   platform's shared fixture, which the specs run case for case.
+- A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
 - Optional trail of the last 20 log lines, attached only when the game's
   trail switch is on; with it off, Warning and lower lines are dropped
   before any copy.
