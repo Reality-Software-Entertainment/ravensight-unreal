@@ -44,7 +44,10 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
 
 ## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
-- Engine-free host check: **124 cases passed**, including every shared delivery
+- After merging the 0.4.0 error capture from main: engine-free host check
+  **143 cases passed** and the full `Ravensight` automation run **184 passed**
+  (171 clean, 13 with expected warnings), 0 failed, on the same UE 5.8.3 build.
+- Before the merge: engine-free host check **124 cases passed**, including every shared delivery
   vector (header and beacon signatures, the 8 KB measure), the error-behind-gameplay
   queue rules and the new response table, plus 4 portable SHA-256 cases.
 - Unreal Engine 5.8.3 Mac Development editor target built with `-WarningsAsErrors`

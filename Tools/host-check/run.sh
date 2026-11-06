@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Compiles FRavensightQueue, RavensightProtocol, RavensightTypedEvents and their automation specs with
+# Compiles FRavensightQueue, RavensightProtocol, RavensightTypedEvents,
+# RavensightErrorCapture and their automation specs with
 # a plain C++17 compiler against the stand-in headers in include/, then runs
 # the specs. This is a host check of the engine-free logic only. It is not an
 # Unreal build: the subsystem, UnrealHeaderTool and UnrealBuildTool are not
@@ -13,17 +14,20 @@ OUT="${TMPDIR:-/tmp}/ravensight-host-check"
 CXX="${CXX:-c++}"
 
 mkdir -p "$OUT"
+python3 "$HERE/../scrub-vectors/generate.py" --check
 "$CXX" -std=c++17 -Wall -Wextra -Wshadow -Werror \
   -I"$HERE/include" -I"$SRC/Public" \
   "$SRC/Private/RavensightQueue.cpp" \
   "$SRC/Private/RavensightProtocol.cpp" \
   "$SRC/Private/RavensightTypedEvents.cpp" \
   "$SRC/Private/RavensightDelivery.cpp" \
+  "$SRC/Private/RavensightErrorCapture.cpp" \
   "$SRC/Private/Tests/RavensightQueue.spec.cpp" \
   "$SRC/Private/Tests/RavensightProtocol.spec.cpp" \
   "$SRC/Private/Tests/RavensightTypedEvents.spec.cpp" \
   "$SRC/Private/Tests/RavensightConfig.spec.cpp" \
   "$SRC/Private/Tests/RavensightDelivery.spec.cpp" \
+  "$SRC/Private/Tests/RavensightErrorCapture.spec.cpp" \
   "$HERE/main.cpp" \
   -o "$OUT/host-check"
 

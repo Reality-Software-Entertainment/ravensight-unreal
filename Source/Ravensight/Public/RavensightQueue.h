@@ -61,7 +61,11 @@ struct FRavensightEvent
 	/** The origin's session id, so a send can tell whether the event is from an earlier session. */
 	FString OriginSession;
 
-	/** A typed error event: it queues behind gameplay events and is evicted first. */
+	/**
+	 * An automatic error capture. Gameplay events are queued ahead of it and
+	 * it is the first dropped when the queue is full, so an error storm never
+	 * holds back or pushes out gameplay.
+	 */
 	bool bError = false;
 
 	FRavensightEvent() = default;
@@ -139,12 +143,11 @@ public:
 	// --- Enqueue -----------------------------------------------------------
 
 	/**
-	 * Adds an event. A gameplay event goes ahead of every queued error event
-	 * (never inside a batch in flight). When the cap is met the oldest queued
-	 * error goes first, then the oldest event; an incoming error with no
-	 * error to evict is itself dropped. Returns how many were dropped, the
-	 * incoming one included, so the caller can log it. A no-op returning 0
-	 * when tracking is off.
+	 * Adds an event, dropping oldest events first if the cap is already met
+	 * (queued errors before any gameplay event). A gameplay event goes in
+	 * ahead of every queued error that is not already in flight. Returns how
+	 * many were dropped to make room, so the caller can log it. A no-op
+	 * returning 0 when tracking is off.
 	 */
 	int32 Enqueue(const FRavensightEvent& Event);
 
@@ -313,9 +316,6 @@ private:
 	/** Removes events until the queue fits the cap, errors first. Returns how many went. */
 	int32 TrimToCap(int32 Headroom);
 
-	/** The first queued error outside the batch in flight, or INDEX_NONE. */
-	int32 FirstQueuedError() const;
-
 	TArray<FRavensightEvent> Events;
 	int32 MaxQueueSize = RavensightLimits::DefaultQueueCap;
 
@@ -323,9 +323,11 @@ private:
 	bool bServerTrackingEnabled = true;
 	bool bLocallyEnabled = true;
 	bool bFlushInProgress = false;
-	int32 InFlightCount = 0;
 	bool bRetryAfterActive = false;
 	bool bSendBlocked = false;
+
+	/** How many leading events the batch in flight holds; nothing may be inserted or dropped among them. */
+	int32 InFlightCount = 0;
 
 	FString SessionToken;
 	double SessionExpiresAtSeconds = 0.0;

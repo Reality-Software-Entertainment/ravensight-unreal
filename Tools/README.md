@@ -108,6 +108,21 @@ engine API moved between 5.x releases.
 
 ## What was verified in Unreal
 
+Automatic error capture (Unreleased), on 2026-11-06, the same way (Unreal
+Engine 5.8, a scratch host project with the plugin under `Plugins/`, warnings
+and shadowed variables as errors): the editor target built with no warnings;
+`Automation RunTests Ravensight` ran 164 tests, 164 passed (13 with expected
+warnings), including six subsystem cases that log real lines to `GLog` and
+raise a real `ensure`, with requests on the fake transport (no network);
+`bash Tools/host-check/run.sh` ran 128 cases, 0 failed, including every case
+of the platform's shared scrub fixture. The Blueprint script exception hook
+compiled but was not raised in a test. After the review round, `Build.sh
+HostGame Mac Shipping` (`NO_LOGGING`) compiled and linked the plugin with
+warnings as errors; Xcode's app finalization step then failed, as for
+0.2.1, so no Shipping app was launched. The editor suite ran 164 again, 164
+passed.
+
+
 For 0.3.0, on 2026-10-16, the same way (Unreal Engine 5.8, Xcode 27.0, a
 scratch host project with the plugin copied under `Plugins/`): the editor
 target built with warnings and shadowed variables as errors, with no

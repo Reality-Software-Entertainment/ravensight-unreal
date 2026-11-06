@@ -148,6 +148,16 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Behavior")
 	bool bPerformance = false;
 
+	/**
+	 * Automatic error capture: Error and Fatal log lines, ensures and
+	 * Blueprint script exceptions become one "error" event each, scrubbed and
+	 * capped on the device (30 a session). On by default; untick to opt out.
+	 * Nothing is captured without a key, before the player's consent, or while
+	 * the game's error capture switch on the dashboard is off.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Behavior")
+	bool bErrorCapture = true;
+
 	/** Logs every session, batch and retry decision to LogRavensight at Log verbosity. */
 	UPROPERTY(config, EditAnywhere, Category = "Diagnostics")
 	bool bVerboseLogging = false;

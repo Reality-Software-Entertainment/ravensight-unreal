@@ -16,7 +16,7 @@
 namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
-	inline constexpr const TCHAR* Sdk = TEXT("0.3.1");
+	inline constexpr const TCHAR* Sdk = TEXT("0.4.0");
 
 	/** "unreal/<version>", sent as "sdk" on the session create request. */
 	inline FString SdkTag()
@@ -59,7 +59,7 @@ enum class ERavensightResponseAction : uint8
 	/** 2xx. Carry on. */
 	Accept,
 
-	/** 400 on a one event batch: the server will never take it. Drop it and keep draining. */
+	/** 400 or 413 on a one event batch: the server will never take it. Drop it and keep draining. */
 	DropHead,
 
 	/** 400 batch_too_large or 413 on a larger batch: retry with half as many events. */

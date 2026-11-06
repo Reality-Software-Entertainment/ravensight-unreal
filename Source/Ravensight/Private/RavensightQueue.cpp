@@ -19,33 +19,25 @@ int32 FRavensightQueue::TrimToCap(int32 Headroom)
 	int32 Dropped = 0;
 	while (Events.Num() > Limit)
 	{
-		// Queued errors go before any gameplay event, never from inside a
-		// batch in flight. Then the oldest goes, so the newest events always
-		// survive: a player who has been offline for an hour is better served
-		// by the last minute of their session than by the first.
-		const int32 Victim = FirstQueuedError();
-		Events.RemoveAt(Victim == INDEX_NONE ? 0 : Victim);
-		if (Victim == INDEX_NONE && InFlightCount > 0)
+		// Drop oldest so the newest events always survive: a player who has
+		// been offline for an hour is better served by the last minute of
+		// their session than by the first. Queued errors go before any
+		// gameplay event, never from inside a batch in flight.
+		int32 Victim = 0;
+		for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
 		{
-			--InFlightCount;
+			if (Events[Index].bError)
+			{
+				Victim = Index;
+				break;
+			}
 		}
+		Events.RemoveAt(Victim);
 		++Dropped;
 	}
 
 	DroppedCount += Dropped;
 	return Dropped;
-}
-
-int32 FRavensightQueue::FirstQueuedError() const
-{
-	for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
-	{
-		if (Events[Index].bError)
-		{
-			return Index;
-		}
-	}
-	return INDEX_NONE;
 }
 
 int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
@@ -55,23 +47,19 @@ int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
 		return 0;
 	}
 
-	if (Event.bError && Events.Num() >= MaxQueueSize && FirstQueuedError() == INDEX_NONE)
-	{
-		// Full of gameplay events: the incoming error is the one that goes.
-		++DroppedCount;
-		return 1;
-	}
-
 	const int32 Dropped = TrimToCap(1);
-	const int32 At = Event.bError ? INDEX_NONE : FirstQueuedError();
-	if (At == INDEX_NONE)
+	if (!Event.bError)
 	{
-		Events.Add(Event);
+		for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
+		{
+			if (Events[Index].bError)
+			{
+				Events.Insert(Event, Index);
+				return Dropped;
+			}
+		}
 	}
-	else
-	{
-		Events.Insert(Event, At);
-	}
+	Events.Add(Event);
 	return Dropped;
 }
 

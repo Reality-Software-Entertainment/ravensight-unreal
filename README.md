@@ -311,6 +311,84 @@ amount becomes a flagged event, visible on the Implementation health card,
 and the helper never throws. In Blueprint the same calls are under
 **Ravensight > Typed Events**.
 
+#### Automatic error capture
+
+Errors in a live game are captured on their own, with no code. Each one is
+an ordinary `error` event on the shared event meter: one capture is one
+event, and spend is bounded on the device.
+
+What is captured:
+
+| Source | `rs_source` | `rs_severity` | `rs_error_type` |
+| --- | --- | --- | --- |
+| A `UE_LOG` (or any `GLog` line) at `Error` | `log` | `warning` | the log category, such as `LogTemp` |
+| A line at `Fatal` sent to `GLog` | `log` | `critical` | the log category |
+| An `ensure` that fails | `log` | `warning` | `Ensure`, with the stack in `rs_stack` |
+| A Blueprint script exception (Accessed None, an infinite loop, a runtime error) | `uncaught` | `error` | `Blueprint.AccessViolation` and so on, with the script stack |
+
+A `Warning`, `Display` or `Log` line is never captured. With the game's
+trail switch on they go into the trail; with it off they are dropped before
+anything is copied.
+
+How it works: an output device on `GLog` and the engine's ensure and script
+exception delegates copy each line or report into a small lock protected
+list, from whichever thread logged it. The list keeps separate room for
+errors (32) and trail lines (32), so trail lines never push an error out,
+and a full quota drops a line before it is copied. The subsystem drains that
+list on the game thread a few times a second, and on `Flush` and quit. Once
+the session's 30 captures are spent, error lines are dropped at the hook
+before any copy, so a game that logs an error every frame pays almost
+nothing. The hooks only
+observe: nothing the game logs, and nothing an ensure or a script exception
+does, changes. Blueprint stack warnings that the engine prints only while
+nothing listens for script exceptions are still printed.
+
+When it runs:
+
+* Nothing is installed without an ingest key, before the player's consent,
+  with **Error Capture** unticked, or once the game's error capture switch
+  on the dashboard is off. Opting out, `SetEnabled(false)` and the kill
+  switch remove the hooks.
+* With a key and consent the hooks go in at start, before the server
+  answers, so errors during boot are not missed. At most 5 are held in
+  memory until the settings or session answer: if it says capture is on
+  (or says nothing), they are queued; if it says off, they are discarded
+  unsent and the hooks are removed.
+
+What is sent, and what never is:
+
+* The message (at most 200 characters), the stack (at most 2,000), the type
+  (at most 100), the source and the severity, at the top level of the
+  event's data. Never `rs_fp`: the server writes the fingerprint.
+* Every captured text is scrubbed on the device before it is queued, with
+  the platform's rules: emails become `[email]`; bearer tokens, JWT shaped
+  strings, `gt_` keys and long runs of key like characters with a digit
+  become `[token]` (file paths are kept); IPv4 and IPv6 addresses become
+  `[ip]`; `/Users/<name>`, `/home/<name>`, `C:\Users\<name>` and
+  `C:\Documents and Settings\<name>` become `~`, the whole name, spaces
+  included;
+  a URL loses its credentials, query and fragment. Your own `TrackError`
+  calls are sent as you wrote them and scrubbed by the server.
+* Never the plugin's own lines (`LogRavensight`), and never a line about its
+  own requests to the API host.
+* The trail is the last 20 log lines, each `+<ms since start> <level> <text>`
+  and at most 120 characters, in memory only. It is attached to a capture
+  only when the game's trail switch is on, never sent alone, and never
+  written to disk.
+
+Caps per session, enforced on the device and dropped silently: 30 captures,
+3 of the same error (type, message with numbers and ids folded, first stack
+frame), 10 trails, and at most 6 a minute.
+
+What still works in a Shipping build: Shipping compiles out logging
+(`NO_LOGGING`), so `UE_LOG` lines, and therefore log captures and the trail,
+are gone there. `ensure` is compiled out of Shipping by default too
+(`DO_ENSURE`). Blueprint script exceptions still reach the hook, though the
+engine's script stack (`DO_BLUEPRINT_GUARD`) is off by default in Test and
+Shipping, so the stack may be short or empty. Test and Development builds
+keep all of it. A `Fatal` log, `check()` or a crash ends the process before
+the next drain, so it is not sent in this version.
+
 #### Performance sampling
 
 Turn on **Performance** in Project Settings to send one `health` event per
@@ -339,6 +417,7 @@ callable.
 | `TrackResource(Flow, Resource, Amount, ItemType, ItemId, Extra, EventName)` | Typed resource flow, `source` or `sink`. Default name `resource_source` or `resource_sink`. |
 | `TrackProgression(Status, P1, P2, P3, bHasScore, Score, Extra, EventName)` | Typed progression, `start`, `complete` or `fail`. Default name `progression_<status>`. |
 | `TrackError(Severity, Message, Stack, Extra, EventName)` | Typed error. Message cut to 200 characters, stack to 2000. Default name `error`. |
+| `IsErrorCaptureActive()` | True while automatic error capture is installed. See [Automatic error capture](#automatic-error-capture). |
 | `Flush()` | Sends queued events now, ignoring the retry window. After a refused key, the one way to make another attempt. |
 | `SubmitFeedback(Message, FeedbackCategory, Rating)` | Posts player feedback. Category is empty or one of `bug`, `suggestion`, `complaint`, `praise`, `playtest`, `other`; Rating is 1 to 5, or 0 to omit. A bad category or rating fails locally with `invalid_category` or `invalid_rating` and sends nothing. While tracking is off it fails with `disabled`. Needs an open session (`no_session` otherwise). |
 | `GetFeedbackCategories()` | The six categories above. |
@@ -418,6 +497,7 @@ the server's events join this player's session.
 | Session Timeout Seconds | `1800` | iOS and Android: a background stay at least this long ends the session. |
 | Request Timeout Seconds | `15` | Per request timeout. |
 | Performance | off | Samples the frame rate once a second and sends one `health` event per session, on background (mobile) or quit. See [Performance sampling](#performance-sampling). |
+| Error Capture | on | Automatic error capture. Untick to opt the game out. See [Automatic error capture](#automatic-error-capture). |
 | Verbose Logging | off | Logs every session, batch and retry decision to `LogRavensight`. |
 
 Watch the SDK work with `Log LogRavensight Verbose` in the console, or turn
@@ -551,10 +631,11 @@ your account. Rotate it from the dashboard at any time.
   `EndPlay`) and on quit. Never one request per event. Up to 50 events go in
   a request, the server limit, and a flush keeps sending until the queue
   drains.
-* **Queue.** Events accumulate up to Max Queue Size. Error events (`rs_kind`
-  `error`) queue behind gameplay events, never inside a batch in flight, and
-  when the queue is full the oldest queued error goes first, then the oldest
-  event.
+* **Queue.** Events accumulate up to Max Queue Size. Past that the oldest are
+  dropped so the newest are kept, automatic error captures first. A gameplay
+  event is queued ahead of every waiting error capture (never inside a batch
+  in flight), so an error storm never holds back or pushes out gameplay. The
+  capture flag is kept in the queue file, so this holds after a restart.
 * **Persisted queue.** The queue is kept in
   `Saved/Ravensight/queue-<hash>.json`, one file per ingest key, written
   beside the old file and moved over it so a partial write never replaces a

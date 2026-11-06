@@ -5,11 +5,10 @@ All notable changes to this plugin are documented here.
 ## Unreleased
 
 Follows the platform's SDK delivery, ads and attribution, exposure and device
-contracts. Automatic error capture is not in this change; it ships from the
-error capture branch. The server releases for these contracts ship first; see
-"Server prerequisites".
+contracts. The server releases for these contracts ship first; see "Server
+prerequisites".
 
-### Changes for 0.3.x games
+### Changes for 0.4.0 games
 
 * The queue is persisted in `Saved/Ravensight/queue-<hash>.json` (version 2 of
   the delivery contract, 500 events, 89 days) and read back on the next launch.
@@ -22,8 +21,12 @@ error capture branch. The server releases for these contracts ship first; see
   resends once uncompressed. A batch `403` keeps the events and stops sending
   until the next launch (a `403 tracking_disabled` on a batch included). One new
   session after a batch `401`, then the backoff (was two).
-* Error events (`rs_kind` `error`) queue behind gameplay events and are
-  evicted first when the queue is full.
+* The 0.4.0 queue rules for automatic captures hold in the persisted queue:
+  the capture flag is stored with each event, so a restored capture still
+  queues behind gameplay and is evicted first, and a capture is written to
+  the file at once. Captures are stamped in milliseconds like every event.
+* A `400` that is not `batch_too_large` no longer halves the batch (0.4.0
+  split every `400`); `413` still halves.
 * Experiment tags follow the exposure contract: a fetch alone tags nothing;
   the first typed config read in a session queues one `rs_exposure` and tags
   that session's later events. A well formed `rs_exp_<key>` of the game's own
@@ -50,6 +53,36 @@ error capture branch. The server releases for these contracts ship first; see
   key's allowlist refuses it.
 * The Phase 2 delivery release and the Phase 5 `rs_ad_*` and `rs_attr_*` keys
   must be deployed first.
+
+## [0.4.0] - 2026-11-06
+
+- Add automatic error capture, on by default with a new **Error Capture**
+  project setting to opt out. An output device on `GLog` captures `Error`
+  lines (`rs_source` `log`, severity `warning`) and `Fatal` lines
+  (`critical`); `FCoreDelegates::OnEnsureFailed` captures ensures with
+  their stack; `FBlueprintCoreDelegates::OnScriptException` captures
+  Blueprint script exceptions (`uncaught`, `error`). Hooks copy into a lock
+  protected list from any thread; the subsystem drains it on the game
+  thread.
+- Nothing is installed without a key, before consent, or while the game's
+  `errorCapture.enabled` is false. Up to 5 boot errors are held until the
+  settings or session answer and discarded unsent when it says off.
+- Device caps per session: 30 captures, 3 per dedupe key, 10 trails, 6 a
+  minute. Message, stack and trail are scrubbed on the device with the
+  platform's shared fixture, which the specs run case for case.
+- A home folder scrubs as the whole name, spaces included, and
+  `C:\Documents and Settings\<name>` is a home folder (scrub contract 5).
+- Optional trail of the last 20 log lines, attached only when the game's
+  trail switch is on; with it off, Warning and lower lines are dropped
+  before any copy.
+- Cheap when spent: the caps and the bucket are checked before any scrub or
+  dedupe work, the hook list keeps separate quotas for errors and trail
+  lines, and the hooks stop copying errors once the session's captures are
+  spent. Builds without logging (`NO_LOGGING`, the Shipping default) skip the
+  log device and keep the ensure and Blueprint hooks.
+- Gameplay events are queued ahead of error captures, and error captures are
+  dropped first when the queue is full. A `413` on a batch is handled like a
+  `400`.
 
 ## [0.3.1] - Unreleased (held)
 
