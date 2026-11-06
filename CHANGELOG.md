@@ -2,7 +2,7 @@
 
 All notable changes to this plugin are documented here.
 
-## Unreleased
+## [0.4.0] - 2026-11-06
 
 - Add automatic error capture, on by default with a new **Error Capture**
   project setting to opt out. An output device on `GLog` captures `Error`
