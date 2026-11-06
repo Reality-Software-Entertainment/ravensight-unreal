@@ -207,6 +207,7 @@ class TMap
 {
 public:
 	void Add(const K& Key, const V& Value) { Items[Key.Str()] = Value; }
+	void Reset() { Items.clear(); }
 	V FindRef(const K& Key) const
 	{
 		const auto Found = Items.find(Key.Str());
