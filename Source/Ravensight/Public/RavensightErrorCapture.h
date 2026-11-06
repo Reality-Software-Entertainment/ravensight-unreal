@@ -18,7 +18,8 @@
 //   3. an email address becomes [email]
 //   4. /Users/<name>, /home/<name> and C:\Users\<name> become ~
 //   5. IPv4 and IPv6 addresses (with a digit) become [ip]
-//   6. a run of 32 or more base64 or hex characters with a digit becomes [token]
+//   6. a run of 32 or more of [A-Za-z0-9+=_-] with a digit becomes [token]
+//      ('/' is not in the class, so file paths in stacks survive)
 
 #pragma once
 
@@ -53,7 +54,7 @@ enum class ERavensightLineAction : uint8
 /** One automatic capture, before it is scrubbed, cut and checked against the caps. */
 struct RAVENSIGHT_API FRavensightCapturedError
 {
-	/** error or critical. */
+	/** warning (an engine log error or an ensure), error (an uncaught Blueprint exception) or critical (Fatal). */
 	FString Severity;
 	FString Message;
 	FString Stack;
@@ -201,7 +202,7 @@ public:
 	 */
 	bool OnLine(ERavensightLogLevel Level, const FString& Category, const FString& Text, double NowSeconds, FRavensightTypedEvent& Out);
 
-	/** One capture from a hook. Same result as OnLine. */
+	/** One capture from a hook. Same result as OnLine. Error and Fatal lines become warning and critical. */
 	bool OnCapture(const FRavensightCapturedError& Error, double NowSeconds, FRavensightTypedEvent& Out);
 
 	/** A new session or identity: caps, trail and anything held start over. The answer is kept. */

@@ -434,9 +434,10 @@ namespace
 		});
 	}
 
-	bool IsLongRunChar(TCHAR C) { return IsAlnum(C) || Is(C, '+') || Is(C, '/') || Is(C, '_') || Is(C, '-'); }
+	/** [A-Za-z0-9+=_-]: no '/', so a file path in a stack survives. */
+	bool IsLongRunChar(TCHAR C) { return IsAlnum(C) || Is(C, '+') || Is(C, '=') || Is(C, '_') || Is(C, '-'); }
 
-	/** 32 or more base64 or hex characters, up to two = of padding, with a digit. */
+	/** 32 or more characters of [A-Za-z0-9+=_-] with a digit in the run. */
 	FString ScrubLongRuns(const FString& Text)
 	{
 		FString Out;
@@ -452,15 +453,10 @@ namespace
 			const int32 Start = Index;
 			while (Index < Text.Len() && IsLongRunChar(Text[Index])) ++Index;
 			const int32 RunEnd = Index;
-			if (RunEnd - Start >= 32)
+			if (RunEnd - Start >= 32 && HasDigit(Text, Start, RunEnd))
 			{
-				int32 Pad = 0;
-				while (Pad < 2 && Index < Text.Len() && Is(Text[Index], '=')) { ++Index; ++Pad; }
-				if (HasDigit(Text, Start, RunEnd))
-				{
-					Out += TEXT("[token]");
-					continue;
-				}
+				Out += TEXT("[token]");
+				continue;
 			}
 			Out += Slice(Text, Start, Index);
 		}
@@ -846,7 +842,8 @@ bool FRavensightErrorPipeline::OnLine(ERavensightLogLevel Level, const FString& 
 	}
 
 	FRavensightCapturedError Error;
-	Error.Severity = Level == ERavensightLogLevel::Fatal ? TEXT("critical") : TEXT("error");
+	// The contract's engine log error is a warning; Fatal is critical.
+	Error.Severity = Level == ERavensightLogLevel::Fatal ? TEXT("critical") : TEXT("warning");
 	Error.Message = RavensightErrors::OneLine(Text);
 	Error.Source = RavensightErrors::SourceLog;
 	Error.ErrorType = Category;

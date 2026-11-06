@@ -81,6 +81,8 @@ void FRavensightErrorCaptureSpec::Define()
 				"Kick Off button: TypeError: x is undefined",
 				"std::vector<int>::size",
 				"version 1.2.3 build 4",
+				"at /Game/Maps/Level_01/Blueprints/BP_Player_Controller_2026/Ubergraph.uasset:12",
+				"D:/Build/Saved/StagedBuilds/Windows/MyGame_v2/Binaries/Win64/MyGame-Win64-Shipping.exe",
 			};
 			for (const char* Input : Kept)
 			{
@@ -237,7 +239,7 @@ void FRavensightErrorCaptureSpec::Define()
 			TestTrue("error", Pipeline.OnLine(ERavensightLogLevel::Error, TEXT("LogGame"), TEXT("Door 12 failed for bob@example.com"), 1.0, Out));
 			TestTrue("name", Same(Out.Name, TEXT("error")));
 			TestTrue("kind", Same(Text(Out, TEXT("rs_kind")), TEXT("error")));
-			TestTrue("severity", Same(Text(Out, TEXT("rs_severity")), TEXT("error")));
+			TestTrue("engine log error is a warning", Same(Text(Out, TEXT("rs_severity")), TEXT("warning")));
 			TestTrue("source", Same(Text(Out, TEXT("rs_source")), TEXT("log")));
 			TestTrue("type", Same(Text(Out, TEXT("rs_error_type")), TEXT("LogGame")));
 			TestTrue("scrubbed", Same(Text(Out, TEXT("rs_message")), TEXT("Door 12 failed for [email]")));
