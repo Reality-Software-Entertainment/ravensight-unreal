@@ -2,6 +2,28 @@
 
 All notable changes to this plugin are documented here.
 
+## Unreleased
+
+- Add automatic error capture, on by default with a new **Error Capture**
+  project setting to opt out. An output device on `GLog` captures `Error`
+  lines (`rs_source` `log`, severity `warning`) and `Fatal` lines
+  (`critical`); `FCoreDelegates::OnEnsureFailed` captures ensures with
+  their stack; `FBlueprintCoreDelegates::OnScriptException` captures
+  Blueprint script exceptions (`uncaught`, `error`). Hooks copy into a lock
+  protected list from any thread; the subsystem drains it on the game
+  thread.
+- Nothing is installed without a key, before consent, or while the game's
+  `errorCapture.enabled` is false. Up to 5 boot errors are held until the
+  settings or session answer and discarded unsent when it says off.
+- Device caps per session: 30 captures, 3 per dedupe key, 10 trails, 6 a
+  minute. Message, stack and trail are scrubbed on the device with the
+  platform's shared fixture, which the specs run case for case.
+- Optional trail of the last 20 log lines, attached only when the game's
+  trail switch is on.
+- Gameplay events are queued ahead of error captures, and error captures are
+  dropped first when the queue is full. A `413` on a batch is handled like a
+  `400`.
+
 ## [0.3.1] - Unreleased (held)
 
 - Add Blueprint prepared Player Reports, bounded encoded images, stable session-bound retries, explicit status/cancel and local handle cleanup.

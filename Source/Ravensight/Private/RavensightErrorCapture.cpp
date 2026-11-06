@@ -675,6 +675,13 @@ namespace RavensightErrors
 		return Text.Len() <= Count ? Text : Text.Left(Count);
 	}
 
+	FString ScrubField(const FString& Text, int32 Limit)
+	{
+		// Some scrub rules are quadratic on hostile input, so the text is cut
+		// to four times the field's limit first, then to the limit.
+		return Cut(Scrub(Cut(Text, Limit * 4)), Limit);
+	}
+
 	FString OneLine(const FString& Text)
 	{
 		FString Out;
@@ -733,15 +740,15 @@ namespace RavensightErrors
 		Event.Name = EventName;
 		Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_kind"), TEXT("error")));
 		Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_severity"), Error.Severity.IsEmpty() ? FString(TEXT("error")) : Error.Severity));
-		Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_message"), Cut(Scrub(Error.Message), MessageChars)));
+		Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_message"), ScrubField(Error.Message, MessageChars)));
 		Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_source"), Error.Source));
 
-		const FString Stack = Cut(Scrub(Error.Stack), StackChars);
+		const FString Stack = ScrubField(Error.Stack, StackChars);
 		if (!Stack.IsEmpty())
 		{
 			Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_stack"), Stack));
 		}
-		const FString Type = Cut(Scrub(Error.ErrorType), TypeChars);
+		const FString Type = ScrubField(Error.ErrorType, TypeChars);
 		if (!Type.IsEmpty())
 		{
 			Event.Props.Add(FRavensightProp::MakeString(TEXT("rs_error_type"), Type));
@@ -760,7 +767,7 @@ void FRavensightTrailRing::Add(double MsSinceStart, ERavensightLogLevel Level, c
 {
 	const int64 Ms = MsSinceStart > 0.0 ? static_cast<int64>(MsSinceStart) : 0;
 	const FString Line = FString::Printf(TEXT("+%lld "), static_cast<long long>(Ms))
-		+ RavensightErrors::LevelWord(Level) + TEXT(" ") + RavensightErrors::Scrub(RavensightErrors::OneLine(Text));
+		+ RavensightErrors::LevelWord(Level) + TEXT(" ") + RavensightErrors::ScrubField(RavensightErrors::OneLine(RavensightErrors::Cut(Text, RavensightErrors::TrailLineChars * 4)), RavensightErrors::TrailLineChars);
 	Lines.Add(RavensightErrors::Cut(Line, RavensightErrors::TrailLineChars));
 	while (Lines.Num() > RavensightErrors::TrailLines)
 	{
@@ -862,9 +869,9 @@ void FRavensightErrorPipeline::Start(double NowSeconds)
 
 FString FRavensightErrorPipeline::DedupeKey(const FRavensightCapturedError& Error)
 {
-	const FString Message = RavensightErrors::Cut(RavensightErrors::Scrub(Error.Message), RavensightErrors::MessageChars);
-	const FString Stack = RavensightErrors::Scrub(Error.Stack);
-	return Error.ErrorType + TEXT("|") + RavensightErrors::Template(Message) + TEXT("|") + RavensightErrors::FirstFrame(Stack);
+	const FString Message = RavensightErrors::ScrubField(Error.Message, RavensightErrors::MessageChars);
+	const FString Stack = RavensightErrors::ScrubField(Error.Stack, RavensightErrors::StackChars);
+	return RavensightErrors::ScrubField(Error.ErrorType, RavensightErrors::TypeChars) + TEXT("|") + RavensightErrors::Template(Message) + TEXT("|") + RavensightErrors::FirstFrame(Stack);
 }
 
 TArray<FRavensightTypedEvent> FRavensightErrorPipeline::Answer(bool bEnabled, bool bTrail)

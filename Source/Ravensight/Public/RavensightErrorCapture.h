@@ -107,6 +107,9 @@ namespace RavensightErrors
 	/** The first Count characters. */
 	RAVENSIGHT_API FString Cut(const FString& Text, int32 Count);
 
+	/** Cut to four times Limit, scrubbed, then cut to Limit: the scrub never sees unbounded input. */
+	RAVENSIGHT_API FString ScrubField(const FString& Text, int32 Limit);
+
 	/** Carriage returns, new lines and tabs become single spaces. */
 	RAVENSIGHT_API FString OneLine(const FString& Text);
 

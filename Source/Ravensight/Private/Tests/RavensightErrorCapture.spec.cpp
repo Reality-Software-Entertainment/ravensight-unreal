@@ -114,6 +114,28 @@ void FRavensightErrorCaptureSpec::Define()
 			}
 		});
 
+		It("bounds hostile input: a 200,000 character field is cut before the scrub", [this]()
+		{
+			FString Hostile;
+			for (int32 Index = 0; Index < 40000; ++Index)
+			{
+				Hostile += TEXT("a.b@");
+				Hostile.AppendChar(TCHAR('x'));
+			}
+			FRavensightCapturedError Error;
+			Error.Message = Hostile;
+			Error.Stack = Hostile;
+			Error.ErrorType = Hostile;
+			Error.Source = RavensightErrors::SourceLog;
+			const FRavensightTypedEvent Event = RavensightErrors::BuildEvent(Error, FString());
+			TestTrue("message bounded", Event.Find(TEXT("rs_message"))->Text.Len() <= RavensightErrors::MessageChars);
+			TestTrue("stack bounded", Event.Find(TEXT("rs_stack"))->Text.Len() <= RavensightErrors::StackChars);
+			FRavensightTrailRing Ring;
+			Ring.Add(0.0, ERavensightLogLevel::Warning, Hostile);
+			TestTrue("trail line bounded", Ring.Join().Len() <= RavensightErrors::TrailLineChars);
+			TestTrue("dedupe key bounded", FRavensightErrorPipeline::DedupeKey(Error).Len() < 3 * RavensightErrors::StackChars + 1000);
+		});
+
 		It("is idempotent", [this]()
 		{
 			const FString Once = RavensightErrors::Scrub(TEXT("bob@x.io at https://h.io/a?b=1 from 10.0.0.1 gt_pub_abc Bearer t"));

@@ -31,6 +31,7 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
+#include "RavensightLogCapture.h"
 #include "RavensightSettings.h"
 #include "RavensightTransport.h"
 #include "Serialization/JsonReader.h"
@@ -93,6 +94,7 @@ void URavensightSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	bTrackPauseEvents = Settings->bTrackPauseEvents;
 	bVerboseLogging = Settings->bVerboseLogging;
 	bPerformance = Settings->bPerformance;
+	bErrorCapture = Settings->bErrorCapture;
 
 	Queue.SetMaxQueueSize(Settings->MaxQueueSize);
 	Queue.SetEnabled(Settings->bEnabled);
@@ -145,6 +147,8 @@ void URavensightSubsystem::Deinitialize()
 	// rule makes a second trigger a no-op.
 	if (bCanSend)
 	{
+		// The last lines seen before quit go out with the final flush.
+		DrainErrors();
 		SendHealthOnce();
 	}
 
@@ -164,6 +168,7 @@ void URavensightSubsystem::Deinitialize()
 
 	StopTimers();
 	StopHealthSampling();
+	StopErrorCapture(true);
 	UnbindApplicationDelegates();
 	EndBackgroundTask();
 
@@ -307,6 +312,11 @@ void URavensightSubsystem::StartIfAllowed()
 
 	SetStatusReason(bKeyRefused ? FString(RavensightReason::InvalidKey) : FString());
 
+	// With a key and consent the hooks go in now, so an error during boot is
+	// held (at most five) until the settings or session answer says whether
+	// the game wants them.
+	StartErrorCapture();
+
 	if (!bMarkerChecked)
 	{
 		bMarkerChecked = true;
@@ -382,6 +392,7 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 	if (!bEnabled)
 	{
 		Log(TEXT("tracking opted out, queue discarded"));
+		StopErrorCapture(true);
 		BumpQueueGeneration();
 		StopTimers();
 		bStarted = false;
@@ -457,6 +468,7 @@ void URavensightSubsystem::SetEnabled(bool bInEnabled)
 	if (!bInEnabled)
 	{
 		Log(TEXT("disabled by the game, queue discarded"));
+		StopErrorCapture(true);
 		BumpQueueGeneration();
 		StopTimers();
 		bStarted = false;
@@ -489,6 +501,7 @@ FString URavensightSubsystem::ResetDeviceId()
 		BumpQueueGeneration();
 		Queue.Clear();
 		Queue.InvalidateSession();
+		ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
 		Log(TEXT("device id forgotten; a new one is made on the next yes"));
 		return DeviceId;
 	}
@@ -500,6 +513,7 @@ FString URavensightSubsystem::ResetDeviceId()
 	BumpQueueGeneration();
 	Queue.Clear();
 	Queue.InvalidateSession();
+	ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
 
 	Log(TEXT("device id reset, queue discarded, next event opens a new session"));
 	return DeviceId;
@@ -577,6 +591,7 @@ void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Sour
 	}
 
 	bStoppedForRun = true;
+	StopErrorCapture(true);
 	BumpQueueGeneration();
 	Queue.SetServerTrackingEnabled(false);
 	StopTimers();
@@ -669,6 +684,11 @@ namespace
 
 void URavensightSubsystem::SendTyped(const FRavensightTypedEvent& Event)
 {
+	TrackEventJson(Event.Name, TypedJson(Event));
+}
+
+FString URavensightSubsystem::TypedJson(const FRavensightTypedEvent& Event)
+{
 	// A whole number is written without a fraction, so 499 stays 499.
 	const TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	for (const FRavensightProp& Prop : Event.Props)
@@ -683,7 +703,7 @@ void URavensightSubsystem::SendTyped(const FRavensightTypedEvent& Event)
 		}
 	}
 
-	TrackEventJson(Event.Name, WriteJson(Payload));
+	return WriteJson(Payload);
 }
 
 void URavensightSubsystem::TrackPurchase(int64 AmountMinor, const FString& Currency, const FString& ItemType, const FString& ItemId,
@@ -716,6 +736,152 @@ void URavensightSubsystem::TrackError(const FString& Severity, const FString& Me
 	const TMap<FString, FString>& Extra, const FString& EventName)
 {
 	SendTyped(RavensightTyped::BuildError(Severity, Message, Stack, ExtraProps(Extra), EventName));
+}
+
+// --- Automatic error capture ------------------------------------------------
+
+bool URavensightSubsystem::IsErrorCaptureActive() const
+{
+	return LogCapture.IsValid() && LogCapture->IsInstalled();
+}
+
+void URavensightSubsystem::StartErrorCapture()
+{
+	if (!bErrorCapture || !bInitialized || bNoKey || bStoppedForRun || bShuttingDown
+		|| ErrorPipeline.GetAnswer() == ERavensightCaptureAnswer::Off || !CurrentGate().bAllowEnqueue)
+	{
+		return;
+	}
+
+	if (!bErrorPipelineStarted)
+	{
+		bErrorPipelineStarted = true;
+		ErrorPipeline.Start(FPlatformTime::Seconds());
+	}
+
+	if (!LogCapture.IsValid())
+	{
+		LogCapture = MakeShared<FRavensightLogCapture>(FGenericPlatformHttp::GetUrlDomain(ApiUrl));
+	}
+	LogCapture->SetKeepInfoLines(ErrorPipeline.IsTrailOn());
+	LogCapture->Install();
+
+	if (!ErrorTickerHandle.IsValid())
+	{
+		// Drained on the game thread a few times a second; the hooks only copy.
+		ErrorTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateUObject(this, &URavensightSubsystem::OnErrorTick), 0.25f);
+	}
+}
+
+void URavensightSubsystem::StopErrorCapture(bool bForget)
+{
+	if (ErrorTickerHandle.IsValid())
+	{
+		FTSTicker::GetCoreTicker().RemoveTicker(ErrorTickerHandle);
+		ErrorTickerHandle.Reset();
+	}
+
+	if (LogCapture.IsValid())
+	{
+		LogCapture->Uninstall();
+		if (bForget)
+		{
+			TArray<FRavensightRawCapture> Discarded;
+			LogCapture->Drain(Discarded);
+		}
+	}
+
+	if (bForget)
+	{
+		ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
+	}
+}
+
+void URavensightSubsystem::ApplyErrorCaptureAnswer(const TSharedPtr<FJsonObject>& Answer)
+{
+	// Absent means on; the trail is off unless the game turned it on.
+	bool bOn = true;
+	bool bTrail = false;
+	const TSharedPtr<FJsonObject>* Capture = nullptr;
+	if (Answer.IsValid() && Answer->TryGetObjectField(TEXT("errorCapture"), Capture) && Capture && Capture->IsValid())
+	{
+		(*Capture)->TryGetBoolField(TEXT("enabled"), bOn);
+		(*Capture)->TryGetBoolField(TEXT("trail"), bTrail);
+	}
+	else if (ErrorPipeline.GetAnswer() != ERavensightCaptureAnswer::Unknown)
+	{
+		// An answer without the switches (the session after the settings
+		// check) keeps what the last answer said.
+		return;
+	}
+
+	// Whatever the hooks saw before the answer is judged under it.
+	if (LogCapture.IsValid() && bOn)
+	{
+		DrainErrors();
+	}
+
+	const TArray<FRavensightTypedEvent> Ready = ErrorPipeline.Answer(bOn, bTrail);
+	if (!bOn)
+	{
+		Log(TEXT("error capture is off for this game"));
+		StopErrorCapture(false);
+		if (LogCapture.IsValid())
+		{
+			TArray<FRavensightRawCapture> Discarded;
+			LogCapture->Drain(Discarded);
+		}
+		return;
+	}
+
+	for (const FRavensightTypedEvent& Event : Ready)
+	{
+		EnqueueEvent(Event.Name, TypedJson(Event), false, true);
+	}
+
+	if (LogCapture.IsValid())
+	{
+		LogCapture->SetKeepInfoLines(ErrorPipeline.IsTrailOn());
+	}
+	StartErrorCapture();
+}
+
+void URavensightSubsystem::DrainErrors()
+{
+	if (!LogCapture.IsValid())
+	{
+		return;
+	}
+
+	TArray<FRavensightRawCapture> Records;
+	LogCapture->Drain(Records);
+	if (Records.Num() == 0 || !Queue.IsActive() || bStoppedForRun)
+	{
+		return;
+	}
+
+	for (const FRavensightRawCapture& Record : Records)
+	{
+		FRavensightTypedEvent Event;
+		const bool bReady = Record.bLine
+			? ErrorPipeline.OnLine(Record.Level, Record.Category, Record.Text, Record.AtSeconds, Event)
+			: ErrorPipeline.OnCapture(Record.Error, Record.AtSeconds, Event);
+		if (bReady)
+		{
+			EnqueueEvent(Event.Name, TypedJson(Event), false, true);
+		}
+	}
+}
+
+bool URavensightSubsystem::OnErrorTick(float /*DeltaTime*/)
+{
+	if (bShuttingDown)
+	{
+		return false;
+	}
+	DrainErrors();
+	return true;
 }
 
 // --- Health sampling --------------------------------------------------------
@@ -781,7 +947,7 @@ void URavensightSubsystem::SendHealthOnce()
 		Summary.FpsMedian, Summary.FpsP10, MemoryMb > 0.0, MemoryMb, BootMs > 0.0, BootMs));
 }
 
-void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront)
+void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront, bool bError)
 {
 	if (EventName.IsEmpty())
 	{
@@ -841,6 +1007,12 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 	const FTCHARToUTF8 Utf8Data(*DataJson);
 	if (Utf8Data.Length() > RavensightProtocol::MaxEventBytes)
 	{
+		if (bError)
+		{
+			// An automatic capture is dropped silently: no log line, which
+			// would only be captured again.
+			return;
+		}
 		if (!bTooLargeLogged)
 		{
 			bTooLargeLogged = true;
@@ -853,7 +1025,7 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 	}
 
 	const int64 Timestamp = FDateTime::UtcNow().ToUnixTimestamp();
-	const FRavensightEvent Event(EventName, DataJson, Timestamp);
+	const FRavensightEvent Event(EventName, DataJson, Timestamp, bError);
 	const int32 Dropped = bAtFront ? Queue.EnqueueAtFront(Event) : Queue.Enqueue(Event);
 	if (Dropped > 0)
 	{
@@ -872,6 +1044,9 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 
 void URavensightSubsystem::Flush()
 {
+	// What the error hooks have seen so far goes out with it.
+	DrainErrors();
+
 	// An explicit Flush is the one way to make another attempt after the
 	// ingest key was refused.
 	FlushInternal(true, true);
@@ -1122,6 +1297,7 @@ void URavensightSubsystem::HandleSettingsResponse(FHttpRequestPtr Request, FHttp
 			StopForRun(RavensightReason::TrackingDisabled, TEXT("server"));
 			return;
 		}
+		ApplyErrorCaptureAnswer(Parsed);
 		break;
 	}
 
@@ -1279,6 +1455,7 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 				Queue.ResetBackoff();
 			}
 			SetStatusReason(FString());
+			ApplyErrorCaptureAnswer(Parsed);
 
 			Log(TEXT("session ready"));
 			OnSessionReady.Broadcast();
@@ -1730,6 +1907,7 @@ void URavensightSubsystem::OnApplicationEnteredForeground()
 			Queue.InvalidateSession();
 			Lifecycle.ResetForNewSession();
 			HealthSampler.ResetForNewSession();
+			ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
 			QueueGameStartedOnce();
 			return;
 		}

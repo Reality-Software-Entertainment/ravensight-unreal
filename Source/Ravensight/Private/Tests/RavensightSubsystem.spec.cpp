@@ -34,6 +34,7 @@
 #include "RavensightSpecListener.h"
 #include "RavensightSubsystem.h"
 #include "RavensightTransport.h"
+#include "RavensightLogCapture.h"
 
 namespace
 {
@@ -129,6 +130,52 @@ namespace
 		return Ids;
 	}
 
+	/** The data of every event in a batch request with this name, in order. */
+	TArray<TSharedPtr<FJsonObject>> EventDataNamed(const FHttpRequestPtr& Request, const FString& Name)
+	{
+		TArray<TSharedPtr<FJsonObject>> Found;
+		const TSharedPtr<FJsonObject> Body = JsonOf(Request);
+		const TArray<TSharedPtr<FJsonValue>>* Events = nullptr;
+		if (Body.IsValid() && Body->TryGetArrayField(TEXT("events"), Events) && Events)
+		{
+			for (const TSharedPtr<FJsonValue>& Event : *Events)
+			{
+				if (Event->AsObject()->GetStringField(TEXT("event")) == Name)
+				{
+					Found.Add(Event->AsObject()->GetObjectField(TEXT("data")));
+				}
+			}
+		}
+		return Found;
+	}
+
+	/** Every batch request among Requests, in order. */
+	TArray<FHttpRequestPtr> Batches(const TArray<FHttpRequestPtr>& All)
+	{
+		TArray<FHttpRequestPtr> Found;
+		for (const FHttpRequestPtr& Request : All)
+		{
+			if (Request->GetURL().EndsWith(TEXT("/track/batch")))
+			{
+				Found.Add(Request);
+			}
+		}
+		return Found;
+	}
+
+	/** The last batch request among Requests, or null. */
+	FHttpRequestPtr LastBatch(const TArray<FHttpRequestPtr>& All)
+	{
+		for (int32 Index = All.Num() - 1; Index >= 0; --Index)
+		{
+			if (All[Index]->GetURL().EndsWith(TEXT("/track/batch")))
+			{
+				return All[Index];
+			}
+		}
+		return nullptr;
+	}
+
 	/** ^[A-Za-z0-9_-]{1,64}$ */
 	bool IsEventIdShape(const FString& Id)
 	{
@@ -177,6 +224,7 @@ BEGIN_DEFINE_SPEC(
 	FString SavedDistribution;
 	bool bSavedOptional = false;
 	ERavensightConsent SavedConsent = ERavensightConsent::OptOut;
+	bool bSavedErrorCapture = true;
 
 	/** The saved [Ravensight] keys, put back in AfterEach. */
 	bool bHadTrackingEnabled = false;
@@ -202,6 +250,9 @@ BEGIN_DEFINE_SPEC(
 	void Listen(URavensightSubsystem* Subsystem);
 
 	FString SavedDeviceIdNow() const;
+
+	/** Accepts every batch sent so far, flushes, accepts again, and returns the data of every "error" event sent. */
+	TArray<TSharedPtr<FJsonObject>> FlushErrors(URavensightSubsystem* Subsystem);
 
 END_DEFINE_SPEC(FRavensightSubsystemSpec)
 
@@ -260,6 +311,27 @@ URavensightSubsystem* FRavensightSubsystemSpec::StartReady()
 	return Subsystem;
 }
 
+TArray<TSharedPtr<FJsonObject>> FRavensightSubsystemSpec::FlushErrors(URavensightSubsystem* Subsystem)
+{
+	TArray<TSharedPtr<FJsonObject>> Errors;
+	TSet<IHttpRequest*> Seen;
+	for (int32 Round = 0; Round < 3; ++Round)
+	{
+		for (const FHttpRequestPtr& Batch : Batches(Requests))
+		{
+			if (Seen.Contains(Batch.Get()))
+			{
+				continue;
+			}
+			Seen.Add(Batch.Get());
+			Errors.Append(EventDataNamed(Batch, TEXT("error")));
+			Answer(Batch, 202, TEXT("{\"accepted\":1}"));
+		}
+		Subsystem->Flush();
+	}
+	return Errors;
+}
+
 FString FRavensightSubsystemSpec::SavedDeviceIdNow() const
 {
 	FString Value;
@@ -291,6 +363,7 @@ void FRavensightSubsystemSpec::Define()
 		SavedDistribution = Settings->Distribution;
 		bSavedOptional = Settings->bOptional;
 		SavedConsent = Settings->Consent;
+		bSavedErrorCapture = Settings->bErrorCapture;
 		Settings->bAutoInitialize = false;
 		Settings->bEnabled = true;
 		Settings->bTrackLifecycleEvents = true;
@@ -298,6 +371,10 @@ void FRavensightSubsystemSpec::Define()
 		Settings->Distribution = FString();
 		Settings->bOptional = false;
 		Settings->Consent = ERavensightConsent::OptOut;
+
+		// The older cases count requests and events exactly; the error
+		// capture cases turn it back on themselves.
+		Settings->bErrorCapture = false;
 
 		bHadTrackingEnabled = GConfig->GetBool(SaveSection, TrackingEnabledKey, bSavedTrackingEnabled, GGameUserSettingsIni);
 		bHadDeviceId = GConfig->GetString(SaveSection, DeviceIdKey, SavedDeviceId, GGameUserSettingsIni);
@@ -332,6 +409,7 @@ void FRavensightSubsystemSpec::Define()
 		Settings->Distribution = SavedDistribution;
 		Settings->bOptional = bSavedOptional;
 		Settings->Consent = SavedConsent;
+		Settings->bErrorCapture = bSavedErrorCapture;
 
 		if (bHadOptIn)
 		{
@@ -1005,6 +1083,162 @@ void FRavensightSubsystemSpec::Define()
             TestEqual(TEXT("no request"),Requests.Num(),Before);
         });
     });
+
+
+	Describe("automatic error capture", [this]()
+	{
+		BeforeEach([this]()
+		{
+			GetMutableDefault<URavensightSettings>()->bErrorCapture = true;
+		});
+
+		// Lines go straight to GLog, as any engine or game line does once it
+		// leaves GWarn. A UE_LOG Error or Warning passes the test framework's
+		// filter first, which turns an expected message into a Verbose one
+		// before GLog sees it, so the hook would never see it in a test.
+
+		It("installs with a key and consent before the answer, holds a boot error and sends it behind gameplay once capture is on", [this]()
+		{
+			AddExpectedMessagePlain(TEXT("Boot door 7"), EAutomationExpectedMessageFlags::Contains, 0);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			TestTrue(TEXT("installed before the answer"), Subsystem->IsErrorCaptureActive());
+
+			GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Error, TEXT("Boot door 7 failed for bob@example.com"));
+			Subsystem->TrackEvent(TEXT("level_completed"), TMap<FString, FString>());
+
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true,\"errorCapture\":{\"enabled\":true,\"trail\":false}}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+
+			const FHttpRequestPtr Batch = LastBatch(Requests);
+			if (!TestTrue(TEXT("a batch went out"), Batch.IsValid())) return;
+			const TArray<FString> Names = EventNamesOf(Batch);
+			AddInfo(FString::Join(Names, TEXT(",")));
+			TestTrue(TEXT("gameplay first"), Names.Num() == 3 && Names[0] == TEXT("game_started") && Names[1] == TEXT("level_completed") && Names[2] == TEXT("error"));
+
+			const TArray<TSharedPtr<FJsonObject>> Errors = EventDataNamed(Batch, TEXT("error"));
+			if (!TestEqual(TEXT("one error"), Errors.Num(), 1)) return;
+			TestEqual(TEXT("kind"), Errors[0]->GetStringField(TEXT("rs_kind")), FString(TEXT("error")));
+			TestEqual(TEXT("source"), Errors[0]->GetStringField(TEXT("rs_source")), FString(TEXT("log")));
+			TestEqual(TEXT("severity"), Errors[0]->GetStringField(TEXT("rs_severity")), FString(TEXT("warning")));
+			TestEqual(TEXT("type"), Errors[0]->GetStringField(TEXT("rs_error_type")), FString(TEXT("LogTemp")));
+			TestEqual(TEXT("scrubbed"), Errors[0]->GetStringField(TEXT("rs_message")), FString(TEXT("Boot door 7 failed for [email]")));
+			TestFalse(TEXT("no trail with the switch off"), Errors[0]->HasField(TEXT("rs_trail")));
+			TestFalse(TEXT("no fingerprint from the device"), Errors[0]->HasField(TEXT("rs_fp")));
+		});
+
+		It("discards held errors unsent and uninstalls when the game's switch is off", [this]()
+		{
+			AddExpectedMessagePlain(TEXT("held then discarded"), EAutomationExpectedMessageFlags::Contains, 0);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Error, TEXT("held then discarded"));
+
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true,\"errorCapture\":{\"enabled\":false,\"trail\":true}}"));
+			TestFalse(TEXT("uninstalled"), Subsystem->IsErrorCaptureActive());
+
+			GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Error, TEXT("held then discarded"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600,\"errorCapture\":{\"enabled\":false,\"trail\":false}}"));
+			TestEqual(TEXT("no error sent"), FlushErrors(Subsystem).Num(), 0);
+			TestFalse(TEXT("still uninstalled"), Subsystem->IsErrorCaptureActive());
+		});
+
+		It("installs nothing without a key, before an Opt In yes, or with the setting off", [this]()
+		{
+			URavensightSubsystem* NoKey = StartInstance();
+			NoKey->Init(FString());
+			TestFalse(TEXT("no key"), NoKey->IsErrorCaptureActive());
+
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			URavensightSubsystem* NoConsent = StartInstance();
+			NoConsent->Init(SpecKey);
+			TestFalse(TEXT("no consent"), NoConsent->IsErrorCaptureActive());
+			TestEqual(TEXT("no request before consent"), Requests.Num(), 0);
+			NoConsent->SetTrackingEnabled(true);
+			TestTrue(TEXT("after the yes"), NoConsent->IsErrorCaptureActive());
+			NoConsent->SetTrackingEnabled(false);
+			TestFalse(TEXT("opt out uninstalls"), NoConsent->IsErrorCaptureActive());
+
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptOut;
+			GetMutableDefault<URavensightSettings>()->bErrorCapture = false;
+			URavensightSubsystem* SettingOff = StartInstance();
+			SettingOff->Init(SpecKey);
+			TestFalse(TEXT("setting off"), SettingOff->IsErrorCaptureActive());
+		});
+
+		It("never captures its own log lines, and keeps the trail only when the switch is on", [this]()
+		{
+			AddExpectedMessagePlain(TEXT("own line"), EAutomationExpectedMessageFlags::Contains, 0);
+			AddExpectedMessagePlain(TEXT("the real failure"), EAutomationExpectedMessageFlags::Contains, 0);
+			AddExpectedMessagePlain(TEXT("low ammo"), EAutomationExpectedMessageFlags::Contains, 0);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true,\"errorCapture\":{\"enabled\":true,\"trail\":true}}"));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+
+			GLog->Log(LogRavensight.GetCategoryName(), ELogVerbosity::Error, TEXT("own line"));
+			GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Warning, TEXT("low ammo"));
+			GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Error, TEXT("the real failure"));
+
+			const TArray<TSharedPtr<FJsonObject>> Errors = FlushErrors(Subsystem);
+			if (!TestEqual(TEXT("one error, not its own"), Errors.Num(), 1)) return;
+			TestEqual(TEXT("message"), Errors[0]->GetStringField(TEXT("rs_message")), FString(TEXT("the real failure")));
+			FString Trail;
+			TestTrue(TEXT("trail present"), Errors[0]->TryGetStringField(TEXT("rs_trail"), Trail));
+			TestTrue(TEXT("trail holds the warning"), Trail.Contains(TEXT("warning LogTemp: low ammo")));
+			TestFalse(TEXT("trail never holds its own line"), Trail.Contains(TEXT("own line")));
+		});
+
+		It("stays inside the device caps in an error storm", [this]()
+		{
+			AddExpectedMessagePlain(TEXT("storm "), EAutomationExpectedMessageFlags::Contains, 0);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+
+			for (int32 Index = 0; Index < 200; ++Index)
+			{
+				GLog->Log(LogTemp.GetCategoryName(), ELogVerbosity::Error, FString::Printf(TEXT("storm %d"), Index));
+			}
+			TestTrue(TEXT("at most 3 of one error"), FlushErrors(Subsystem).Num() <= RavensightErrors::MaxPerKey);
+		});
+
+		It("reports an ensure once, with its stack", [this]()
+		{
+			// An ensure writes a block of error lines the test framework would count as failures.
+			AddExpectedMessage(TEXT(".*"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 0);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_spec\",\"expiresIn\":3600}"));
+
+			const bool bHeld = false;
+			ensureMsgf(bHeld, TEXT("spec ensure"));
+
+			int32 Ensures = 0;
+			const TArray<TSharedPtr<FJsonObject>> Errors = FlushErrors(Subsystem);
+			for (const TSharedPtr<FJsonObject>& Error : Errors)
+			{
+				AddInfo(Error->GetStringField(TEXT("rs_error_type")) + TEXT(": ") + Error->GetStringField(TEXT("rs_message")));
+				if (Error->GetStringField(TEXT("rs_error_type")) == TEXT("Ensure"))
+				{
+					++Ensures;
+					TestTrue(TEXT("message"), Error->GetStringField(TEXT("rs_message")).Contains(TEXT("spec ensure")));
+					if (FRavensightLogCapture::HasEnsureHook())
+					{
+						TestTrue(TEXT("stack"), Error->HasField(TEXT("rs_stack")));
+					}
+				}
+			}
+			TestEqual(TEXT("one ensure event"), Ensures, 1);
+			TestEqual(TEXT("nothing else from the ensure block"), Errors.Num(), 1);
+		});
+	});
 
 }
 

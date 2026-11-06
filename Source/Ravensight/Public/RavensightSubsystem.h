@@ -6,6 +6,7 @@
 #include "Containers/Ticker.h"
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpRequest.h"
+#include "RavensightErrorCapture.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
 #include "RavensightSettings.h"
@@ -14,6 +15,7 @@
 #include "RavensightSubsystem.generated.h"
 
 class FJsonObject;
+class FRavensightLogCapture;
 class FJsonValue;
 class UWorld;
 
@@ -251,6 +253,16 @@ public:
 	void TrackError(const FString& Severity, const FString& Message, const FString& Stack,
 		const TMap<FString, FString>& Extra, const FString& EventName);
 
+	/**
+	 * True while automatic error capture is installed: a key, the player's
+	 * consent, the Error Capture setting, and the game's switch not off.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Typed Events")
+	bool IsErrorCaptureActive() const;
+
+	/** The engine-free capture state, for tests and debug overlays. */
+	const FRavensightErrorPipeline& GetErrorPipeline() const { return ErrorPipeline; }
+
 	/** Sends queued events now, ignoring the retry window. */
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	void Flush();
@@ -428,8 +440,30 @@ private:
 	/** Sends the one health event of this session, if sampling is on and any sample exists. */
 	void SendHealthOnce();
 
-	/** Validates, tags and queues one event. TrackEventJson and the lifecycle events share it. */
-	void EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront);
+	/**
+	 * Validates, tags and queues one event. TrackEventJson and the lifecycle
+	 * events share it. bError marks an automatic capture: queued behind
+	 * gameplay and dropped silently when too large.
+	 */
+	void EnqueueEvent(const FString& EventName, const FString& JsonData, bool bAtFront, bool bError = false);
+
+	/** A typed event's properties as a JSON object literal. */
+	static FString TypedJson(const FRavensightTypedEvent& Event);
+
+	// --- Automatic error capture ------------------------------------------
+
+	/** Installs the log device and hooks when the gate, the setting and the game's switch allow. */
+	void StartErrorCapture();
+
+	/** Uninstalls them. bForget also drops anything held and the trail. */
+	void StopErrorCapture(bool bForget);
+
+	/** Reads errorCapture { enabled, trail } from a settings or session answer. Absent means on. */
+	void ApplyErrorCaptureAnswer(const TSharedPtr<FJsonObject>& Answer);
+
+	/** Moves what the hooks saw through the caps into the queue. Game thread. */
+	void DrainErrors();
+	bool OnErrorTick(float DeltaTime);
 
 	/** The pure start gate (RavensightProtocol::DecideGate) over the current state. */
 	FRavensightGate CurrentGate(bool bExplicitAttempt = false) const;
@@ -600,6 +634,13 @@ private:
 	bool bPerformance = false;
 	FRavensightHealthSampler HealthSampler;
 	FTSTicker::FDelegateHandle HealthTickerHandle;
+
+	/** The Error Capture project setting. */
+	bool bErrorCapture = true;
+	FRavensightErrorPipeline ErrorPipeline;
+	bool bErrorPipelineStarted = false;
+	TSharedPtr<FRavensightLogCapture> LogCapture;
+	FTSTicker::FDelegateHandle ErrorTickerHandle;
 
 	/** Milliseconds from process start to Init, or 0 when unknown. */
 	double BootMs = 0.0;
