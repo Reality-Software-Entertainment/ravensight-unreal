@@ -44,6 +44,11 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
 
 ## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
+- After the backup and temporary file hardening (exclusion before the move,
+  checked with one retry, temporary file removed on failure and on every delete,
+  folder and older files excluded at load): host check **150 cases passed**; full
+  `Ravensight` automation run **193 passed** (180 clean, 13 with expected warnings),
+  0 failed. The iOS exclusion itself is still compiled only by an iOS build.
 - After the iOS do-not-backup attribute on the queue file: host check **145
   cases passed**; full `Ravensight` automation run **188 passed** (174 clean, 14
   with expected warnings), 0 failed. The new `Private/IOS/RavensightIOSBackupExclusion.mm`

@@ -9,6 +9,7 @@
 #include "RavensightErrorCapture.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
+#include "RavensightQueueFile.h"
 #include "RavensightSettings.h"
 #include "RavensightTypedEvents.h"
 #include "Subsystems/GameInstanceSubsystem.h"
@@ -532,6 +533,9 @@ private:
 
 	// --- Persisted queue, origin and signing (DELIVERY_CONTRACT.md) ----------
 	FString QueueFilePath() const;
+	RavensightQueueFile::FOps QueueFileOps() const;
+	/** Deletes the queue file and any temporary file a write left behind. */
+	void DeleteQueueFiles() const;
 	bool QueueFileAllowed() const;
 	void LoadPersistedQueue();
 	void PersistQueueSoon();
@@ -670,6 +674,8 @@ private:
 	/** The persisted queue was read back this run; a change is waiting to be written. */
 	bool bQueueLoaded = false;
 	bool bQueueDirty = false;
+	/** One backup exclusion warning a run. */
+	mutable bool bBackupWarned = false;
 	double LastQueueWriteSeconds = 0.0;
 
 	/** The next batch goes out uncompressed once, after a 415. */

@@ -32,6 +32,7 @@
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
 #include "RavensightBackupExclusion.h"
+#include "RavensightQueueFile.h"
 #include "RavensightDelivery.h"
 #include "Misc/Compression.h"
 #include "RHI.h"
@@ -418,7 +419,7 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 	if (!bEnabled)
 	{
 		Log(TEXT("tracking opted out, queue discarded"));
-		IFileManager::Get().Delete(*QueueFilePath(), false, true, true);
+		DeleteQueueFiles();
 		StopErrorCapture(true);
 		BumpQueueGeneration();
 		StopTimers();
@@ -622,7 +623,7 @@ void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Sour
 	StopErrorCapture(true);
 	BumpQueueGeneration();
 	Queue.SetServerTrackingEnabled(false);
-	IFileManager::Get().Delete(*QueueFilePath(), false, true, true);
+	DeleteQueueFiles();
 	StopTimers();
 	SetStatusReason(Reason);
 
@@ -2726,6 +2727,46 @@ FString URavensightSubsystem::QueueFilePath() const
 		TEXT("queue-") + FromUtf8(RavensightDelivery::QueueKeyHash(Utf8(IngestKey))) + TEXT(".json"));
 }
 
+RavensightQueueFile::FOps URavensightSubsystem::QueueFileOps() const
+{
+	RavensightQueueFile::FOps Ops;
+	Ops.Save = [](const std::string& Path, const std::string& Text)
+	{
+		return FFileHelper::SaveArrayToFile(TArrayView<const uint8>(reinterpret_cast<const uint8*>(Text.data()), static_cast<int32>(Text.size())), *FromUtf8(Path));
+	};
+	Ops.Move = [](const std::string& To, const std::string& From)
+	{
+		return IFileManager::Get().Move(*FromUtf8(To), *FromUtf8(From), true, true);
+	};
+	Ops.Remove = [](const std::string& Path)
+	{
+		IFileManager::Get().Delete(*FromUtf8(Path), false, true, true);
+	};
+	Ops.Exclude = [](const std::string& Path)
+	{
+		return RavensightBackupExclusion::Exclude(FromUtf8(Path));
+	};
+	Ops.Warn = [this](const char* Message)
+	{
+		// Once a run; the message carries no path and no queue contents.
+		if (!bBackupWarned)
+		{
+			bBackupWarned = true;
+			UE_LOG(LogRavensight, Warning, TEXT("%s"), UTF8_TO_TCHAR(Message));
+		}
+	};
+	return Ops;
+}
+
+void URavensightSubsystem::DeleteQueueFiles() const
+{
+	const FString Path = QueueFilePath();
+	if (!Path.IsEmpty())
+	{
+		RavensightQueueFile::RemoveAll(QueueFileOps(), Utf8(Path));
+	}
+}
+
 bool URavensightSubsystem::QueueFileAllowed() const
 {
 	// Never for a Playtest run (nothing is persisted), never before an opt-in
@@ -2742,6 +2783,13 @@ void URavensightSubsystem::LoadPersistedQueue()
 	bQueueLoaded = true;
 
 	const FString Path = QueueFilePath();
+	if (!Path.IsEmpty())
+	{
+		// Files written by older versions get the backup exclusion too.
+		const FString Directory = FPaths::GetPath(Path);
+		IFileManager::Get().MakeDirectory(*Directory, true);
+		RavensightQueueFile::ExcludeExisting(QueueFileOps(), Utf8(Directory), Utf8(Path), IFileManager::Get().FileExists(*Path));
+	}
 	FString Text;
 	if (Path.IsEmpty() || !FFileHelper::LoadFileToString(Text, *Path))
 	{
@@ -2843,14 +2891,14 @@ void URavensightSubsystem::PersistQueueNow()
 	if (!QueueFileAllowed())
 	{
 		// Opted out, before a yes, or the identity forgotten: nothing stays on disk.
-		IFileManager::Get().Delete(*Path, false, true, true);
+		DeleteQueueFiles();
 		return;
 	}
 
 	const TArray<FRavensightEvent>& Events = Queue.GetEvents();
 	if (Events.Num() == 0)
 	{
-		IFileManager::Get().Delete(*Path, false, true, true);
+		DeleteQueueFiles();
 		return;
 	}
 
@@ -2904,16 +2952,11 @@ void URavensightSubsystem::PersistQueueNow()
 	}
 	Text += TEXT("]}]}");
 
-	// Written beside the old file, then moved over it, so a partial write
-	// never replaces a good one.
+	// Written beside the old file, marked excluded from backups, then moved
+	// over it, so a partial write never replaces a good one and nothing
+	// reaches a backup (RavensightQueueFile::Write).
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
-	const FString Temp = Path + TEXT(".tmp");
-	if (FFileHelper::SaveStringToFile(Text, *Temp, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
-		&& IFileManager::Get().Move(*Path, *Temp, true, true))
-	{
-		// The move makes a new file, so the attribute is set after every write.
-		RavensightBackupExclusion::Exclude(Path);
-	}
+	RavensightQueueFile::Write(QueueFileOps(), Utf8(Path), Utf8(Text));
 }
 
 void URavensightSubsystem::AdoptSessionAnswer(const TSharedPtr<FJsonObject>& Parsed)

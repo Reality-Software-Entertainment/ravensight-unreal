@@ -50,8 +50,13 @@ prerequisites".
 * `RavensightDelivery` (engine-free) with the shared delivery vectors in
   `RavensightDelivery.spec.cpp`, run by the host check.
 
-* On iOS the queue file gets the do-not-backup attribute after every write.
-  The README gives the Android Auto Backup rules a game adds.
+* On iOS the queue file gets the do-not-backup attribute: set on the
+  temporary file before it is moved into place, checked, and retried once on
+  the final file with a warning (no path or contents) when it fails. At load
+  the folder and an existing file are marked too, so files from older
+  versions are covered. A failed write deletes its temporary file, and every
+  delete of the queue file deletes `queue-<hash>.json.tmp` as well. The README
+  gives the Android Auto Backup rules a game adds.
 
 ### Server prerequisites
 

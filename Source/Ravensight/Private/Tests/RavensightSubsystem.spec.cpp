@@ -1168,8 +1168,10 @@ void FRavensightSubsystemSpec::Define()
 
 			Subsystem->TrackEventJson(TEXT("play"), FString());
 			const_cast<FRavensightQueue&>(Subsystem->GetQueue()).Enqueue(Capture);
+			FFileHelper::SaveStringToFile(TEXT("partial"), *(Path + TEXT(".tmp")));
 			Subsystem->SetTrackingEnabled(false);
 			TestFalse(TEXT("opt-out deletes it"), IFileManager::Get().FileExists(*Path));
+			TestFalse(TEXT("and any temporary file a write left"), IFileManager::Get().FileExists(*(Path + TEXT(".tmp"))));
 		});
 
 		It("drops rs_trail from a capture restored from an older file", [this]()
