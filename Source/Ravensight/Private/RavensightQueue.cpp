@@ -47,6 +47,26 @@ int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
 		return 0;
 	}
 
+	if (Event.bError && Events.Num() >= MaxQueueSize)
+	{
+		// A capture never evicts a gameplay event: with no queued capture to
+		// evict, the incoming one is the one dropped.
+		bool bHasCapture = false;
+		for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
+		{
+			if (Events[Index].bError)
+			{
+				bHasCapture = true;
+				break;
+			}
+		}
+		if (!bHasCapture)
+		{
+			++DroppedCount;
+			return 1;
+		}
+	}
+
 	const int32 Dropped = TrimToCap(1);
 	if (!Event.bError)
 	{

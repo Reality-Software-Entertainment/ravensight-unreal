@@ -2801,6 +2801,8 @@ void URavensightSubsystem::LoadPersistedQueue()
 				? Data->ToSharedRef() : MakeShared<FJsonObject>();
 			bool bCaptured = false;
 			Entry->TryGetBoolField(TEXT("auto"), bCaptured);
+			// A trail never comes back from the file, even from an older one.
+			DataObject->RemoveField(TEXT("rs_trail"));
 			FRavensightEvent Event(Name, WriteJson(DataObject), Timestamp, bCaptured);
 			Event.OriginJson = OriginJson;
 			Event.OriginSession = OriginSession;
@@ -2833,8 +2835,14 @@ void URavensightSubsystem::PersistQueueNow()
 	bQueueDirty = false;
 	LastQueueWriteSeconds = NowSeconds();
 	const FString Path = QueueFilePath();
-	if (Path.IsEmpty() || !QueueFileAllowed())
+	if (Path.IsEmpty())
 	{
+		return;
+	}
+	if (!QueueFileAllowed())
+	{
+		// Opted out, before a yes, or the identity forgotten: nothing stays on disk.
+		IFileManager::Get().Delete(*Path, false, true, true);
 		return;
 	}
 
@@ -2877,9 +2885,20 @@ void URavensightSubsystem::PersistQueueNow()
 			Text += TEXT(",");
 		}
 		bFirstEvent = false;
+		// A trail is never written to the queue file: it stays in memory only.
+		FString DataText = Event.DataJson.IsEmpty() ? FString(TEXT("{}")) : Event.DataJson;
+		if (DataText.Contains(TEXT("\"rs_trail\"")))
+		{
+			const TSharedPtr<FJsonObject> Data = ParseJsonObject(DataText);
+			if (Data.IsValid())
+			{
+				Data->RemoveField(TEXT("rs_trail"));
+				DataText = WriteJson(Data.ToSharedRef());
+			}
+		}
 		Text += TEXT("{\"event\":") + FromUtf8(RavensightDelivery::JsonString(Utf8(Event.EventName)))
 			+ FString::Printf(TEXT(",\"timestamp\":%lld,\"data\":"), static_cast<long long>(Event.TimestampMs))
-			+ (Event.DataJson.IsEmpty() ? FString(TEXT("{}")) : Event.DataJson)
+			+ DataText
 			+ (Event.bError ? TEXT(",\"auto\":true}") : TEXT("}"));
 	}
 	Text += TEXT("]}]}");

@@ -320,6 +320,37 @@ void FRavensightQueueSpec::Define()
 		});
 	});
 
+	Describe("the error queue rules every SDK shares", [this]()
+	{
+		It("rule 1: gameplay goes ahead of captures, never inside a batch in flight", [this]()
+		{
+			GiveSession(3600.0);
+			Queue->Enqueue(FRavensightEvent(TEXT("capture_0"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("play_0"), TEXT("{}"), 1));
+			TestEqual(TEXT("gameplay first"), Queue->GetEvents()[0].EventName, FString(TEXT("play_0")));
+			const FRavensightFlushPlan Plan = Queue->BeginFlush(Now, false);
+			TestEqual(TEXT("in flight"), Plan.Batch.Num(), 2);
+			Queue->Enqueue(FRavensightEvent(TEXT("play_1"), TEXT("{}"), 1));
+			TestEqual(TEXT("in flight untouched"), Queue->GetEvents()[1].EventName, FString(TEXT("capture_0")));
+			TestEqual(TEXT("after the batch"), Queue->GetEvents()[2].EventName, FString(TEXT("play_1")));
+		});
+
+		It("rule 2: an incoming capture evicts the oldest capture, or is dropped, never gameplay", [this]()
+		{
+			Queue->SetMaxQueueSize(3);
+			Queue->Enqueue(FRavensightEvent(TEXT("a"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("one"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("b"), TEXT("{}"), 1));
+			TestEqual(TEXT("evicts the oldest capture"), Queue->Enqueue(FRavensightEvent(TEXT("two"), TEXT("{}"), 1, true)), 1);
+			TestEqual(TEXT("the newer capture stays"), Queue->GetEvents()[2].EventName, FString(TEXT("two")));
+			Queue->Enqueue(FRavensightEvent(TEXT("c"), TEXT("{}"), 1));
+			TestEqual(TEXT("dropped, nothing evicted"), Queue->Enqueue(FRavensightEvent(TEXT("three"), TEXT("{}"), 1, true)), 1);
+			TestEqual(TEXT("gameplay intact"), Queue->GetEvents()[0].EventName, FString(TEXT("a")));
+			TestEqual(TEXT("b"), Queue->GetEvents()[1].EventName, FString(TEXT("b")));
+			TestEqual(TEXT("c"), Queue->GetEvents()[2].EventName, FString(TEXT("c")));
+		});
+	});
+
 	Describe("the persisted queue's merge", [this]()
 	{
 		It("puts restored events ahead of this run's and stamps origins only where missing", [this]()

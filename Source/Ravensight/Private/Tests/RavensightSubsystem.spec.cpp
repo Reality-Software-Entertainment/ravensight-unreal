@@ -1140,6 +1140,69 @@ void FRavensightSubsystemSpec::Define()
 			TestEqual(TEXT("this run's game_started carries no origin"), FreshStarts, 1);
 		});
 
+		It("rule 3: never writes rs_trail, keeps the capture flag, and opt-out or id reset delete persisted captures", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			FRavensightEvent Capture(TEXT("error"), TEXT("{\"rs_kind\":\"error\",\"rs_message\":\"boom\",\"rs_trail\":\"+10 info secret line\"}"), 1767225600000, true);
+			const_cast<FRavensightQueue&>(Subsystem->GetQueue()).Enqueue(Capture);
+			Subsystem->Flush();
+			Answer(Requests.Last(), 503, TEXT("{\"error\":\"busy\"}"));
+
+			TArray<FString> Files;
+			const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"));
+			IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("queue-*.json")), true, false);
+			if (!TestEqual(TEXT("one queue file"), Files.Num(), 1)) return;
+			const FString Path = FPaths::Combine(Directory, Files[0]);
+			FString Text;
+			FFileHelper::LoadFileToString(Text, *Path);
+			TestTrue(TEXT("the capture is stored"), Text.Contains(TEXT("boom")));
+			TestTrue(TEXT("with its flag"), Text.Contains(TEXT("\"auto\":true")));
+			TestFalse(TEXT("never its trail"), Text.Contains(TEXT("rs_trail")) || Text.Contains(TEXT("secret line")));
+			TestTrue(TEXT("the trail stays in memory"), Subsystem->GetQueue().GetEvents().Last().DataJson.Contains(TEXT("rs_trail")));
+
+			Subsystem->ResetDeviceId();
+			FString AfterReset;
+			const bool bExists = FFileHelper::LoadFileToString(AfterReset, *Path);
+			TestFalse(TEXT("id reset deletes the persisted capture"), bExists && AfterReset.Contains(TEXT("boom")));
+
+			Subsystem->TrackEventJson(TEXT("play"), FString());
+			const_cast<FRavensightQueue&>(Subsystem->GetQueue()).Enqueue(Capture);
+			Subsystem->SetTrackingEnabled(false);
+			TestFalse(TEXT("opt-out deletes it"), IFileManager::Get().FileExists(*Path));
+		});
+
+		It("drops rs_trail from a capture restored from an older file", [this]()
+		{
+			URavensightSubsystem* First = StartReady();
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			TArray<FString> Files;
+			const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"));
+			First->TrackEventJson(TEXT("play"), FString());
+			First->Flush();
+			Answer(Requests.Last(), 503, TEXT("{\"error\":\"busy\"}"));
+			IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("queue-*.json")), true, false);
+			if (!TestEqual(TEXT("one queue file"), Files.Num(), 1)) return;
+			const FString Path = FPaths::Combine(Directory, Files[0]);
+			const FString Old = FString::Printf(TEXT("{\"version\":2,\"groups\":[{\"events\":[{\"event\":\"error\",\"timestamp\":%lld,\"data\":{\"rs_kind\":\"error\",\"rs_message\":\"old\",\"rs_trail\":\"x\"},\"auto\":true}]}]}"),
+				static_cast<long long>(FDateTime::UtcNow().ToUnixTimestamp()) * 1000);
+			FFileHelper::SaveStringToFile(Old, *Path);
+
+			URavensightSubsystem* Second = StartInstance();
+			Second->Init(SpecKey);
+			bool bFound = false;
+			for (const FRavensightEvent& Event : Second->GetQueue().GetEvents())
+			{
+				if (Event.DataJson.Contains(TEXT("\"old\"")))
+				{
+					bFound = true;
+					TestTrue(TEXT("still a capture"), Event.bError);
+					TestFalse(TEXT("no trail"), Event.DataJson.Contains(TEXT("rs_trail")));
+				}
+			}
+			TestTrue(TEXT("restored"), bFound);
+		});
+
 		It("signs every batch over the plain body and gzips a body of 1 KB or more", [this]()
 		{
 			URavensightSubsystem* Subsystem = StartInstance();

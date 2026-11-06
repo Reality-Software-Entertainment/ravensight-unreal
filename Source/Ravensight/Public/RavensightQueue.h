@@ -145,9 +145,11 @@ public:
 	/**
 	 * Adds an event, dropping oldest events first if the cap is already met
 	 * (queued errors before any gameplay event). A gameplay event goes in
-	 * ahead of every queued error that is not already in flight. Returns how
-	 * many were dropped to make room, so the caller can log it. A no-op
-	 * returning 0 when tracking is off.
+	 * ahead of every queued error that is not already in flight. An incoming
+	 * error with no queued error to evict is itself dropped: a capture never
+	 * evicts gameplay. Returns how many were dropped, the incoming one
+	 * included, so the caller can log it. A no-op returning 0 when tracking
+	 * is off.
 	 */
 	int32 Enqueue(const FRavensightEvent& Event);
 

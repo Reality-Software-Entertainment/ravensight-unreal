@@ -21,10 +21,13 @@ prerequisites".
   resends once uncompressed. A batch `403` keeps the events and stops sending
   until the next launch (a `403 tracking_disabled` on a batch included). One new
   session after a batch `401`, then the backoff (was two).
-* The 0.4.0 queue rules for automatic captures hold in the persisted queue:
-  the capture flag is stored with each event, so a restored capture still
-  queues behind gameplay and is evicted first, and a capture is written to
-  the file at once. Captures are stamped in milliseconds like every event.
+* The error queue rules every SDK shares: an incoming capture with no queued
+  capture to evict is now dropped and never evicts a gameplay event (0.4.0
+  evicted the oldest gameplay event). The capture flag is stored with the
+  queue, so a restored capture still queues behind gameplay; `rs_trail` is
+  never written to the queue file (a restored capture has none); a capture is
+  written at once; opt-out and `ResetDeviceId` delete the file. Captures are
+  stamped in milliseconds like every event.
 * A `400` that is not `batch_too_large` no longer halves the batch (0.4.0
   split every `400`); `413` still halves.
 * Experiment tags follow the exposure contract: a fetch alone tags nothing;

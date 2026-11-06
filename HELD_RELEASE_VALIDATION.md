@@ -44,6 +44,9 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
 
 ## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
+- After the shared error queue rules (order, full queue, no trail on disk):
+  host check **145 cases passed**; full `Ravensight` automation run **188 passed**
+  (176 clean, 12 with expected warnings), 0 failed.
 - After merging the 0.4.0 error capture from main: engine-free host check
   **143 cases passed** and the full `Ravensight` automation run **184 passed**
   (171 clean, 13 with expected warnings), 0 failed, on the same UE 5.8.3 build.

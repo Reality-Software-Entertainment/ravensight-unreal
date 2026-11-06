@@ -634,8 +634,10 @@ your account. Rotate it from the dashboard at any time.
 * **Queue.** Events accumulate up to Max Queue Size. Past that the oldest are
   dropped so the newest are kept, automatic error captures first. A gameplay
   event is queued ahead of every waiting error capture (never inside a batch
-  in flight), so an error storm never holds back or pushes out gameplay. The
-  capture flag is kept in the queue file, so this holds after a restart.
+  in flight), so an error storm never holds back or pushes out gameplay: an
+  incoming capture with no queued capture to evict is dropped. The capture
+  flag is kept in the queue file, so this holds after a restart; `rs_trail`
+  is never written there, and opt-out and `ResetDeviceId` delete the file.
 * **Persisted queue.** The queue is kept in
   `Saved/Ravensight/queue-<hash>.json`, one file per ingest key, written
   beside the old file and moved over it so a partial write never replaces a
