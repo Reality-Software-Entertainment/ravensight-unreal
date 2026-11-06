@@ -90,7 +90,9 @@ FRavensightResponseVerdict RavensightProtocol::ClassifyResponse(const FRavensigh
 			Endpoint == ERavensightEndpoint::Session ? RavensightReason::SessionFailed : TEXT(""));
 	}
 
-	if (Status == 400 && Endpoint == ERavensightEndpoint::Batch)
+	// 413 is answered like 400: split the batch, then drop the one event
+	// that is still too large. Never retried as it is.
+	if ((Status == 400 || Status == 413) && Endpoint == ERavensightEndpoint::Batch)
 	{
 		return MakeVerdict(Input.BatchSize > 1 ? ERavensightResponseAction::HalveBatch : ERavensightResponseAction::DropHead);
 	}

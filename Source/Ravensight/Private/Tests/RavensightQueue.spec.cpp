@@ -116,6 +116,47 @@ void FRavensightQueueSpec::Define()
 		});
 	});
 
+	Describe("errors behind gameplay", [this]()
+	{
+		It("queues a gameplay event ahead of every queued error", [this]()
+		{
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_0"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_1"), TEXT("{}"), 1));
+
+			TestEqual(TEXT("first"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+			TestEqual(TEXT("gameplay jumped the errors"), Queue->GetEvents()[1].EventName, FString(TEXT("ev_1")));
+			TestTrue(TEXT("errors last"), Queue->GetEvents()[2].bError && Queue->GetEvents()[3].bError);
+		});
+
+		It("never inserts into a batch in flight", [this]()
+		{
+			GiveSession(3600.0);
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			const FRavensightFlushPlan Plan = Queue->BeginFlush(Now, false);
+			TestEqual(TEXT("in flight"), Plan.Batch.Num(), 1);
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_0"), TEXT("{}"), 1));
+			TestTrue(TEXT("error still first"), Queue->GetEvents()[0].bError);
+			Queue->EndFlush();
+			Queue->OnBatchAccepted(1);
+			TestEqual(TEXT("gameplay left"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+		});
+
+		It("drops queued errors before any gameplay event when full", [this]()
+		{
+			Queue->SetMaxQueueSize(3);
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_0"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("error"), TEXT("{}"), 1, true));
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_1"), TEXT("{}"), 1));
+			Queue->Enqueue(FRavensightEvent(TEXT("ev_2"), TEXT("{}"), 1));
+
+			TestEqual(TEXT("at the cap"), Queue->Num(), 3);
+			TestEqual(TEXT("oldest gameplay kept"), Queue->GetEvents()[0].EventName, FString(TEXT("ev_0")));
+			TestFalse(TEXT("no error left"), Queue->GetEvents()[2].bError);
+		});
+	});
+
 	Describe("flush decisions", [this]()
 	{
 		It("reports an empty queue rather than sending nothing", [this]()

@@ -172,6 +172,12 @@ void FRavensightProtocolSpec::Define()
 			TestTrue(TEXT("1 drops"), IsAction(Answer(ERavensightEndpoint::Batch, 400, FString(), 1), ERavensightResponseAction::DropHead));
 		});
 
+		It("handles a 413 like a 400: split, then drop the one event, never retried as it is", [this]()
+		{
+			TestTrue(TEXT("50 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 413, FString(), 50), ERavensightResponseAction::HalveBatch));
+			TestTrue(TEXT("1 drops"), IsAction(Answer(ERavensightEndpoint::Batch, 413, FString(), 1), ERavensightResponseAction::DropHead));
+		});
+
 		It("reports feedback and suggestion failures to the caller instead of retrying", [this]()
 		{
 			TestTrue(TEXT("feedback 400"), IsAction(Answer(ERavensightEndpoint::Feedback, 400, TEXT("invalid_rating")), ERavensightResponseAction::Fail));

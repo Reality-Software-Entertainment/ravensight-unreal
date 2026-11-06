@@ -51,12 +51,20 @@ struct FRavensightEvent
 	/** Unix seconds, captured when the event happened rather than when it is sent. */
 	int64 TimestampUnix = 0;
 
+	/**
+	 * An automatic error capture. Gameplay events are queued ahead of it and
+	 * it is the first dropped when the queue is full, so an error storm never
+	 * holds back or pushes out gameplay.
+	 */
+	bool bError = false;
+
 	FRavensightEvent() = default;
 
-	FRavensightEvent(FString InEventName, FString InDataJson, int64 InTimestampUnix)
+	FRavensightEvent(FString InEventName, FString InDataJson, int64 InTimestampUnix, bool bInError = false)
 		: EventName(MoveTemp(InEventName))
 		, DataJson(MoveTemp(InDataJson))
 		, TimestampUnix(InTimestampUnix)
+		, bError(bInError)
 	{
 	}
 };
@@ -122,9 +130,11 @@ public:
 	// --- Enqueue -----------------------------------------------------------
 
 	/**
-	 * Adds an event, dropping oldest events first if the cap is already met.
-	 * Returns how many were dropped to make room, so the caller can log it.
-	 * A no-op returning 0 when tracking is off.
+	 * Adds an event, dropping oldest events first if the cap is already met
+	 * (queued errors before any gameplay event). A gameplay event goes in
+	 * ahead of every queued error that is not already in flight. Returns how
+	 * many were dropped to make room, so the caller can log it. A no-op
+	 * returning 0 when tracking is off.
 	 */
 	int32 Enqueue(const FRavensightEvent& Event);
 
@@ -279,6 +289,9 @@ private:
 	bool bServerTrackingEnabled = true;
 	bool bLocallyEnabled = true;
 	bool bFlushInProgress = false;
+
+	/** How many leading events the batch in flight holds; nothing may be inserted or dropped among them. */
+	int32 InFlightCount = 0;
 
 	FString SessionToken;
 	double SessionExpiresAtSeconds = 0.0;

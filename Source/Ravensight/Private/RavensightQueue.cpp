@@ -21,8 +21,18 @@ int32 FRavensightQueue::TrimToCap(int32 Headroom)
 	{
 		// Drop oldest so the newest events always survive: a player who has
 		// been offline for an hour is better served by the last minute of
-		// their session than by the first.
-		Events.RemoveAt(0);
+		// their session than by the first. Queued errors go before any
+		// gameplay event, never from inside a batch in flight.
+		int32 Victim = 0;
+		for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
+		{
+			if (Events[Index].bError)
+			{
+				Victim = Index;
+				break;
+			}
+		}
+		Events.RemoveAt(Victim);
 		++Dropped;
 	}
 
@@ -38,6 +48,17 @@ int32 FRavensightQueue::Enqueue(const FRavensightEvent& Event)
 	}
 
 	const int32 Dropped = TrimToCap(1);
+	if (!Event.bError)
+	{
+		for (int32 Index = FMath::Min(InFlightCount, Events.Num()); Index < Events.Num(); ++Index)
+		{
+			if (Events[Index].bError)
+			{
+				Events.Insert(Event, Index);
+				return Dropped;
+			}
+		}
+	}
 	Events.Add(Event);
 	return Dropped;
 }
@@ -201,12 +222,14 @@ FRavensightFlushPlan FRavensightQueue::BeginFlush(double NowSeconds, bool bForce
 
 	Plan.Decision = ERavensightFlushDecision::Send;
 	bFlushInProgress = true;
+	InFlightCount = BatchSize;
 	return Plan;
 }
 
 void FRavensightQueue::EndFlush()
 {
 	bFlushInProgress = false;
+	InFlightCount = 0;
 }
 
 // --- Responses --------------------------------------------------------------

@@ -59,10 +59,10 @@ enum class ERavensightResponseAction : uint8
 	/** 2xx. Carry on. */
 	Accept,
 
-	/** 400 on a one event batch: the server will never take it. Drop it and keep draining. */
+	/** 400 or 413 on a one event batch: the server will never take it. Drop it and keep draining. */
 	DropHead,
 
-	/** 400 on a larger batch: retry with half as many events. */
+	/** 400 or 413 on a larger batch: retry with half as many events. */
 	HalveBatch,
 
 	/** 401 on a batch or feedback: the session expired. Open a new one. */
