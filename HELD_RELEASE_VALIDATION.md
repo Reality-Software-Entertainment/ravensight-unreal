@@ -44,6 +44,11 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
 
 ## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
+- After the iOS do-not-backup attribute on the queue file: host check **145
+  cases passed**; full `Ravensight` automation run **188 passed** (174 clean, 14
+  with expected warnings), 0 failed. The new `Private/IOS/RavensightIOSBackupExclusion.mm`
+  is compiled only for iOS, and this engine install has no iOS target, so it is
+  not compiled here: an iOS build must confirm it.
 - After the shared error queue rules (order, full queue, no trail on disk):
   host check **145 cases passed**; full `Ravensight` automation run **188 passed**
   (176 clean, 12 with expected warnings), 0 failed.

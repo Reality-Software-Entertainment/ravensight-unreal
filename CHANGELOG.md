@@ -50,6 +50,9 @@ prerequisites".
 * `RavensightDelivery` (engine-free) with the shared delivery vectors in
   `RavensightDelivery.spec.cpp`, run by the host check.
 
+* On iOS the queue file gets the do-not-backup attribute after every write.
+  The README gives the Android Auto Backup rules a game adds.
+
 ### Server prerequisites
 
 * `rs_exposure` must be in `SDK_AUTOMATIC_EVENTS` before release, or a public

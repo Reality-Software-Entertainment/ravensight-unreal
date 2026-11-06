@@ -31,6 +31,7 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
+#include "RavensightBackupExclusion.h"
 #include "RavensightDelivery.h"
 #include "Misc/Compression.h"
 #include "RHI.h"
@@ -2907,9 +2908,11 @@ void URavensightSubsystem::PersistQueueNow()
 	// never replaces a good one.
 	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
 	const FString Temp = Path + TEXT(".tmp");
-	if (FFileHelper::SaveStringToFile(Text, *Temp, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+	if (FFileHelper::SaveStringToFile(Text, *Temp, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)
+		&& IFileManager::Get().Move(*Path, *Temp, true, true))
 	{
-		IFileManager::Get().Move(*Path, *Temp, true, true);
+		// The move makes a new file, so the attribute is set after every write.
+		RavensightBackupExclusion::Exclude(Path);
 	}
 }
 

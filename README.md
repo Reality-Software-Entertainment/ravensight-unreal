@@ -831,6 +831,28 @@ SDK sends:
 The queue file under `Saved/Ravensight` holds queued events and each session's
 opaque origin stamp; never the session token or signing secret.
 
+**Backups.** The queue file holds origin stamps and scrubbed error captures,
+so it stays out of backups. On iOS the plugin sets the do-not-backup attribute
+(`NSURLIsExcludedFromBackupKey`) on it after every write. On Android, Auto
+Backup copies app files by default. The project's `Saved` folder sits in the
+app's external files directory by default (in the internal one when the
+project saves internally), so add rules for both to your backup rule files,
+with your project name in the path:
+
+```xml
+<!-- in your fullBackupContent file -->
+<exclude domain="external" path="UnrealGame/YourProject/YourProject/Saved/Ravensight/" />
+<exclude domain="file" path="UnrealGame/YourProject/YourProject/Saved/Ravensight/" />
+
+<!-- in your dataExtractionRules file, inside both <cloud-backup> and <device-transfer> -->
+<exclude domain="external" path="UnrealGame/YourProject/YourProject/Saved/Ravensight/" />
+<exclude domain="file" path="UnrealGame/YourProject/YourProject/Saved/Ravensight/" />
+```
+
+Check the path on a device with `adb shell run-as <package> ls files` (or
+the external files directory) before shipping. Desktop platforms have no app
+backup the plugin can opt out of.
+
 Because no advertising identifier is involved, an iOS build does not need an App
 Tracking Transparency prompt for Ravensight. You do still need to declare a
 device identifier used for analytics in your App Store privacy details and your
