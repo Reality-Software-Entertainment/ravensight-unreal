@@ -117,9 +117,9 @@ namespace RavensightErrors
 	RAVENSIGHT_API FString LevelWord(ERavensightLogLevel Level);
 
 	/**
-	 * Fatal and Error capture; Warning always goes to the trail; Display and
-	 * Log go to the trail only when the trail is on; Verbose and VeryVerbose
-	 * are never kept.
+	 * Fatal and Error capture; Warning, Display and Log go to the trail only
+	 * when the trail is on and are dropped before any copy otherwise; Verbose
+	 * and VeryVerbose are never kept.
 	 */
 	RAVENSIGHT_API ERavensightLineAction ClassifyLine(ERavensightLogLevel Level, bool bTrailOn);
 
@@ -152,6 +152,9 @@ private:
 class RAVENSIGHT_API FRavensightErrorLimiter
 {
 public:
+	/** The session cap and the bucket alone, without the key: a cheap check that counts nothing. */
+	bool HasRoom(double NowSeconds) const;
+
 	/** True when one more capture with this key may go out now; counts it. */
 	bool TryAdmit(const FString& DedupeKey, double NowSeconds);
 

@@ -745,9 +745,10 @@ namespace RavensightErrors
 		case ERavensightLogLevel::Error:
 			return ERavensightLineAction::Capture;
 		case ERavensightLogLevel::Warning:
-			return ERavensightLineAction::Trail;
 		case ERavensightLogLevel::Display:
 		case ERavensightLogLevel::Log:
+			// With the trail off nothing below Error is kept, so a game that
+			// logs every frame pays one comparison per line.
 			return bTrailOn ? ERavensightLineAction::Trail : ERavensightLineAction::Ignore;
 		default:
 			return ERavensightLineAction::Ignore;
@@ -825,6 +826,18 @@ FString FRavensightTrailRing::Join() const
 }
 
 // --- Limiter ---------------------------------------------------------------------
+
+bool FRavensightErrorLimiter::HasRoom(double NowSeconds) const
+{
+	if (Captures >= RavensightErrors::MaxCaptures)
+	{
+		return false;
+	}
+	const double Start = bBucketStarted ? RefilledAt : NowSeconds;
+	const double Rate = RavensightErrors::BucketSize / RavensightErrors::BucketSeconds;
+	const double Refilled = FMath::Min(static_cast<double>(RavensightErrors::BucketSize), Tokens + FMath::Max(0.0, NowSeconds - Start) * Rate);
+	return Refilled >= 1.0;
+}
 
 bool FRavensightErrorLimiter::TryAdmit(const FString& DedupeKey, double NowSeconds)
 {
@@ -958,7 +971,9 @@ bool FRavensightErrorPipeline::OnCapture(const FRavensightCapturedError& Error, 
 	{
 		return false;
 	}
-	if (!Limiter.TryAdmit(DedupeKey(Error), NowSeconds))
+	// The cheap checks first: once the session cap or the bucket is spent,
+	// nothing is scrubbed, templated or keyed.
+	if (!Limiter.HasRoom(NowSeconds) || !Limiter.TryAdmit(DedupeKey(Error), NowSeconds))
 	{
 		return false;
 	}

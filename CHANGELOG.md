@@ -19,7 +19,13 @@ All notable changes to this plugin are documented here.
   minute. Message, stack and trail are scrubbed on the device with the
   platform's shared fixture, which the specs run case for case.
 - Optional trail of the last 20 log lines, attached only when the game's
-  trail switch is on.
+  trail switch is on; with it off, Warning and lower lines are dropped
+  before any copy.
+- Cheap when spent: the caps and the bucket are checked before any scrub or
+  dedupe work, the hook list keeps separate quotas for errors and trail
+  lines, and the hooks stop copying errors once the session's captures are
+  spent. Builds without logging (`NO_LOGGING`, the Shipping default) skip the
+  log device and keep the ensure and Blueprint hooks.
 - Gameplay events are queued ahead of error captures, and error captures are
   dropped first when the queue is full. A `413` on a batch is handled like a
   `400`.

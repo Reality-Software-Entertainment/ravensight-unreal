@@ -166,11 +166,12 @@ void FRavensightErrorCaptureSpec::Define()
 
 	Describe("Levels", [this]()
 	{
-		It("captures Error and Fatal, trails Warning, trails lower levels only with the trail on", [this]()
+		It("captures Error and Fatal, and trails Warning and lower levels only with the trail on", [this]()
 		{
 			TestTrue("fatal", RavensightErrors::ClassifyLine(ERavensightLogLevel::Fatal, false) == ERavensightLineAction::Capture);
 			TestTrue("error", RavensightErrors::ClassifyLine(ERavensightLogLevel::Error, false) == ERavensightLineAction::Capture);
-			TestTrue("warning", RavensightErrors::ClassifyLine(ERavensightLogLevel::Warning, false) == ERavensightLineAction::Trail);
+			TestTrue("warning off", RavensightErrors::ClassifyLine(ERavensightLogLevel::Warning, false) == ERavensightLineAction::Ignore);
+			TestTrue("warning on", RavensightErrors::ClassifyLine(ERavensightLogLevel::Warning, true) == ERavensightLineAction::Trail);
 			TestTrue("log off", RavensightErrors::ClassifyLine(ERavensightLogLevel::Log, false) == ERavensightLineAction::Ignore);
 			TestTrue("log on", RavensightErrors::ClassifyLine(ERavensightLogLevel::Log, true) == ERavensightLineAction::Trail);
 			TestTrue("display on", RavensightErrors::ClassifyLine(ERavensightLogLevel::Display, true) == ERavensightLineAction::Trail);
@@ -224,6 +225,8 @@ void FRavensightErrorCaptureSpec::Define()
 			TestTrue("c", Limiter.TryAdmit(TEXT("c"), 0.0));
 			TestTrue("d", Limiter.TryAdmit(TEXT("d"), 0.0));
 			TestFalse("bucket empty", Limiter.TryAdmit(TEXT("e"), 0.0));
+			TestFalse("no room before any key work", Limiter.HasRoom(0.0));
+			TestTrue("room again after 10 s", Limiter.HasRoom(10.0));
 			TestFalse("not yet", Limiter.TryAdmit(TEXT("e"), 9.0));
 			TestTrue("one refilled after 10 s", Limiter.TryAdmit(TEXT("e"), 10.0));
 		});

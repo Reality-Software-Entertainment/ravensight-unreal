@@ -53,8 +53,11 @@ public:
 
 	bool IsInstalled() const { return bInstalled; }
 
-	/** Display and Log lines are copied only while the game's trail is on. */
-	void SetKeepInfoLines(bool bKeep) { bKeepInfo.store(bKeep); }
+	/** Warning, Display and Log lines are copied only while the game's trail is on. */
+	void SetKeepTrailLines(bool bKeep) { bKeepTrail.store(bKeep); }
+
+	/** False once the session's captures are spent: error lines and hook reports are then dropped before any copy. */
+	void SetAcceptCaptures(bool bAccept) { bAcceptCaptures.store(bAccept); }
 
 	/** Moves everything pending into Out, oldest first. Game thread. */
 	void Drain(TArray<FRavensightRawCapture>& Out);
@@ -75,8 +78,16 @@ private:
 	void Push(FRavensightRawCapture&& Record);
 	void HandleScriptException(const UObject* ActiveObject, const FFrame& StackFrame, const FBlueprintExceptionInfo& Info);
 
-	/** At most this many records wait for the next drain; more are dropped. */
-	static constexpr int32 MaxPending = 64;
+	/**
+	 * Separate quotas between drains, so trail lines can never push a real
+	 * error, ensure or script exception out. Over a quota the record is
+	 * dropped before anything is copied.
+	 */
+	static constexpr int32 MaxPendingCaptures = 32;
+	static constexpr int32 MaxPendingLines = 32;
+
+	/** A cheap check before any copy: room in the quota, and for a capture, captures still accepted. */
+	bool HasRoom(bool bCapture) const;
 
 	/** A copied line or stack is cut to this many characters. */
 	static constexpr int32 MaxCopyChars = 4000;
@@ -85,7 +96,12 @@ private:
 	TArray<FRavensightRawCapture> Pending;
 
 	const FString OwnHost;
-	std::atomic<bool> bKeepInfo { false };
+	std::atomic<bool> bKeepTrail { false };
+	std::atomic<bool> bAcceptCaptures { true };
+
+	/** Pending counts by quota, read without the lock for the pre-check and changed only under it. */
+	std::atomic<int32> PendingCaptures { 0 };
+	std::atomic<int32> PendingLines { 0 };
 
 	/** True while AddOutputDevice replays the engine's backlog: earlier lines are not this session's. */
 	std::atomic<bool> bInstalling { false };

@@ -63,6 +63,7 @@ namespace
 	{
 	}
 
+#if !NO_LOGGING
 	bool StartsWith(const TCHAR* Text, const TCHAR* Prefix)
 	{
 		return FCString::Strncmp(Text, Prefix, FCString::Strlen(Prefix)) == 0;
@@ -85,6 +86,8 @@ namespace
 			return ERavensightLogLevel::VeryVerbose;
 		}
 	}
+
+#endif
 
 	const TCHAR* ExceptionTypeName(int32 Type)
 	{
@@ -131,9 +134,11 @@ void FRavensightLogCapture::Install()
 
 	// AddOutputDevice may replay the engine's backlog into a new device;
 	// those lines are not this session's errors.
+#if !NO_LOGGING
 	bInstalling.store(true);
 	GLog->AddOutputDevice(this);
 	bInstalling.store(false);
+#endif
 }
 
 void FRavensightLogCapture::Uninstall()
@@ -169,19 +174,38 @@ void FRavensightLogCapture::Drain(TArray<FRavensightRawCapture>& Out)
 	FScopeLock ScopeLock(&Lock);
 	Out = MoveTemp(Pending);
 	Pending.Reset();
+	PendingCaptures.store(0);
+	PendingLines.store(0);
+}
+
+bool FRavensightLogCapture::HasRoom(bool bCapture) const
+{
+	return bCapture
+		? (bAcceptCaptures.load() && PendingCaptures.load() < MaxPendingCaptures)
+		: PendingLines.load() < MaxPendingLines;
 }
 
 void FRavensightLogCapture::Push(FRavensightRawCapture&& Record)
 {
+	const bool bCapture = !Record.bLine || Record.Level <= ERavensightLogLevel::Error;
 	FScopeLock ScopeLock(&Lock);
-	if (Pending.Num() < MaxPending)
+	std::atomic<int32>& Count = bCapture ? PendingCaptures : PendingLines;
+	if (Count.load() < (bCapture ? MaxPendingCaptures : MaxPendingLines))
 	{
+		Count.store(Count.load() + 1);
 		Pending.Add(MoveTemp(Record));
 	}
 }
 
 void FRavensightLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category)
 {
+#if NO_LOGGING
+	// A build without logging never registers this device; the log
+	// categories it compares against do not exist there.
+	(void)V;
+	(void)Verbosity;
+	(void)Category;
+#else
 	if (!V || bInstalling.load())
 	{
 		return;
@@ -195,7 +219,12 @@ void FRavensightLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbos
 
 	bool bKnown = false;
 	const ERavensightLogLevel Level = ToLevel(Verbosity, bKnown);
-	if (!bKnown || RavensightErrors::ClassifyLine(Level, bKeepInfo.load()) == ERavensightLineAction::Ignore)
+	if (!bKnown)
+	{
+		return;
+	}
+	const ERavensightLineAction Action = RavensightErrors::ClassifyLine(Level, bKeepTrail.load());
+	if (Action == ERavensightLineAction::Ignore || !HasRoom(Action == ERavensightLineAction::Capture))
 	{
 		return;
 	}
@@ -229,7 +258,7 @@ void FRavensightLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbos
 		}
 		if (StartsWith(V, TEXT("Ensure condition failed:")))
 		{
-			if (!bEnsureHooked)
+			if (!bEnsureHooked && HasRoom(true))
 			{
 				// No ensure hook on this engine: the log line is the report.
 				FRavensightRawCapture Record;
@@ -252,6 +281,7 @@ void FRavensightLogCapture::Serialize(const TCHAR* V, ELogVerbosity::Type Verbos
 	Record.Text = FString(V).Left(MaxCopyChars);
 	Record.AtSeconds = FPlatformTime::Seconds();
 	Push(MoveTemp(Record));
+#endif
 }
 
 void FRavensightLogCapture::HandleEnsure(const FString& Expression, const TCHAR* Message, const TCHAR* Combined)
@@ -259,6 +289,10 @@ void FRavensightLogCapture::HandleEnsure(const FString& Expression, const TCHAR*
 	const uint32 ThreadId = FPlatformTLS::GetCurrentThreadId();
 	uint32 Expected = ThreadId;
 	EnsureThreadId.compare_exchange_strong(Expected, 0);
+	if (!HasRoom(true))
+	{
+		return;
+	}
 
 	// Combined is "Ensure condition failed: <expr> [File:..] [Line: ..]\n<msg>\nStack: \n<frames>".
 	// The message leaves out the file and line, which a long build path
@@ -293,8 +327,6 @@ void FRavensightLogCapture::HandleScriptException(const UObject* /*ActiveObject*
 		return;
 	}
 
-	const FString Trace = StackFrame.GetStackTrace();
-
 #if DO_BLUEPRINT_GUARD
 	// The engine logs the script stack only while nothing is bound to this
 	// delegate. Binding it must not take that line away from the game's log.
@@ -303,11 +335,17 @@ void FRavensightLogCapture::HandleScriptException(const UObject* /*ActiveObject*
 		static const IConsoleVariable* ShortWarnings = IConsoleManager::Get().FindConsoleVariable(TEXT("bp.ShortScriptWarnings"));
 		if (!ShortWarnings || ShortWarnings->GetInt() == 0)
 		{
-			UE_LOG(LogScript, Warning, TEXT("%s"), *Trace);
+			UE_LOG(LogScript, Warning, TEXT("%s"), *StackFrame.GetStackTrace());
 		}
 	}
 #endif
 
+	if (!HasRoom(true))
+	{
+		return;
+	}
+
+	const FString Trace = StackFrame.GetStackTrace();
 	const FString Description = Info.GetDescription().ToString();
 
 	FRavensightRawCapture Record;

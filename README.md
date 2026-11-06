@@ -326,13 +326,19 @@ What is captured:
 | An `ensure` that fails | `log` | `warning` | `Ensure`, with the stack in `rs_stack` |
 | A Blueprint script exception (Accessed None, an infinite loop, a runtime error) | `uncaught` | `error` | `Blueprint.AccessViolation` and so on, with the script stack |
 
-A `Warning` line is never captured; it goes into the trail. With the game's
-trail switch on, `Display` and `Log` lines go into the trail too.
+A `Warning`, `Display` or `Log` line is never captured. With the game's
+trail switch on they go into the trail; with it off they are dropped before
+anything is copied.
 
 How it works: an output device on `GLog` and the engine's ensure and script
 exception delegates copy each line or report into a small lock protected
-list, from whichever thread logged it. The subsystem drains that list on the
-game thread a few times a second, and on `Flush` and quit. The hooks only
+list, from whichever thread logged it. The list keeps separate room for
+errors (32) and trail lines (32), so trail lines never push an error out,
+and a full quota drops a line before it is copied. The subsystem drains that
+list on the game thread a few times a second, and on `Flush` and quit. Once
+the session's 30 captures are spent, error lines are dropped at the hook
+before any copy, so a game that logs an error every frame pays almost
+nothing. The hooks only
 observe: nothing the game logs, and nothing an ensure or a script exception
 does, changes. Blueprint stack warnings that the engine prints only while
 nothing listens for script exceptions are still printed.

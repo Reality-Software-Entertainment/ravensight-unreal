@@ -116,8 +116,11 @@ warnings), including six subsystem cases that log real lines to `GLog` and
 raise a real `ensure`, with requests on the fake transport (no network);
 `bash Tools/host-check/run.sh` ran 128 cases, 0 failed, including every case
 of the platform's shared scrub fixture. The Blueprint script exception hook
-compiled but was not raised in a test, and no packaged or Shipping game was
-run.
+compiled but was not raised in a test. After the review round, `Build.sh
+HostGame Mac Shipping` (`NO_LOGGING`) compiled and linked the plugin with
+warnings as errors; Xcode's app finalization step then failed, as for
+0.2.1, so no Shipping app was launched. The editor suite ran 164 again, 164
+passed.
 
 
 For 0.3.0, on 2026-10-16, the same way (Unreal Engine 5.8, Xcode 27.0, a

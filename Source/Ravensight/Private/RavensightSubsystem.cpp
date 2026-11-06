@@ -763,7 +763,7 @@ void URavensightSubsystem::StartErrorCapture()
 	{
 		LogCapture = MakeShared<FRavensightLogCapture>(FGenericPlatformHttp::GetUrlDomain(ApiUrl));
 	}
-	LogCapture->SetKeepInfoLines(ErrorPipeline.IsTrailOn());
+	LogCapture->SetKeepTrailLines(ErrorPipeline.IsTrailOn());
 	LogCapture->Install();
 
 	if (!ErrorTickerHandle.IsValid())
@@ -842,7 +842,7 @@ void URavensightSubsystem::ApplyErrorCaptureAnswer(const TSharedPtr<FJsonObject>
 
 	if (LogCapture.IsValid())
 	{
-		LogCapture->SetKeepInfoLines(ErrorPipeline.IsTrailOn());
+		LogCapture->SetKeepTrailLines(ErrorPipeline.IsTrailOn());
 	}
 	StartErrorCapture();
 }
@@ -856,6 +856,16 @@ void URavensightSubsystem::DrainErrors()
 
 	TArray<FRavensightRawCapture> Records;
 	LogCapture->Drain(Records);
+
+	// Once the session's captures are spent the hooks stop copying errors at
+	// all; a new session opens them again on the next drain.
+	ON_SCOPE_EXIT
+	{
+		if (LogCapture.IsValid())
+		{
+			LogCapture->SetAcceptCaptures(ErrorPipeline.GetLimiter().GetCaptures() < RavensightErrors::MaxCaptures);
+		}
+	};
 	if (Records.Num() == 0 || !Queue.IsActive() || bStoppedForRun)
 	{
 		return;
