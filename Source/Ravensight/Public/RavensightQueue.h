@@ -35,8 +35,8 @@ namespace RavensightLimits
 	/** Floor on any scheduled retry, so a zero delay never busy loops. */
 	inline constexpr double MinRetrySeconds = 0.5;
 
-	/** Retry waits are the backoff plus or minus this fraction. */
-	inline constexpr double Jitter = 0.2;
+	/** Retry waits are the backoff times a random factor from this to 1. */
+	inline constexpr double JitterFloor = 0.5;
 }
 
 /** One queued analytics event. Data is carried as an already serialized JSON object. */
@@ -48,8 +48,18 @@ struct FRavensightEvent
 	/** A JSON object literal, "{}" when the event carries no payload. */
 	FString DataJson;
 
-	/** Unix seconds, captured when the event happened rather than when it is sent. */
-	int64 TimestampUnix = 0;
+	/** Unix milliseconds, captured when the event happened rather than when it is sent. */
+	int64 TimestampMs = 0;
+
+	/**
+	 * The /session answer's origin for the session this event belongs to, as
+	 * a JSON object text exactly as received, or empty when not known yet.
+	 * An event sent under a later session carries it.
+	 */
+	FString OriginJson;
+
+	/** The origin's session id, so a send can tell whether the event is from an earlier session. */
+	FString OriginSession;
 
 	/**
 	 * An automatic error capture. Gameplay events are queued ahead of it and
@@ -60,10 +70,10 @@ struct FRavensightEvent
 
 	FRavensightEvent() = default;
 
-	FRavensightEvent(FString InEventName, FString InDataJson, int64 InTimestampUnix, bool bInError = false)
+	FRavensightEvent(FString InEventName, FString InDataJson, int64 InTimestampMs, bool bInError = false)
 		: EventName(MoveTemp(InEventName))
 		, DataJson(MoveTemp(InDataJson))
-		, TimestampUnix(InTimestampUnix)
+		, TimestampMs(InTimestampMs)
 		, bError(bInError)
 	{
 	}
@@ -89,6 +99,9 @@ enum class ERavensightFlushDecision : uint8
 
 	/** Tracking is off: the Enabled setting, the server kill switch or a local opt out. */
 	Disabled,
+
+	/** A batch was refused with a 403: the events are kept and sent on the next launch. */
+	Refused,
 };
 
 /** The outcome of FRavensightQueue::BeginFlush. */
@@ -132,11 +145,23 @@ public:
 	/**
 	 * Adds an event, dropping oldest events first if the cap is already met
 	 * (queued errors before any gameplay event). A gameplay event goes in
-	 * ahead of every queued error that is not already in flight. Returns how
-	 * many were dropped to make room, so the caller can log it. A no-op
-	 * returning 0 when tracking is off.
+	 * ahead of every queued error that is not already in flight. An incoming
+	 * error with no queued error to evict is itself dropped: a capture never
+	 * evicts gameplay. Returns how many were dropped, the incoming one
+	 * included, so the caller can log it. A no-op returning 0 when tracking
+	 * is off.
 	 */
 	int32 Enqueue(const FRavensightEvent& Event);
+
+	/**
+	 * Puts events read back from the persisted queue ahead of anything queued
+	 * in this run, oldest first, then trims to the cap. Never while a batch is
+	 * in flight. Returns how many were added.
+	 */
+	int32 Restore(const TArray<FRavensightEvent>& Restored);
+
+	/** Gives every queued event that has no origin yet this session's origin. */
+	void StampOrigins(const FString& InOriginJson, const FString& InOriginSession);
 
 	/**
 	 * Like Enqueue, but places the event at the front, for game_started when
@@ -167,6 +192,13 @@ public:
 	 * otherwise block everything behind it. Returns how many went.
 	 */
 	int32 DropHead(int32 Count);
+
+	/** Removes Count events from Index, the server having named them as refused for good. */
+	int32 DropAt(int32 Index, int32 Count);
+
+	/** After a batch 403: keep every event and send nothing more until the next launch. */
+	void SetSendBlocked(bool bBlocked) { bSendBlocked = bBlocked; }
+	bool IsSendBlocked() const { return bSendBlocked; }
 
 	// --- Enablement --------------------------------------------------------
 
@@ -204,8 +236,9 @@ public:
 	 * removed here: they leave the queue only in OnBatchAccepted, so a failed
 	 * send never loses them.
 	 *
-	 * bForce ignores the retry window, for a flush on shutdown or a manual
-	 * Flush() call. It never ignores the session or the kill switch.
+	 * bForce ignores a backoff window, for a flush on shutdown, background or
+	 * a manual Flush() call. It never ignores a server Retry-After, the
+	 * session or the kill switch.
 	 *
 	 * MaxCount caps the batch below MaxBatchSize, for retrying a batch the
 	 * server answered 400 at half its size. Values below 1 are treated as 1.
@@ -243,8 +276,11 @@ public:
 	/** Back to the 10 second first delay, with no pending retry window. */
 	void ResetBackoff();
 
+	/** True while the retry window is a server Retry-After, which nothing cuts short. */
+	bool IsRetryAfterActive() const { return bRetryAfterActive; }
+
 	/**
-	 * Opens a retry window of the current backoff plus or minus 20 percent
+	 * Opens a retry window of the current backoff times a factor in [0.5, 1)
 	 * (never under MinRetrySeconds, never over MaxBackoffSeconds), then
 	 * doubles the backoff up to the ceiling. The jitter keeps many copies of a
 	 * game that lost the network together from coming back together.
@@ -257,7 +293,7 @@ public:
 	/** Replaces the jitter source. A source that returns 0.5 gives the unjittered ladder. */
 	void SetRandomSource(FRandomSource InSource) { RandomSource = InSource; }
 
-	/** The jittered wait for one backoff step. Random is 0 <= x < 1; 0.5 returns the step itself. */
+	/** The jittered wait for one backoff step. Random is 0 <= x < 1; 0.5 gives three quarters of the step. */
 	static double JitteredWaitSeconds(double InBackoffSeconds, double Random);
 
 	/** 0 when a request may go out now, otherwise the wait remaining. */
@@ -279,7 +315,7 @@ public:
 private:
 	FRandomSource RandomSource = nullptr;
 
-	/** Removes oldest events until the queue fits the cap. Returns how many went. */
+	/** Removes events until the queue fits the cap, errors first. Returns how many went. */
 	int32 TrimToCap(int32 Headroom);
 
 	TArray<FRavensightEvent> Events;
@@ -289,6 +325,8 @@ private:
 	bool bServerTrackingEnabled = true;
 	bool bLocallyEnabled = true;
 	bool bFlushInProgress = false;
+	bool bRetryAfterActive = false;
+	bool bSendBlocked = false;
 
 	/** How many leading events the batch in flight holds; nothing may be inserted or dropped among them. */
 	int32 InFlightCount = 0;

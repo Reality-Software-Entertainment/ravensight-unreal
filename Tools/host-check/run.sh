@@ -20,11 +20,14 @@ python3 "$HERE/../scrub-vectors/generate.py" --check
   "$SRC/Private/RavensightQueue.cpp" \
   "$SRC/Private/RavensightProtocol.cpp" \
   "$SRC/Private/RavensightTypedEvents.cpp" \
+  "$SRC/Private/RavensightDelivery.cpp" \
   "$SRC/Private/RavensightErrorCapture.cpp" \
   "$SRC/Private/Tests/RavensightQueue.spec.cpp" \
   "$SRC/Private/Tests/RavensightProtocol.spec.cpp" \
   "$SRC/Private/Tests/RavensightTypedEvents.spec.cpp" \
   "$SRC/Private/Tests/RavensightConfig.spec.cpp" \
+  "$SRC/Private/Tests/RavensightDelivery.spec.cpp" \
+  "$SRC/Private/Tests/RavensightQueueFile.spec.cpp" \
   "$SRC/Private/Tests/RavensightErrorCapture.spec.cpp" \
   "$HERE/main.cpp" \
   -o "$OUT/host-check"

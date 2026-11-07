@@ -115,9 +115,9 @@ void FRavensightProtocolSpec::Define()
 			TestTrue(TEXT("suggestions 401"), IsAction(Answer(ERavensightEndpoint::Suggestions, 401), ERavensightResponseAction::FatalKey));
 		});
 
-		It("stops for the run on a 403 tracking_disabled from any endpoint", [this]()
+		It("stops for the run on a 403 tracking_disabled from settings, session and feedback", [this]()
 		{
-			const TArray<ERavensightEndpoint> Endpoints = { ERavensightEndpoint::Settings, ERavensightEndpoint::Session, ERavensightEndpoint::Batch, ERavensightEndpoint::Feedback };
+			const TArray<ERavensightEndpoint> Endpoints = { ERavensightEndpoint::Settings, ERavensightEndpoint::Session, ERavensightEndpoint::Feedback };
 			for (const ERavensightEndpoint Endpoint : Endpoints)
 			{
 				const FRavensightResponseVerdict Verdict = Answer(Endpoint, 403, TEXT("tracking_disabled"));
@@ -137,11 +137,47 @@ void FRavensightProtocolSpec::Define()
 			TestEqual(TEXT("invalid reason"), Invalid.Reason, FString(RavensightReason::SessionFailed));
 		});
 
-		It("re opens the session on a batch 401 at most twice in a row, then backs off", [this]()
+		It("re opens the session on a batch 401 once, then a second 401 in a row backs off", [this]()
 		{
 			TestTrue(TEXT("first"), IsAction(Answer(ERavensightEndpoint::Batch, 401, FString(), 10, 1), ERavensightResponseAction::RefreshSession));
-			TestTrue(TEXT("second"), IsAction(Answer(ERavensightEndpoint::Batch, 401, FString(), 10, 2), ERavensightResponseAction::RefreshSession));
-			TestTrue(TEXT("third"), IsAction(Answer(ERavensightEndpoint::Batch, 401, FString(), 10, 3), ERavensightResponseAction::BackOff));
+			TestTrue(TEXT("second"), IsAction(Answer(ERavensightEndpoint::Batch, 401, FString(), 10, 2), ERavensightResponseAction::BackOff));
+		});
+
+		It("keeps the events and stops until the next launch on any batch 403 but a Playtest one", [this]()
+		{
+			const FRavensightResponseVerdict Paused = Answer(ERavensightEndpoint::Batch, 403, TEXT("public_key_inactive"), 5);
+			TestTrue(TEXT("paused key"), IsAction(Paused, ERavensightResponseAction::StopUntilNextLaunch));
+			TestEqual(TEXT("reason"), Paused.Reason, FString(RavensightReason::InvalidKey));
+			const FRavensightResponseVerdict Off = Answer(ERavensightEndpoint::Batch, 403, TEXT("tracking_disabled"), 5);
+			TestTrue(TEXT("tracking off"), IsAction(Off, ERavensightResponseAction::StopUntilNextLaunch));
+			TestEqual(TEXT("off reason"), Off.Reason, FString(RavensightReason::TrackingDisabled));
+		});
+
+		It("drops the event a 400 names by index, the batch on any other 400, and resends a refused gzip plain once", [this]()
+		{
+			FRavensightResponseInput Input;
+			Input.Endpoint = ERavensightEndpoint::Batch;
+			Input.Status = 400;
+			Input.Error = TEXT("event_not_allowed");
+			Input.BatchSize = 5;
+			Input.Index = 3;
+			TestTrue(TEXT("index"), IsAction(RavensightProtocol::ClassifyResponse(Input), ERavensightResponseAction::DropIndex));
+			Input.Index = 5;
+			TestTrue(TEXT("index out of range"), IsAction(RavensightProtocol::ClassifyResponse(Input), ERavensightResponseAction::DropBatch));
+			TestTrue(TEXT("other 400"), IsAction(Answer(ERavensightEndpoint::Batch, 400, TEXT("invalid_payload"), 5), ERavensightResponseAction::DropBatch));
+
+			Input.Status = 415;
+			Input.Index = -1;
+			Input.bCompressed = true;
+			TestTrue(TEXT("415 compressed"), IsAction(RavensightProtocol::ClassifyResponse(Input), ERavensightResponseAction::ResendPlain));
+			Input.bCompressed = false;
+			TestTrue(TEXT("415 plain"), IsAction(RavensightProtocol::ClassifyResponse(Input), ERavensightResponseAction::DropBatch));
+		});
+
+		It("handles a 413 like batch_too_large: split, then drop the one event", [this]()
+		{
+			TestTrue(TEXT("50 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 413, TEXT("payload_too_large"), 50), ERavensightResponseAction::HalveBatch));
+			TestTrue(TEXT("1 drops"), IsAction(Answer(ERavensightEndpoint::Batch, 413, FString(), 1), ERavensightResponseAction::DropHead));
 		});
 
 		It("waits Retry-After on a 429, and on a 503 that sends one", [this]()
@@ -165,11 +201,11 @@ void FRavensightProtocolSpec::Define()
 			TestEqual(TEXT("500 reason"), ServerError.Reason, FString(RavensightReason::SessionFailed));
 		});
 
-		It("halves a batch the server answers 400 and drops a single event it still refuses", [this]()
+		It("halves a batch the server answers 400 batch_too_large and drops a single event it still refuses", [this]()
 		{
-			TestTrue(TEXT("50 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 400, TEXT("payload_too_large"), 50), ERavensightResponseAction::HalveBatch));
-			TestTrue(TEXT("2 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 400, FString(), 2), ERavensightResponseAction::HalveBatch));
-			TestTrue(TEXT("1 drops"), IsAction(Answer(ERavensightEndpoint::Batch, 400, FString(), 1), ERavensightResponseAction::DropHead));
+			TestTrue(TEXT("50 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 400, TEXT("batch_too_large"), 50), ERavensightResponseAction::HalveBatch));
+			TestTrue(TEXT("2 halves"), IsAction(Answer(ERavensightEndpoint::Batch, 400, TEXT("batch_too_large"), 2), ERavensightResponseAction::HalveBatch));
+			TestTrue(TEXT("1 drops"), IsAction(Answer(ERavensightEndpoint::Batch, 400, TEXT("batch_too_large"), 1), ERavensightResponseAction::DropHead));
 		});
 
 		It("handles a 413 like a 400: split, then drop the one event, never retried as it is", [this]()
@@ -537,7 +573,7 @@ void FRavensightProtocolSpec::Define()
 					bHasPoison |= Event.EventName == Poison;
 				}
 
-				const FRavensightResponseVerdict Verdict = Answer(ERavensightEndpoint::Batch, bHasPoison ? 400 : 202, FString(), Plan.Batch.Num());
+				const FRavensightResponseVerdict Verdict = Answer(ERavensightEndpoint::Batch, bHasPoison ? 400 : 202, TEXT("batch_too_large"), Plan.Batch.Num());
 				switch (Verdict.Action)
 				{
 				case ERavensightResponseAction::Accept:
@@ -564,7 +600,7 @@ void FRavensightProtocolSpec::Define()
 			TestEqual(TEXT("requests"), Requests, 7);
 		});
 
-		It("stops re opening the session after two batch 401s in a row", [this]()
+		It("stops re opening the session after one batch 401", [this]()
 		{
 			Fill(3);
 			int32 InARow = 0;
@@ -594,7 +630,7 @@ void FRavensightProtocolSpec::Define()
 				break;
 			}
 
-			TestEqual(TEXT("two re opens"), SessionOpens, 2);
+			TestEqual(TEXT("one re open"), SessionOpens, 1);
 			TestTrue(TEXT("now waiting"), Queue->SecondsUntilNextAttempt(Now) > 0.0);
 			TestEqual(TEXT("events kept"), Queue->Num(), 3);
 		});

@@ -2,6 +2,63 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.5.0] - 2026-11-06
+
+Follows the platform's SDK delivery, ads and attribution, exposure and device
+contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
+
+### Changes for 0.4.0 games
+
+* The queue is persisted in `Saved/Ravensight/queue-<hash>.json` (version 2 of
+  the delivery contract, 500 events, 89 days) and read back on the next launch.
+* Event timestamps are unix milliseconds (were seconds).
+* Retry waits are the backoff times a random factor between 0.5 and 1 (were
+  plus or minus 20 percent). A forced flush (`Flush`, background, quit) cuts a
+  backoff short but never a server `Retry-After`.
+* A batch `400` with `index` drops that event only; `400 batch_too_large` and
+  `413` halve the batch; any other `400` drops the request's events; `415`
+  resends once uncompressed. A batch `403` keeps the events and stops sending
+  until the next launch (a `403 tracking_disabled` on a batch included). One new
+  session after a batch `401`, then the backoff (was two).
+* The error queue rules every SDK shares: an incoming capture with no queued
+  capture to evict is now dropped and never evicts a gameplay event (0.4.0
+  evicted the oldest gameplay event). The capture flag is stored with the
+  queue, so a restored capture still queues behind gameplay; `rs_trail` is
+  never written to the queue file (a restored capture has none); a capture is
+  written at once; opt-out and `ResetDeviceId` delete the file. Captures are
+  stamped in milliseconds like every event.
+* A `400` that is not `batch_too_large` no longer halves the batch (0.4.0
+  split every `400`); `413` still halves.
+* Experiment tags follow the exposure contract: a fetch alone tags nothing;
+  the first typed config read in a session queues one `rs_exposure` and tags
+  that session's later events. A well formed `rs_exp_<key>` of the game's own
+  is kept (it was removed).
+
+### Added
+
+* Origin replay: each event carries the session it was tracked under; on
+  mobile an expired saved exit is queued under its origin.
+* gzip for batches of 1,024 bytes or more, and request signing when the
+  session answers with `signing` (secret in memory only).
+* The 8,192 byte check measures as the server does: a typed error's message,
+  stack and trail count one byte a character.
+* `TrackAd`, `TrackAdRevenue`, `TrackAdRevenueFromMediation` and
+  `SetAttribution` (once per device), Blueprint callable.
+* `device` on `POST /session` from `GetDeviceMakeAndModel`, `GetOSVersion` and
+  `GRHIAdapterName`. The module now depends on `RHI`.
+* `RavensightDelivery` (engine-free) with the shared delivery vectors in
+  `RavensightDelivery.spec.cpp`, run by the host check.
+
+* On iOS the queue file gets the do-not-backup attribute: set on the
+  temporary file before it is moved into place, checked, and retried once on
+  the final file with a warning (no path or contents) when it fails. At load
+  the folder and an existing file are marked too, so files from older
+  versions are covered. A failed write deletes its temporary file, and every
+  delete of the queue file deletes `queue-<hash>.json.tmp` as well. The README
+  gives the Android Auto Backup rules a game adds.
+
 ## [0.4.0] - 2026-11-06
 
 - Add automatic error capture, on by default with a new **Error Capture**

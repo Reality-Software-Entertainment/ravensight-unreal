@@ -41,3 +41,38 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   prepared-report cases passed. Evidence: sibling `validation/unreal-reports-automation/index.json`
   and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live S3 test.
 - No remote writes, publication or deployment. Live S3/device/game capture checks remain held.
+
+## 0.5.0: delivery, ads and attribution, exposure and device fields (November 6, 2026)
+
+- Release 0.5.0, with the 8 KB check counting a typed error's trail one byte a
+  character: Unreal Engine 5.8.3 Mac Development editor target built with
+  `-WarningsAsErrors`; full `Ravensight` automation run **193 passed** (180
+  clean, 13 with expected warnings), 0 failed, 0 not run; host check **150
+  cases passed**. The iOS exclusion is still compiled only by an iOS build.
+- After the backup and temporary file hardening (exclusion before the move,
+  checked with one retry, temporary file removed on failure and on every delete,
+  folder and older files excluded at load): host check **150 cases passed**; full
+  `Ravensight` automation run **193 passed** (180 clean, 13 with expected warnings),
+  0 failed. The iOS exclusion itself is still compiled only by an iOS build.
+- After the iOS do-not-backup attribute on the queue file: host check **145
+  cases passed**; full `Ravensight` automation run **188 passed** (174 clean, 14
+  with expected warnings), 0 failed. The new `Private/IOS/RavensightIOSBackupExclusion.mm`
+  is compiled only for iOS, and this engine install has no iOS target, so it is
+  not compiled here: an iOS build must confirm it.
+- After the shared error queue rules (order, full queue, no trail on disk):
+  host check **145 cases passed**; full `Ravensight` automation run **188 passed**
+  (176 clean, 12 with expected warnings), 0 failed.
+- After merging the 0.4.0 error capture from main: engine-free host check
+  **143 cases passed** and the full `Ravensight` automation run **184 passed**
+  (171 clean, 13 with expected warnings), 0 failed, on the same UE 5.8.3 build.
+- Before the merge: engine-free host check **124 cases passed**, including every shared delivery
+  vector (header and beacon signatures, the 8 KB measure), the error-behind-gameplay
+  queue rules and the new response table, plus 4 portable SHA-256 cases.
+- Unreal Engine 5.8.3 Mac Development editor target built with `-WarningsAsErrors`
+  (UnrealHeaderTool included) in a scratch host project.
+- Full `Ravensight` automation run: **159 passed** (149 clean, 10 with expected
+  warnings), 0 failed, 0 not run. New subsystem cases cover the queue file read back
+  under its original origin, signing over the plain body with gzip, a batch 403 kept
+  for the next launch, the session's device fields, ads and attribution, and exposure.
+- Requests went through the fake transport; no live Ravensight service, packaged
+  build or device was exercised. No push to GitHub, tag or publication.

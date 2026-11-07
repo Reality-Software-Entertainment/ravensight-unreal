@@ -16,7 +16,7 @@
 namespace RavensightVersion
 {
 	/** The plugin version. Matches VersionName in Ravensight.uplugin. */
-	inline constexpr const TCHAR* Sdk = TEXT("0.4.0");
+	inline constexpr const TCHAR* Sdk = TEXT("0.5.0");
 
 	/** "unreal/<version>", sent as "sdk" on the session create request. */
 	inline FString SdkTag()
@@ -62,8 +62,20 @@ enum class ERavensightResponseAction : uint8
 	/** 400 or 413 on a one event batch: the server will never take it. Drop it and keep draining. */
 	DropHead,
 
-	/** 400 or 413 on a larger batch: retry with half as many events. */
+	/** 400 batch_too_large or 413 on a larger batch: retry with half as many events. */
 	HalveBatch,
+
+	/** 400 naming one event by index: drop that event and resend the rest. */
+	DropIndex,
+
+	/** Any other 400, or a 415 sent plain: the request's events will never be accepted. Drop them. */
+	DropBatch,
+
+	/** 415 on a compressed batch: send the same batch once more uncompressed. */
+	ResendPlain,
+
+	/** 403 on a batch: keep the events and send nothing more until the next launch. */
+	StopUntilNextLaunch,
 
 	/** 401 on a batch or feedback: the session expired. Open a new one. */
 	RefreshSession,
@@ -106,6 +118,12 @@ struct FRavensightResponseInput
 
 	/** True when the response carried a usable delta seconds Retry-After header. */
 	bool bHasRetryAfter = false;
+
+	/** Batch only: the "index" of a 400 body, or -1 when it named none. */
+	int32 Index = -1;
+
+	/** Batch only: the request body was gzip compressed. */
+	bool bCompressed = false;
 };
 
 /** The outcome of ClassifyResponse. */
@@ -123,7 +141,7 @@ struct FRavensightResponseVerdict
 namespace RavensightProtocol
 {
 	/** A batch 401 re opens the session at most this many times in a row before backing off. */
-	inline constexpr int32 MaxBatchReauthInARow = 2;
+	inline constexpr int32 MaxBatchReauthInARow = 1;
 
 	/** Mobile: a background stay at least this long ends the session. Seconds. */
 	inline constexpr double DefaultSessionTimeoutSeconds = 1800.0;

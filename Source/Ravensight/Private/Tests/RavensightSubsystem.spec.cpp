@@ -34,6 +34,11 @@
 #include "RavensightSpecListener.h"
 #include "RavensightSubsystem.h"
 #include "RavensightTransport.h"
+#include "RavensightDelivery.h"
+#include "HAL/FileManager.h"
+#include "Misc/Compression.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "RavensightLogCapture.h"
 
 namespace
@@ -83,7 +88,18 @@ namespace
 
 	FString BodyOf(const FHttpRequestPtr& Request)
 	{
-		const TArray<uint8>& Bytes = Request->GetContent();
+		TArray<uint8> Bytes = Request->GetContent();
+		if (Request->GetHeader(TEXT("Content-Encoding")) == TEXT("gzip") && Bytes.Num() >= 4)
+		{
+			// The gzip trailer's last four bytes are the plain size.
+			const int32 Size = Bytes[Bytes.Num() - 4] | (Bytes[Bytes.Num() - 3] << 8) | (Bytes[Bytes.Num() - 2] << 16) | (Bytes[Bytes.Num() - 1] << 24);
+			TArray<uint8> Plain;
+			Plain.SetNumUninitialized(Size);
+			if (FCompression::UncompressMemory(NAME_Gzip, Plain.GetData(), Size, Bytes.GetData(), Bytes.Num()))
+			{
+				Bytes = Plain;
+			}
+		}
 		const auto Text = StringCast<TCHAR>(reinterpret_cast<const UTF8CHAR*>(Bytes.GetData()), Bytes.Num());
 		return FString::ConstructFromPtrSize(Text.Get(), Text.Length());
 	}
@@ -94,6 +110,35 @@ namespace
 		const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(BodyOf(Request));
 		FJsonSerializer::Deserialize(Reader, Object);
 		return Object;
+	}
+
+	/** The persisted queue files, removed before and after every case so no case reads another's queue. */
+	void DeleteQueueFiles()
+	{
+		TArray<FString> Files;
+		const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"));
+		IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("queue-*.json")), true, false);
+		for (const FString& File : Files)
+		{
+			IFileManager::Get().Delete(*FPaths::Combine(Directory, File), false, true, true);
+		}
+		GConfig->RemoveKey(TEXT("Ravensight"), TEXT("AttributionSentFor"), GGameUserSettingsIni);
+	}
+
+	/** The data of the last event with this name in a batch request, or null. */
+	TSharedPtr<FJsonObject> EventDataOf(const FHttpRequestPtr& Request, const FString& Name)
+	{
+		TSharedPtr<FJsonObject> Found;
+		const TSharedPtr<FJsonObject> Body = JsonOf(Request);
+		const TArray<TSharedPtr<FJsonValue>>* Events = nullptr;
+		if (Body.IsValid() && Body->TryGetArrayField(TEXT("events"), Events) && Events)
+		{
+			for (const TSharedPtr<FJsonValue>& Event : *Events)
+			{
+				if (Event->AsObject()->GetStringField(TEXT("event")) == Name) Found = Event->AsObject();
+			}
+		}
+		return Found;
 	}
 
 	/** The event names of a batch request, in order. */
@@ -343,6 +388,7 @@ void FRavensightSubsystemSpec::Define()
 {
 	BeforeEach([this]()
 	{
+		DeleteQueueFiles();
 		Requests.Reset();
 		ConfigRequests.Reset();
 		RavensightTransport::SetSenderForTests([this](const FHttpRequestRef& Request)
@@ -396,6 +442,7 @@ void FRavensightSubsystemSpec::Define()
 		RavensightTransport::SetSenderForTests(nullptr);
 		Requests.Reset();
 		ConfigRequests.Reset();
+		DeleteQueueFiles();
 
 		Listener->RemoveFromRoot();
 		Listener = nullptr;
@@ -1018,7 +1065,7 @@ void FRavensightSubsystemSpec::Define()
 			Subsystem->SetTrackingEnabled(false); const int32 Count = ConfigRequests.Num(); Subsystem->FetchConfig();
 			TestEqual(TEXT("no opted-out request"), ConfigRequests.Num(), Count);
 		});
-		It("applies exposures only to new events and rejects malformed replacements", [this]()
+		It("tags only after a typed read, sends one rs_exposure, and keeps a well formed tag of the game's own", [this]()
 		{
 			auto* Subsystem = StartReady();
 			if (!TestEqual(TEXT("fetch pending"), ConfigRequests.Num(), 1)) return;
@@ -1029,13 +1076,20 @@ void FRavensightSubsystemSpec::Define()
 			Document->SetObjectField(TEXT("values"), Values); Document->SetArrayField(TEXT("experiments"), Assignments); Document->SetStringField(TEXT("etag"), Tag);
 			FString Body; const auto Writer = TJsonWriterFactory<TCHAR>::Create(&Body); FJsonSerializer::Serialize(Document, Writer);
 			const auto InitialBatch = Requests.Last();
-			const auto Initial = JsonOf(InitialBatch)->GetArrayField(TEXT("events"))[0]->AsObject()->GetObjectField(TEXT("data"));
-			TestFalse(TEXT("old event unlabeled"), Initial->HasField(TEXT("rs_exp_difficulty")));
 			Answer(ConfigRequests.Last(), 200, Body); Answer(InitialBatch, 202, TEXT("{}"));
-			Subsystem->TrackEventJson(TEXT("after"), TEXT("{\"rs_exp_fake\":\"spoof\"}")); Subsystem->Flush();
-			const auto New = JsonOf(Requests.Last())->GetArrayField(TEXT("events"))[0]->AsObject()->GetObjectField(TEXT("data"));
-			TestEqual(TEXT("assignment"), New->GetStringField(TEXT("rs_exp_difficulty")), FString(TEXT("easy")));
-			TestFalse(TEXT("caller label removed"), New->HasField(TEXT("rs_exp_fake")));
+
+			Subsystem->TrackEventJson(TEXT("before"), FString());
+			TestEqual(TEXT("read"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 3.0);
+			Subsystem->GetConfigNumber(TEXT("speed"), 9);
+			Subsystem->TrackEventJson(TEXT("after"), FString());
+			Subsystem->TrackEventJson(TEXT("own"), TEXT("{\"rs_exp_difficulty\":\"mine\"}"));
+			Subsystem->Flush();
+			const auto Batch = Requests.Last();
+			TestFalse(TEXT("a fetch alone tags nothing"), EventDataOf(Batch, TEXT("before"))->GetObjectField(TEXT("data"))->HasField(TEXT("rs_exp_difficulty")));
+			TestEqual(TEXT("one exposure"), EventNamesOf(Batch).FilterByPredicate([](const FString& Name) { return Name == TEXT("rs_exposure"); }).Num(), 1);
+			TestEqual(TEXT("exposure tagged"), EventDataOf(Batch, TEXT("rs_exposure"))->GetObjectField(TEXT("data"))->GetStringField(TEXT("rs_exp_difficulty")), FString(TEXT("easy")));
+			TestEqual(TEXT("later events tagged"), EventDataOf(Batch, TEXT("after"))->GetObjectField(TEXT("data"))->GetStringField(TEXT("rs_exp_difficulty")), FString(TEXT("easy")));
+			TestEqual(TEXT("own tag kept"), EventDataOf(Batch, TEXT("own"))->GetObjectField(TEXT("data"))->GetStringField(TEXT("rs_exp_difficulty")), FString(TEXT("mine")));
 			Subsystem->FetchConfig(); Answer(ConfigRequests.Last(), 200, TEXT("{\"values\":{\"speed\":99}}"));
 			TestEqual(TEXT("bad document retains snapshot"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 3.0);
 		});
@@ -1046,6 +1100,171 @@ void FRavensightSubsystemSpec::Define()
 			auto* Subsystem = StartInstance(); Subsystem->Init(SpecKey); Subsystem->FetchConfig();
 			TestEqual(TEXT("no network"), ConfigRequests.Num(), 0);
 			TestEqual(TEXT("fallback"), Subsystem->GetConfigNumber(TEXT("speed"), 9), 9.0);
+		});
+	});
+
+	Describe("the delivery contract", [this]()
+	{
+		It("stores the queue with its origin and the next launch sends it under that origin", [this]()
+		{
+			URavensightSubsystem* First = StartInstance();
+			First->Init(SpecKey);
+			Answer(Requests.Last(), 200, TEXT("{\"trackingEnabled\":true}"));
+			Answer(Requests.Last(), 201, TEXT("{\"token\":\"tok_1\",\"expiresIn\":3600,\"origin\":{\"session\":\"ses_1\",\"build\":\"1\",\"platform\":\"Mac\",\"stamp\":\"o1.s1\"}}"));
+			First->TrackEventJson(TEXT("pickup"), FString());
+			First->Flush();
+			const TArray<FString> Ids = EventIdsOf(Requests.Last());
+			Answer(Requests.Last(), 503, TEXT("{\"error\":\"busy\"}"));
+			// The process ends here without a clean quit: the next launch is a
+			// second instance reading the same queue file.
+
+			URavensightSubsystem* Second = StartInstance();
+			Second->Init(SpecKey);
+			Answer(Requests.Last(), 200, TEXT("{\"trackingEnabled\":true}"));
+			Answer(Requests.Last(), 201, TEXT("{\"token\":\"tok_2\",\"expiresIn\":3600,\"origin\":{\"session\":\"ses_2\",\"build\":\"1\",\"platform\":\"Mac\",\"stamp\":\"o1.s2\"}}"));
+			Second->Flush();
+			const auto Batch = Requests.Last();
+			if (!TestTrue(TEXT("a batch body"), JsonOf(Batch).IsValid())) return;
+			const TSharedPtr<FJsonObject> Pickup = EventDataOf(Batch, TEXT("pickup"));
+			if (!TestTrue(TEXT("restored and sent"), Pickup.IsValid())) return;
+			TestEqual(TEXT("origin verbatim"), Pickup->GetObjectField(TEXT("origin"))->GetStringField(TEXT("stamp")), FString(TEXT("o1.s1")));
+			TestTrue(TEXT("same id"), EventIdsOf(Batch).Contains(Ids.Num() > 0 ? Ids.Last() : FString()));
+			TestTrue(TEXT("milliseconds"), Pickup->GetNumberField(TEXT("timestamp")) > 1e11);
+			int32 FreshStarts = 0;
+			// Held in a local: the array is a reference into the parsed body.
+			const TSharedPtr<FJsonObject> Parsed = JsonOf(Batch);
+			for (const TSharedPtr<FJsonValue>& Event : Parsed->GetArrayField(TEXT("events")))
+			{
+				if (Event->AsObject()->GetStringField(TEXT("event")) == TEXT("game_started") && !Event->AsObject()->HasField(TEXT("origin"))) ++FreshStarts;
+			}
+			TestEqual(TEXT("this run's game_started carries no origin"), FreshStarts, 1);
+		});
+
+		It("rule 3: never writes rs_trail, keeps the capture flag, and opt-out or id reset delete persisted captures", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			FRavensightEvent Capture(TEXT("error"), TEXT("{\"rs_kind\":\"error\",\"rs_message\":\"boom\",\"rs_trail\":\"+10 info secret line\"}"), 1767225600000, true);
+			const_cast<FRavensightQueue&>(Subsystem->GetQueue()).Enqueue(Capture);
+			Subsystem->Flush();
+			Answer(Requests.Last(), 503, TEXT("{\"error\":\"busy\"}"));
+
+			TArray<FString> Files;
+			const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"));
+			IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("queue-*.json")), true, false);
+			if (!TestEqual(TEXT("one queue file"), Files.Num(), 1)) return;
+			const FString Path = FPaths::Combine(Directory, Files[0]);
+			FString Text;
+			FFileHelper::LoadFileToString(Text, *Path);
+			TestTrue(TEXT("the capture is stored"), Text.Contains(TEXT("boom")));
+			TestTrue(TEXT("with its flag"), Text.Contains(TEXT("\"auto\":true")));
+			TestFalse(TEXT("never its trail"), Text.Contains(TEXT("rs_trail")) || Text.Contains(TEXT("secret line")));
+			TestTrue(TEXT("the trail stays in memory"), Subsystem->GetQueue().GetEvents().Last().DataJson.Contains(TEXT("rs_trail")));
+
+			Subsystem->ResetDeviceId();
+			FString AfterReset;
+			const bool bExists = FFileHelper::LoadFileToString(AfterReset, *Path);
+			TestFalse(TEXT("id reset deletes the persisted capture"), bExists && AfterReset.Contains(TEXT("boom")));
+
+			Subsystem->TrackEventJson(TEXT("play"), FString());
+			const_cast<FRavensightQueue&>(Subsystem->GetQueue()).Enqueue(Capture);
+			FFileHelper::SaveStringToFile(TEXT("partial"), *(Path + TEXT(".tmp")));
+			Subsystem->SetTrackingEnabled(false);
+			TestFalse(TEXT("opt-out deletes it"), IFileManager::Get().FileExists(*Path));
+			TestFalse(TEXT("and any temporary file a write left"), IFileManager::Get().FileExists(*(Path + TEXT(".tmp"))));
+		});
+
+		It("drops rs_trail from a capture restored from an older file", [this]()
+		{
+			URavensightSubsystem* First = StartReady();
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			TArray<FString> Files;
+			const FString Directory = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"));
+			First->TrackEventJson(TEXT("play"), FString());
+			First->Flush();
+			Answer(Requests.Last(), 503, TEXT("{\"error\":\"busy\"}"));
+			IFileManager::Get().FindFiles(Files, *FPaths::Combine(Directory, TEXT("queue-*.json")), true, false);
+			if (!TestEqual(TEXT("one queue file"), Files.Num(), 1)) return;
+			const FString Path = FPaths::Combine(Directory, Files[0]);
+			const FString Old = FString::Printf(TEXT("{\"version\":2,\"groups\":[{\"events\":[{\"event\":\"error\",\"timestamp\":%lld,\"data\":{\"rs_kind\":\"error\",\"rs_message\":\"old\",\"rs_trail\":\"x\"},\"auto\":true}]}]}"),
+				static_cast<long long>(FDateTime::UtcNow().ToUnixTimestamp()) * 1000);
+			FFileHelper::SaveStringToFile(Old, *Path);
+
+			URavensightSubsystem* Second = StartInstance();
+			Second->Init(SpecKey);
+			bool bFound = false;
+			for (const FRavensightEvent& Event : Second->GetQueue().GetEvents())
+			{
+				if (Event.DataJson.Contains(TEXT("\"old\"")))
+				{
+					bFound = true;
+					TestTrue(TEXT("still a capture"), Event.bError);
+					TestFalse(TEXT("no trail"), Event.DataJson.Contains(TEXT("rs_trail")));
+				}
+			}
+			TestTrue(TEXT("restored"), bFound);
+		});
+
+		It("signs every batch over the plain body and gzips a body of 1 KB or more", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests.Last(), 200, TEXT("{\"trackingEnabled\":true}"));
+			const FString Now = FString::Printf(TEXT("%lld"), static_cast<long long>(FDateTime::UtcNow().ToUnixTimestamp()));
+			Answer(Requests.Last(), 201, TEXT("{\"token\":\"tok_s\",\"expiresIn\":3600,\"signing\":{\"algorithm\":\"HMAC-SHA256\",\"version\":1,\"secret\":\"spec-secret\",\"serverTime\":") + Now + TEXT("}}"));
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			Subsystem->TrackEventJson(TEXT("big"), TEXT("{\"pad\":\"") + FString::ChrN(2000, TCHAR('x')) + TEXT("\"}"));
+			Subsystem->Flush();
+			const auto Batch = Requests.Last();
+			TestEqual(TEXT("gzip"), Batch->GetHeader(TEXT("Content-Encoding")), FString(TEXT("gzip")));
+			const FString Plain = BodyOf(Batch);
+			const FString Timestamp = Batch->GetHeader(TEXT("X-Ravensight-Timestamp"));
+			const FTCHARToUTF8 PlainUtf8(*Plain);
+			const std::string Expected = RavensightDelivery::SignRequest("spec-secret", FCString::Atoi64(*Timestamp), std::string(PlainUtf8.Get(), PlainUtf8.Length()));
+			TestEqual(TEXT("signature"), Batch->GetHeader(TEXT("X-Ravensight-Signature")), FString(UTF8_TO_TCHAR(Expected.c_str())));
+		});
+
+		It("keeps a refused batch for the next launch", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			Answer(Requests.Last(), 403, TEXT("{\"error\":\"origin_refused\"}"));
+			const int32 Count = Requests.Num();
+			Subsystem->TrackEventJson(TEXT("later"), FString());
+			Subsystem->Flush();
+			TestEqual(TEXT("nothing more sent"), Requests.Num(), Count);
+			TestEqual(TEXT("kept"), Subsystem->GetQueuedEventCount(), 2);
+		});
+
+		It("sends the device fields on the session", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			Answer(Requests.Last(), 200, TEXT("{\"trackingEnabled\":true}"));
+			const TSharedPtr<FJsonObject> Session = JsonOf(Requests.Last());
+			const TSharedPtr<FJsonObject>* Device = nullptr;
+			if (!TestTrue(TEXT("device object"), Session->TryGetObjectField(TEXT("device"), Device) && Device)) return;
+			for (const auto& Pair : (*Device)->Values)
+			{
+				TestTrue(TEXT("only the three fields"), Pair.Key == TEXT("model") || Pair.Key == TEXT("osVersion") || Pair.Key == TEXT("gpu"));
+				TestTrue(TEXT("at most 128"), Pair.Value->AsString().Len() <= 128);
+			}
+		});
+
+		It("sends an ad with micros as a digit string and attribution once per device", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			Answer(Requests.Last(), 202, TEXT("{}"));
+			TestFalse(TEXT("revenue without currency"), Subsystem->TrackAdRevenue(TEXT("admob"), TEXT("rewarded"), TEXT("x"), TEXT("1500"), FString()));
+			TestTrue(TEXT("ad"), Subsystem->TrackAdRevenueFromMediation(TEXT("applovin"), TEXT("REWARDED"), TEXT("level_end"), 0.0015, TEXT("usd")));
+			TestTrue(TEXT("attribution"), Subsystem->SetAttribution(TEXT("store_referrer"), TEXT("google"), TEXT("spring"), FString(), FString(), 0));
+			TestFalse(TEXT("once"), Subsystem->SetAttribution(TEXT("organic"), FString(), FString(), FString(), FString(), 0));
+			Subsystem->Flush();
+			const TSharedPtr<FJsonObject> Ad = EventDataOf(Requests.Last(), TEXT("rs_ad"))->GetObjectField(TEXT("data"));
+			TestEqual(TEXT("micros"), Ad->GetStringField(TEXT("rs_revenue_micros")), FString(TEXT("1500")));
+			TestEqual(TEXT("currency"), Ad->GetStringField(TEXT("rs_currency")), FString(TEXT("USD")));
+			TestEqual(TEXT("format"), Ad->GetStringField(TEXT("rs_ad_format")), FString(TEXT("rewarded")));
+			const TSharedPtr<FJsonObject> Attribution = EventDataOf(Requests.Last(), TEXT("rs_attribution"))->GetObjectField(TEXT("data"));
+			TestEqual(TEXT("source"), Attribution->GetStringField(TEXT("rs_attr_source")), FString(TEXT("store_referrer")));
 		});
 	});
 

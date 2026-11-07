@@ -31,6 +31,11 @@
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
+#include "RavensightBackupExclusion.h"
+#include "RavensightQueueFile.h"
+#include "RavensightDelivery.h"
+#include "Misc/Compression.h"
+#include "RHI.h"
 #include "RavensightLogCapture.h"
 #include "RavensightSettings.h"
 #include "RavensightTransport.h"
@@ -58,6 +63,24 @@ namespace
 	const TCHAR* const MarkerTokenKey = TEXT("BackgroundSessionToken");
 	const TCHAR* const MarkerExpiresAtKey = TEXT("BackgroundSessionExpiresAt");
 	const TCHAR* const MarkerBackgroundedAtKey = TEXT("BackgroundedAt");
+	const TCHAR* const MarkerOriginKey = TEXT("BackgroundSessionOrigin");
+
+	/** The device id this install's attribution was queued for, saved beside the device id. */
+	const TCHAR* const AttributionSentKey = TEXT("AttributionSentFor");
+
+	/** A burst of tracked events is written to the queue file at most this often. */
+	constexpr double QueueWriteIntervalSeconds = 1.0;
+
+	std::string Utf8(const FString& Text)
+	{
+		const FTCHARToUTF8 Converted(*Text);
+		return std::string(Converted.Get(), Converted.Length());
+	}
+
+	FString FromUtf8(const std::string& Text)
+	{
+		return FString(UTF8_TO_TCHAR(Text.c_str()));
+	}
 
 	/** Session lifetime assumed when the server sends neither expiresAt nor expiresIn. */
 	constexpr double DefaultSessionSeconds = 86400.0;
@@ -165,6 +188,9 @@ void URavensightSubsystem::Deinitialize()
 		FlushInternal(true);
 		PumpUntilIdle(RavensightProtocol::ExitFlushBudgetSeconds);
 	}
+
+	// What is still queued stays in the queue file for the next launch.
+	PersistQueueNow();
 
 	StopTimers();
 	StopHealthSampling();
@@ -333,6 +359,7 @@ void URavensightSubsystem::StartIfAllowed()
 	// anything the game tracked before Init. The settings check then decides
 	// whether it is ever sent.
 	LoadConfigCache();
+	LoadPersistedQueue();
 	QueueGameStartedOnce(true);
 
 	if (!bSettingsChecked && !bSettingsRequestPending)
@@ -392,6 +419,7 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 	if (!bEnabled)
 	{
 		Log(TEXT("tracking opted out, queue discarded"));
+		DeleteQueueFiles();
 		StopErrorCapture(true);
 		BumpQueueGeneration();
 		StopTimers();
@@ -513,6 +541,7 @@ FString URavensightSubsystem::ResetDeviceId()
 	BumpQueueGeneration();
 	Queue.Clear();
 	Queue.InvalidateSession();
+	PersistQueueNow();
 	ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
 
 	Log(TEXT("device id reset, queue discarded, next event opens a new session"));
@@ -594,6 +623,7 @@ void URavensightSubsystem::StopForRun(const FString& Reason, const FString& Sour
 	StopErrorCapture(true);
 	BumpQueueGeneration();
 	Queue.SetServerTrackingEnabled(false);
+	DeleteQueueFiles();
 	StopTimers();
 	SetStatusReason(Reason);
 
@@ -998,13 +1028,19 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		Parsed->SetStringField(TEXT("pt_tier"), TEXT("T2_driven_build"));
 	}
 
-	for (auto It = Parsed->Values.CreateIterator(); It; ++It)
+	// Exposure tags (EXPOSURE_CONTRACT.md): only the experiments exposed by
+	// a typed config read in this session that the latest config still runs.
+	// A well formed tag of the game's own is left alone.
+	if (ExposedEpoch == SessionEpoch)
 	{
-		if (FString(*It.Key()).StartsWith(TEXT("rs_exp_"))) It.RemoveCurrent();
-	}
-	for (const auto& Assignment : RemoteExperiments)
-	{
-		Parsed->SetStringField(TEXT("rs_exp_") + Assignment.Key, Assignment.Value);
+		for (const auto& Assignment : RemoteExperiments)
+		{
+			if (!ExposedKeys.Contains(Assignment.Key)) continue;
+			const FString Key = TEXT("rs_exp_") + Assignment.Key;
+			FString Own;
+			if (Parsed->TryGetStringField(Key, Own) && RavensightConfigProtocol::Name(Own, 40, true)) continue;
+			Parsed->SetStringField(Key, Assignment.Value);
+		}
 	}
 
 	// Inside the event's data, so a batch sent again after a failure carries
@@ -1012,10 +1048,19 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 	Parsed->SetStringField(EventIdKey, NextEventId());
 	DataJson = WriteJson(Parsed.ToSharedRef());
 
-	// The size the server checks: the data as JSON, in UTF-8 bytes. Bigger
-	// events are dropped here rather than refused with a 400 later.
-	const FTCHARToUTF8 Utf8Data(*DataJson);
-	if (Utf8Data.Length() > RavensightProtocol::MaxEventBytes)
+	// The size the server checks: the data as JSON, in UTF-8 bytes, with a
+	// typed error's message, stack and trail counted one byte a character.
+	// Bigger events are dropped here rather than refused with a 400 later.
+	FString Kind, Message, Stack, Trail;
+	Parsed->TryGetStringField(TEXT("rs_kind"), Kind);
+	const bool bTypedError = Kind == TEXT("error");
+	if (bTypedError)
+	{
+		Parsed->TryGetStringField(TEXT("rs_message"), Message);
+		Parsed->TryGetStringField(TEXT("rs_stack"), Stack);
+		Parsed->TryGetStringField(TEXT("rs_trail"), Trail);
+	}
+	if (RavensightDelivery::EventDataBytes(Utf8(DataJson), bTypedError, Utf8(Message), Utf8(Stack), Utf8(Trail)) > RavensightProtocol::MaxEventBytes)
 	{
 		if (bError)
 		{
@@ -1034,13 +1079,29 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 		return;
 	}
 
-	const int64 Timestamp = FDateTime::UtcNow().ToUnixTimestamp();
-	const FRavensightEvent Event(EventName, DataJson, Timestamp, bError);
+	// Unix milliseconds, set now and never at send time. The origin is the
+	// session this event belongs to; events tracked before a session opens
+	// get it when it does. Automatic captures queue behind gameplay events.
+	FRavensightEvent Event(EventName, DataJson, NowMs(), bError);
+	if (Queue.IsSessionValid(NowSeconds()))
+	{
+		Event.OriginJson = CurrentOriginJson;
+		Event.OriginSession = CurrentOriginSession;
+	}
 	const int32 Dropped = bAtFront ? Queue.EnqueueAtFront(Event) : Queue.Enqueue(Event);
 	if (Dropped > 0)
 	{
 		UE_LOG(LogRavensight, Warning,
-			TEXT("Queue is full at %d events, dropped %d oldest to make room"), Queue.GetMaxQueueSize(), Dropped);
+			TEXT("Queue is full at %d events, dropped %d to make room (errors first, then the oldest)"), Queue.GetMaxQueueSize(), Dropped);
+	}
+	// A capture may come just before the process ends: written at once.
+	if (bError)
+	{
+		PersistQueueNow();
+	}
+	else
+	{
+		PersistQueueSoon();
 	}
 
 	// track only enqueues. Sending happens on the timer, on Flush, on
@@ -1111,19 +1172,59 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 			Data = MakeShared<FJsonObject>();
 		}
 		Entry->SetObjectField(TEXT("data"), Data);
-		Entry->SetNumberField(TEXT("timestamp"), static_cast<double>(Event.TimestampUnix));
+		Entry->SetNumberField(TEXT("timestamp"), static_cast<double>(Event.TimestampMs));
+
+		// An event from an earlier session carries that session's origin,
+		// copied verbatim, so the server stores it under the run it happened in.
+		if (!Event.OriginJson.IsEmpty() && Event.OriginSession != CurrentOriginSession)
+		{
+			const TSharedPtr<FJsonObject> Origin = ParseJsonObject(Event.OriginJson);
+			if (Origin.IsValid())
+			{
+				Entry->SetObjectField(TEXT("origin"), Origin);
+			}
+		}
 
 		EventValues.Add(MakeShared<FJsonValueObject>(Entry));
 	}
 
 	const TSharedRef<FJsonObject> Body = MakeShared<FJsonObject>();
 	Body->SetArrayField(TEXT("events"), EventValues);
+	const FString BodyText = WriteJson(Body);
+	const std::string BodyUtf8 = Utf8(BodyText);
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/track/batch"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-Session-Token"), Queue.GetSessionToken());
-	Request->SetContentAsString(WriteJson(Body));
-	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleBatchResponse, Batch.Num(), QueueGeneration);
+
+	// Signed over the plain bytes, then compressed (DELIVERY_CONTRACT.md 4.3, 7).
+	if (!SigningSecret.IsEmpty())
+	{
+		const int64 Timestamp = static_cast<int64>(NowSeconds()) + SigningOffsetSeconds;
+		Request->SetHeader(TEXT("X-Ravensight-Timestamp"), FString::Printf(TEXT("%lld"), static_cast<long long>(Timestamp)));
+		Request->SetHeader(TEXT("X-Ravensight-Signature"), FromUtf8(RavensightDelivery::SignRequest(Utf8(SigningSecret), Timestamp, BodyUtf8)));
+	}
+
+	bool bCompressed = false;
+	if (!bSendPlainOnce && static_cast<int32>(BodyUtf8.size()) >= RavensightDelivery::GzipMinBytes)
+	{
+		int32 Bound = FCompression::CompressMemoryBound(NAME_Gzip, static_cast<int32>(BodyUtf8.size()));
+		TArray<uint8> Zipped;
+		Zipped.SetNumUninitialized(Bound);
+		if (FCompression::CompressMemory(NAME_Gzip, Zipped.GetData(), Bound, BodyUtf8.data(), static_cast<int32>(BodyUtf8.size())))
+		{
+			Zipped.SetNum(Bound);
+			Request->SetHeader(TEXT("Content-Encoding"), TEXT("gzip"));
+			Request->SetContent(MoveTemp(Zipped));
+			bCompressed = true;
+		}
+	}
+	if (!bCompressed)
+	{
+		Request->SetContentAsString(BodyText);
+	}
+	bSendPlainOnce = false;
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleBatchResponse, Batch.Num(), QueueGeneration, bCompressed);
 
 	if (!RavensightTransport::Send(Request))
 	{
@@ -1134,7 +1235,7 @@ void URavensightSubsystem::SendBatch(const TArray<FRavensightEvent>& Batch)
 	}
 }
 
-void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation)
+void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 BatchSize, int32 Generation, bool bCompressed)
 {
 	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
 	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
@@ -1158,8 +1259,18 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 		++ConsecutiveBatchUnauthorized;
 	}
 
+	int32 RefusedIndex = -1;
+	if (Code == 400)
+	{
+		const TSharedPtr<FJsonObject> Parsed = ParseJsonObject(Body);
+		double IndexValue = -1.0;
+		if (Parsed.IsValid() && Parsed->TryGetNumberField(TEXT("index"), IndexValue) && IndexValue >= 0.0 && FMath::FloorToDouble(IndexValue) == IndexValue)
+		{
+			RefusedIndex = static_cast<int32>(IndexValue);
+		}
+	}
 	const FRavensightResponseVerdict Verdict = Classify(
-		ERavensightEndpoint::Batch, Response, bConnectedSuccessfully, BatchSize, ConsecutiveBatchUnauthorized);
+		ERavensightEndpoint::Batch, Response, bConnectedSuccessfully, BatchSize, ConsecutiveBatchUnauthorized, RefusedIndex, bCompressed);
 
 	const FString FailReason = bAnswered ? ExtractError(Body, FString::Printf(TEXT("http_%d"), Code)) : FString(TEXT("unreachable"));
 
@@ -1167,6 +1278,8 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 	{
 	case ERavensightResponseAction::Accept:
 		Queue.OnBatchAccepted(BatchSize);
+		// The removal is stored before anything else happens.
+		PersistQueueNow();
 		BatchLimit = RavensightLimits::MaxBatchSize;
 		ConsecutiveBatchUnauthorized = 0;
 		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
@@ -1191,14 +1304,53 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 
 	case ERavensightResponseAction::HalveBatch:
 		BatchLimit = FMath::Max(1, BatchSize / 2);
-		Log(FString::Printf(TEXT("batch of %d refused with HTTP 400, retrying at %d"), BatchSize, BatchLimit));
+		Log(FString::Printf(TEXT("batch of %d refused as too large (HTTP %d), retrying at %d"), BatchSize, Code, BatchLimit));
 		FlushInternal(false);
+		return;
+
+	case ERavensightResponseAction::DropIndex:
+	case ERavensightResponseAction::DropBatch:
+		// The server named one event, or the whole request, as never acceptable.
+		if (Verdict.Action == ERavensightResponseAction::DropIndex)
+		{
+			Queue.DropAt(RefusedIndex, 1);
+		}
+		else
+		{
+			Queue.DropHead(BatchSize);
+		}
+		PersistQueueNow();
+		BatchLimit = RavensightLimits::MaxBatchSize;
+		if (!bDroppedEventLogged)
+		{
+			bDroppedEventLogged = true;
+			UE_LOG(LogRavensight, Warning,
+				TEXT("Dropped events the server refused (HTTP %d, %s). Further drops are counted in GetQueue().GetStats() without a log line."),
+				Code, *FailReason);
+		}
+		OnFlushFailed.Broadcast(FailReason);
+		FlushInternal(false);
+		return;
+
+	case ERavensightResponseAction::ResendPlain:
+		bSendPlainOnce = true;
+		FlushInternal(false);
+		return;
+
+	case ERavensightResponseAction::StopUntilNextLaunch:
+		// Keep the events, stored, and send nothing more until the next launch.
+		Queue.SetSendBlocked(true);
+		PersistQueueNow();
+		SetStatusReason(Verdict.Reason);
+		UE_LOG(LogRavensight, Warning, TEXT("The server refused a batch (%s). Events are kept and sent on the next launch."), *FailReason);
+		OnFlushFailed.Broadcast(FailReason);
 		return;
 
 	case ERavensightResponseAction::DropHead:
 		// One event the server will never accept. Drop it so the rest of the
 		// queue is not blocked behind it for the whole run.
 		Queue.DropHead(1);
+		PersistQueueNow();
 		BatchLimit = RavensightLimits::MaxBatchSize;
 		if (!bDroppedEventLogged)
 		{
@@ -1226,6 +1378,8 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 
 	case ERavensightResponseAction::WaitRetryAfter:
 		Queue.OnRateLimited(Now, ParseRetryAfterSeconds(Response));
+		// The events wait: make sure the file has every one of them.
+		PersistQueueNow();
 		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		UE_LOG(LogRavensight, Warning, TEXT("track/batch refused for now (%s), retrying in %.0fs"),
 			*FailReason, Queue.SecondsUntilNextAttempt(Now));
@@ -1242,6 +1396,8 @@ void URavensightSubsystem::HandleBatchResponse(FHttpRequestPtr Request, FHttpRes
 		}
 		Log(FString::Printf(TEXT("batch flush failed (HTTP %d), will retry"), Code));
 		Queue.OnTransportFailure(Now);
+		// The events wait: make sure the file has every one of them.
+		PersistQueueNow();
 		SetStatusReason(RavensightProtocol::NextStatusReason(StatusReason, Verdict));
 		OnFlushFailed.Broadcast(FailReason);
 		ScheduleRetry();
@@ -1387,6 +1543,11 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 		Body->SetStringField(TEXT("distribution"), Distribution);
 	}
 	Body->SetStringField(TEXT("sdk"), RavensightVersion::SdkTag());
+	const TSharedRef<FJsonObject> Device = DeviceFields();
+	if (Device->Values.Num() > 0)
+	{
+		Body->SetObjectField(TEXT("device"), Device);
+	}
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/session"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
@@ -1457,6 +1618,7 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			}
 
 			Queue.SetSession(Token, ExpiresAt);
+			AdoptSessionAnswer(Parsed);
 
 			// After batch 401s past the re open cap the ladder keeps climbing:
 			// only a 202 resets it then.
@@ -1782,6 +1944,10 @@ void URavensightSubsystem::ScheduleRetry()
 
 void URavensightSubsystem::OnFlushTimer()
 {
+	if (bQueueDirty)
+	{
+		PersistQueueNow();
+	}
 	FlushInternal(false);
 }
 
@@ -1915,6 +2081,9 @@ void URavensightSubsystem::OnApplicationEnteredForeground()
 			}
 
 			Queue.InvalidateSession();
+			// A new analytics session starts now: exposure starts over.
+			++SessionEpoch;
+			bSessionBreakCounted = true;
 			Lifecycle.ResetForNewSession();
 			HealthSampler.ResetForNewSession();
 			ErrorPipeline.ResetForNewSession(FPlatformTime::Seconds());
@@ -1957,7 +2126,9 @@ void URavensightSubsystem::WriteBackgroundMarker()
 	GConfig->SetString(SaveSection, MarkerTokenKey, *Token, GGameUserSettingsIni);
 	GConfig->SetString(SaveSection, MarkerExpiresAtKey, *FString::Printf(TEXT("%.0f"), Queue.GetSessionExpiresAt()), GGameUserSettingsIni);
 	GConfig->SetString(SaveSection, MarkerBackgroundedAtKey, *FString::Printf(TEXT("%.0f"), BackgroundedAtSeconds), GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerOriginKey, *CurrentOriginJson, GGameUserSettingsIni);
 	GConfig->Flush(false, GGameUserSettingsIni);
+	PersistQueueNow();
 }
 
 void URavensightSubsystem::DeleteBackgroundMarker()
@@ -1977,6 +2148,7 @@ void URavensightSubsystem::DeleteBackgroundMarker()
 	GConfig->SetString(SaveSection, MarkerTokenKey, TEXT(""), GGameUserSettingsIni);
 	GConfig->SetString(SaveSection, MarkerExpiresAtKey, TEXT(""), GGameUserSettingsIni);
 	GConfig->SetString(SaveSection, MarkerBackgroundedAtKey, TEXT(""), GGameUserSettingsIni);
+	GConfig->SetString(SaveSection, MarkerOriginKey, TEXT(""), GGameUserSettingsIni);
 	GConfig->Flush(false, GGameUserSettingsIni);
 }
 
@@ -2010,6 +2182,25 @@ void URavensightSubsystem::ReportMarkerExitFromLastRun()
 	{
 		SendExitUnderToken(Token, BackgroundedAt);
 	}
+	else if (bTrackLifecycleEvents && BackgroundedAt > 0.0 && Queue.IsLocallyEnabled())
+	{
+		// The old session has expired: queue its exit under its origin, so the
+		// server still stores it under the run that ended.
+		FString OriginJson;
+		GConfig->GetString(SaveSection, MarkerOriginKey, OriginJson, GGameUserSettingsIni);
+		const TSharedPtr<FJsonObject> Origin = OriginJson.IsEmpty() ? nullptr : ParseJsonObject(OriginJson);
+		FString OriginSession;
+		if (Origin.IsValid() && Origin->TryGetStringField(TEXT("session"), OriginSession))
+		{
+			const TSharedRef<FJsonObject> ExitData = MakeShared<FJsonObject>();
+			ExitData->SetStringField(EventIdKey, NextEventId());
+			FRavensightEvent Exit(TEXT("game_exited"), WriteJson(ExitData), static_cast<int64>(BackgroundedAt) * 1000);
+			Exit.OriginJson = OriginJson;
+			Exit.OriginSession = OriginSession;
+			Queue.Enqueue(Exit);
+			PersistQueueNow();
+		}
+	}
 
 	DeleteBackgroundMarker();
 }
@@ -2021,7 +2212,7 @@ void URavensightSubsystem::SendExitUnderToken(const FString& Token, double Exite
 	const TSharedRef<FJsonObject> ExitData = MakeShared<FJsonObject>();
 	ExitData->SetStringField(EventIdKey, NextEventId());
 	Entry->SetObjectField(TEXT("data"), ExitData);
-	Entry->SetNumberField(TEXT("timestamp"), FMath::FloorToDouble(ExitedAtSeconds));
+	Entry->SetNumberField(TEXT("timestamp"), FMath::FloorToDouble(ExitedAtSeconds) * 1000.0);
 
 	TArray<TSharedPtr<FJsonValue>> EventValues;
 	EventValues.Add(MakeShared<FJsonValueObject>(Entry));
@@ -2108,12 +2299,16 @@ FRavensightResponseVerdict URavensightSubsystem::Classify(
 	const FHttpResponsePtr& Response,
 	bool bConnectedSuccessfully,
 	int32 BatchSize,
-	int32 InConsecutiveBatchUnauthorized)
+	int32 InConsecutiveBatchUnauthorized,
+	int32 RefusedIndex,
+	bool bCompressed)
 {
 	FRavensightResponseInput Input;
 	Input.Endpoint = Endpoint;
 	Input.BatchSize = BatchSize;
 	Input.ConsecutiveBatchUnauthorized = InConsecutiveBatchUnauthorized;
+	Input.Index = RefusedIndex;
+	Input.bCompressed = bCompressed;
 
 	if (bConnectedSuccessfully && Response.IsValid())
 	{
@@ -2383,18 +2578,22 @@ TSharedPtr<FJsonValue> URavensightSubsystem::ConfigValue(const FString& Key) con
 }
 bool URavensightSubsystem::GetConfigBool(const FString& Key, bool Fallback) const
 {
+	MarkExposed();
 	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::Boolean ? Value->AsBool() : Fallback;
 }
 double URavensightSubsystem::GetConfigNumber(const FString& Key, double Fallback) const
 {
+	MarkExposed();
 	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::Number ? Value->AsNumber() : Fallback;
 }
 FString URavensightSubsystem::GetConfigString(const FString& Key, const FString& Fallback) const
 {
+	MarkExposed();
 	const auto Value = ConfigValue(Key); return Value.IsValid() && Value->Type == EJson::String ? Value->AsString() : Fallback;
 }
 FString URavensightSubsystem::GetConfigJson(const FString& Key, const FString& Fallback) const
 {
+	MarkExposed();
 	const auto Value = ConfigValue(Key); return Value.IsValid() && (Value->Type == EJson::Object || Value->Type == EJson::Array) ? ConfigJson(Value) : Fallback;
 }
 
@@ -2509,4 +2708,430 @@ void URavensightSubsystem::SendReportStep(const FString& Handle, const TSharedPt
         Body->TryGetStringField(TEXT("reportId"), ReportId); Report->bBusy = false; OnReportResult.Broadcast(Handle, Status, ReportId, TEXT(""));
     });
     if (!RavensightTransport::Send(Request)) { Report->bBusy = false; OnReportResult.Broadcast(Handle, TEXT(""), TEXT(""), TEXT("request_not_started")); }
+}
+
+// --- Persisted queue, origin and signing (DELIVERY_CONTRACT.md) -------------
+
+int64 URavensightSubsystem::NowMs()
+{
+	const FDateTime Now = FDateTime::UtcNow();
+	return Now.ToUnixTimestamp() * 1000 + Now.GetMillisecond();
+}
+
+FString URavensightSubsystem::QueueFilePath() const
+{
+	if (IngestKey.IsEmpty())
+	{
+		return FString();
+	}
+	return FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Ravensight"),
+		TEXT("queue-") + FromUtf8(RavensightDelivery::QueueKeyHash(Utf8(IngestKey))) + TEXT(".json"));
+}
+
+RavensightQueueFile::FOps URavensightSubsystem::QueueFileOps() const
+{
+	RavensightQueueFile::FOps Ops;
+	Ops.Save = [](const std::string& Path, const std::string& Text)
+	{
+		return FFileHelper::SaveArrayToFile(TArrayView<const uint8>(reinterpret_cast<const uint8*>(Text.data()), static_cast<int32>(Text.size())), *FromUtf8(Path));
+	};
+	Ops.Move = [](const std::string& To, const std::string& From)
+	{
+		return IFileManager::Get().Move(*FromUtf8(To), *FromUtf8(From), true, true);
+	};
+	Ops.Remove = [](const std::string& Path)
+	{
+		IFileManager::Get().Delete(*FromUtf8(Path), false, true, true);
+	};
+	Ops.Exclude = [](const std::string& Path)
+	{
+		return RavensightBackupExclusion::Exclude(FromUtf8(Path));
+	};
+	Ops.Warn = [this](const char* Message)
+	{
+		// Once a run; the message carries no path and no queue contents.
+		if (!bBackupWarned)
+		{
+			bBackupWarned = true;
+			UE_LOG(LogRavensight, Warning, TEXT("%s"), UTF8_TO_TCHAR(Message));
+		}
+	};
+	return Ops;
+}
+
+void URavensightSubsystem::DeleteQueueFiles() const
+{
+	const FString Path = QueueFilePath();
+	if (!Path.IsEmpty())
+	{
+		RavensightQueueFile::RemoveAll(QueueFileOps(), Utf8(Path));
+	}
+}
+
+bool URavensightSubsystem::QueueFileAllowed() const
+{
+	// Never for a Playtest run (nothing is persisted), never before an opt-in
+	// yes or after an opt-out, never while inert.
+	return bInitialized && !bNoKey && !IsPlaytest() && !DeviceId.IsEmpty() && Queue.IsLocallyEnabled() && !IngestKey.IsEmpty();
+}
+
+void URavensightSubsystem::LoadPersistedQueue()
+{
+	if (bQueueLoaded || !QueueFileAllowed())
+	{
+		return;
+	}
+	bQueueLoaded = true;
+
+	const FString Path = QueueFilePath();
+	if (!Path.IsEmpty())
+	{
+		// Files written by older versions get the backup exclusion too.
+		const FString Directory = FPaths::GetPath(Path);
+		IFileManager::Get().MakeDirectory(*Directory, true);
+		RavensightQueueFile::ExcludeExisting(QueueFileOps(), Utf8(Directory), Utf8(Path), IFileManager::Get().FileExists(*Path));
+	}
+	FString Text;
+	if (Path.IsEmpty() || !FFileHelper::LoadFileToString(Text, *Path))
+	{
+		return;
+	}
+
+	// A missing, unreadable, malformed or unknown version file is an empty queue.
+	const TSharedPtr<FJsonObject> Root = ParseJsonObject(Text);
+	double Version = 0.0;
+	const TArray<TSharedPtr<FJsonValue>>* Groups = nullptr;
+	if (!Root.IsValid() || !Root->TryGetNumberField(TEXT("version"), Version) || (Version != 1.0 && Version != 2.0)
+		|| !Root->TryGetArrayField(TEXT("groups"), Groups) || !Groups)
+	{
+		return;
+	}
+
+	const int64 Now = NowMs();
+	TArray<FRavensightEvent> Restored;
+	int32 Expired = 0;
+	for (const TSharedPtr<FJsonValue>& GroupValue : *Groups)
+	{
+		const TSharedPtr<FJsonObject> Group = GroupValue.IsValid() && GroupValue->Type == EJson::Object ? GroupValue->AsObject() : nullptr;
+		const TArray<TSharedPtr<FJsonValue>>* GroupEvents = nullptr;
+		if (!Group.IsValid() || !Group->TryGetArrayField(TEXT("events"), GroupEvents) || !GroupEvents)
+		{
+			continue;
+		}
+		FString OriginJson;
+		FString OriginSession;
+		const TSharedPtr<FJsonObject>* Origin = nullptr;
+		if (Version == 2.0 && Group->TryGetObjectField(TEXT("origin"), Origin) && Origin && Origin->IsValid()
+			&& (*Origin)->TryGetStringField(TEXT("session"), OriginSession))
+		{
+			OriginJson = WriteJson(Origin->ToSharedRef());
+		}
+		for (const TSharedPtr<FJsonValue>& EventValue : *GroupEvents)
+		{
+			const TSharedPtr<FJsonObject> Entry = EventValue.IsValid() && EventValue->Type == EJson::Object ? EventValue->AsObject() : nullptr;
+			FString Name;
+			double Stamp = 0.0;
+			if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("event"), Name) || Name.IsEmpty()
+				|| !Entry->TryGetNumberField(TEXT("timestamp"), Stamp) || Stamp <= 0.0)
+			{
+				continue;
+			}
+			int64 Timestamp = static_cast<int64>(Stamp);
+			if (Timestamp < 100000000000LL)
+			{
+				Timestamp *= 1000;
+			}
+			if (Now - Timestamp > RavensightDelivery::MaxQueueAgeMs)
+			{
+				++Expired;
+				continue;
+			}
+			const TSharedPtr<FJsonObject>* Data = nullptr;
+			const TSharedRef<FJsonObject> DataObject = Entry->TryGetObjectField(TEXT("data"), Data) && Data && Data->IsValid()
+				? Data->ToSharedRef() : MakeShared<FJsonObject>();
+			bool bCaptured = false;
+			Entry->TryGetBoolField(TEXT("auto"), bCaptured);
+			// A trail never comes back from the file, even from an older one.
+			DataObject->RemoveField(TEXT("rs_trail"));
+			FRavensightEvent Event(Name, WriteJson(DataObject), Timestamp, bCaptured);
+			Event.OriginJson = OriginJson;
+			Event.OriginSession = OriginSession;
+			Restored.Add(Event);
+		}
+	}
+
+	if (Restored.Num() > RavensightDelivery::MaxPersistedEvents)
+	{
+		Restored.RemoveAt(0, Restored.Num() - RavensightDelivery::MaxPersistedEvents);
+	}
+	const int32 Count = Queue.Restore(Restored);
+	Log(FString::Printf(TEXT("restored %d queued events from the last run (%d older than 89 days dropped)"), Count, Expired));
+}
+
+void URavensightSubsystem::PersistQueueSoon()
+{
+	if (NowSeconds() - LastQueueWriteSeconds >= QueueWriteIntervalSeconds)
+	{
+		PersistQueueNow();
+	}
+	else
+	{
+		bQueueDirty = true;
+	}
+}
+
+void URavensightSubsystem::PersistQueueNow()
+{
+	bQueueDirty = false;
+	LastQueueWriteSeconds = NowSeconds();
+	const FString Path = QueueFilePath();
+	if (Path.IsEmpty())
+	{
+		return;
+	}
+	if (!QueueFileAllowed())
+	{
+		// Opted out, before a yes, or the identity forgotten: nothing stays on disk.
+		DeleteQueueFiles();
+		return;
+	}
+
+	const TArray<FRavensightEvent>& Events = Queue.GetEvents();
+	if (Events.Num() == 0)
+	{
+		DeleteQueueFiles();
+		return;
+	}
+
+	// Version 2: groups of events by the session they were queued under, each
+	// with that session's origin exactly as received. Never the session token
+	// or the signing secret.
+	FString Text = TEXT("{\"version\":2,\"groups\":[");
+	FString GroupSession;
+	bool bFirstGroup = true;
+	bool bFirstEvent = true;
+	const int32 Start = FMath::Max(0, Events.Num() - RavensightDelivery::MaxPersistedEvents);
+	for (int32 Index = Start; Index < Events.Num(); ++Index)
+	{
+		const FRavensightEvent& Event = Events[Index];
+		if (bFirstGroup || Event.OriginSession != GroupSession)
+		{
+			if (!bFirstGroup)
+			{
+				Text += TEXT("]},");
+			}
+			Text += TEXT("{");
+			if (!Event.OriginJson.IsEmpty())
+			{
+				Text += TEXT("\"origin\":") + Event.OriginJson + TEXT(",");
+			}
+			Text += TEXT("\"events\":[");
+			GroupSession = Event.OriginSession;
+			bFirstGroup = false;
+			bFirstEvent = true;
+		}
+		if (!bFirstEvent)
+		{
+			Text += TEXT(",");
+		}
+		bFirstEvent = false;
+		// A trail is never written to the queue file: it stays in memory only.
+		FString DataText = Event.DataJson.IsEmpty() ? FString(TEXT("{}")) : Event.DataJson;
+		if (DataText.Contains(TEXT("\"rs_trail\"")))
+		{
+			const TSharedPtr<FJsonObject> Data = ParseJsonObject(DataText);
+			if (Data.IsValid())
+			{
+				Data->RemoveField(TEXT("rs_trail"));
+				DataText = WriteJson(Data.ToSharedRef());
+			}
+		}
+		Text += TEXT("{\"event\":") + FromUtf8(RavensightDelivery::JsonString(Utf8(Event.EventName)))
+			+ FString::Printf(TEXT(",\"timestamp\":%lld,\"data\":"), static_cast<long long>(Event.TimestampMs))
+			+ DataText
+			+ (Event.bError ? TEXT(",\"auto\":true}") : TEXT("}"));
+	}
+	Text += TEXT("]}]}");
+
+	// Written beside the old file, marked excluded from backups, then moved
+	// over it, so a partial write never replaces a good one and nothing
+	// reaches a backup (RavensightQueueFile::Write).
+	IFileManager::Get().MakeDirectory(*FPaths::GetPath(Path), true);
+	RavensightQueueFile::Write(QueueFileOps(), Utf8(Path), Utf8(Text));
+}
+
+void URavensightSubsystem::AdoptSessionAnswer(const TSharedPtr<FJsonObject>& Parsed)
+{
+	CurrentOriginJson.Reset();
+	CurrentOriginSession.Reset();
+	SigningSecret.Reset();
+	SigningOffsetSeconds = 0;
+	if (!Parsed.IsValid())
+	{
+		return;
+	}
+
+	const TSharedPtr<FJsonObject>* Origin = nullptr;
+	FString Session;
+	if (Parsed->TryGetObjectField(TEXT("origin"), Origin) && Origin && Origin->IsValid() && (*Origin)->TryGetStringField(TEXT("session"), Session))
+	{
+		CurrentOriginJson = WriteJson(Origin->ToSharedRef());
+		CurrentOriginSession = Session;
+	}
+
+	// Memory only: the secret is never written to the queue file or a log.
+	const TSharedPtr<FJsonObject>* Signing = nullptr;
+	FString Secret;
+	if (Parsed->TryGetObjectField(TEXT("signing"), Signing) && Signing && Signing->IsValid() && (*Signing)->TryGetStringField(TEXT("secret"), Secret))
+	{
+		SigningSecret = Secret;
+		double ServerTime = 0.0;
+		if ((*Signing)->TryGetNumberField(TEXT("serverTime"), ServerTime))
+		{
+			SigningOffsetSeconds = static_cast<int64>(FMath::RoundToDouble(ServerTime - NowSeconds()));
+		}
+	}
+
+	if (SessionsOpened > 0 && !bSessionBreakCounted)
+	{
+		++SessionEpoch;
+	}
+	bSessionBreakCounted = false;
+	++SessionsOpened;
+
+	Queue.StampOrigins(CurrentOriginJson, CurrentOriginSession);
+	PersistQueueSoon();
+}
+
+TSharedRef<FJsonObject> URavensightSubsystem::DeviceFields() const
+{
+	// Only what the engine reports without a permission prompt; none is a
+	// hardware identifier.
+	const TSharedRef<FJsonObject> Device = MakeShared<FJsonObject>();
+	const std::string Model = RavensightDelivery::DeviceField(Utf8(FPlatformMisc::GetDeviceMakeAndModel()));
+	const std::string OsVersion = RavensightDelivery::OsVersionFrom(Utf8(FPlatformMisc::GetOSVersion()));
+	const std::string Gpu = RavensightDelivery::DeviceField(Utf8(GRHIAdapterName));
+	if (!Model.empty()) Device->SetStringField(TEXT("model"), FromUtf8(Model));
+	if (!OsVersion.empty()) Device->SetStringField(TEXT("osVersion"), FromUtf8(OsVersion));
+	if (!Gpu.empty()) Device->SetStringField(TEXT("gpu"), FromUtf8(Gpu));
+	return Device;
+}
+
+// --- Experiment exposure (EXPOSURE_CONTRACT.md) -------------------------------
+
+void URavensightSubsystem::MarkExposed() const
+{
+	if (!Queue.IsActive() || bStoppedForRun || bKeyRefused || RemoteExperiments.Num() == 0)
+	{
+		return;
+	}
+	if (ExposedEpoch != SessionEpoch)
+	{
+		ExposedEpoch = SessionEpoch;
+		ExposedKeys.Reset();
+	}
+	bool bAdded = false;
+	for (const auto& Assignment : RemoteExperiments)
+	{
+		if (!ExposedKeys.Contains(Assignment.Key))
+		{
+			ExposedKeys.Add(Assignment.Key);
+			bAdded = true;
+		}
+	}
+	if (bAdded)
+	{
+		// A read is const to callers; sending the one exposure event is the
+		// only state it changes beyond the exposure set.
+		const_cast<URavensightSubsystem*>(this)->EnqueueEvent(TEXT("rs_exposure"), FString(), false);
+	}
+}
+
+// --- Ads and attribution (ADS_ATTRIBUTION_CONTRACT.md) ------------------------
+
+bool URavensightSubsystem::TrackAd(const FString& Network, const FString& Format, const FString& Result,
+	const FString& Placement, const FString& RevenueMicros, const FString& Currency)
+{
+	const std::string Problem = RavensightDelivery::AdProblem(Utf8(Network), Utf8(Format), Utf8(Result),
+		Utf8(Placement), Utf8(RevenueMicros), Utf8(Currency));
+	if (!Problem.empty())
+	{
+		Log(TEXT("ad event not sent: ") + FromUtf8(Problem));
+		return false;
+	}
+	if (!Queue.IsActive() || bStoppedForRun || bNoKey)
+	{
+		return false;
+	}
+	const TSharedRef<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("rs_kind"), TEXT("ad"));
+	Data->SetStringField(TEXT("rs_ad_network"), Network);
+	Data->SetStringField(TEXT("rs_ad_format"), Format);
+	if (!Placement.IsEmpty()) Data->SetStringField(TEXT("rs_ad_placement"), Placement);
+	Data->SetStringField(TEXT("rs_ad_result"), Result);
+	if (!RevenueMicros.IsEmpty())
+	{
+		Data->SetStringField(TEXT("rs_revenue_micros"), RevenueMicros);
+		Data->SetStringField(TEXT("rs_currency"), Currency.ToUpper());
+	}
+	EnqueueEvent(TEXT("rs_ad"), WriteJson(Data), false);
+	return true;
+}
+
+bool URavensightSubsystem::TrackAdRevenue(const FString& Network, const FString& Format, const FString& Placement,
+	const FString& RevenueMicros, const FString& Currency)
+{
+	return TrackAd(Network, Format, TEXT("shown"), Placement, RevenueMicros, Currency);
+}
+
+bool URavensightSubsystem::TrackAdRevenueFromMediation(const FString& Network, const FString& FormatName, const FString& Placement,
+	double Revenue, const FString& Currency)
+{
+	const std::string Micros = RavensightDelivery::MicrosFromRevenue(Revenue);
+	if (Micros.empty())
+	{
+		return false;
+	}
+	return TrackAdRevenue(Network, FromUtf8(RavensightDelivery::AdFormatFrom(Utf8(FormatName))), Placement, FromUtf8(Micros), Currency);
+}
+
+bool URavensightSubsystem::SetAttribution(const FString& Source, const FString& Network, const FString& Campaign,
+	const FString& Adset, const FString& Creative, int64 TouchTimeMs)
+{
+	if (!Queue.IsActive() || bStoppedForRun || bNoKey || DeviceId.IsEmpty())
+	{
+		return false;
+	}
+	const std::string Problem = RavensightDelivery::AttributionProblem(Utf8(Source), Utf8(Network), Utf8(Campaign),
+		Utf8(Adset), Utf8(Creative), TouchTimeMs);
+	if (!Problem.empty())
+	{
+		Log(TEXT("attribution not sent: ") + FromUtf8(Problem));
+		return false;
+	}
+	FString SentFor;
+	if (!IsPlaytest() && GConfig && GConfig->GetString(SaveSection, AttributionSentKey, SentFor, GGameUserSettingsIni) && SentFor == DeviceId)
+	{
+		return false;
+	}
+	const TSharedRef<FJsonObject> Data = MakeShared<FJsonObject>();
+	Data->SetStringField(TEXT("rs_kind"), TEXT("attribution"));
+	Data->SetStringField(TEXT("rs_attr_source"), Source);
+	if (!Network.IsEmpty()) Data->SetStringField(TEXT("rs_attr_network"), Network);
+	if (!Campaign.IsEmpty()) Data->SetStringField(TEXT("rs_campaign"), Campaign);
+	if (!Adset.IsEmpty()) Data->SetStringField(TEXT("rs_adset"), Adset);
+	if (!Creative.IsEmpty()) Data->SetStringField(TEXT("rs_creative"), Creative);
+	if (TouchTimeMs > 0) Data->SetNumberField(TEXT("rs_touch_time"), static_cast<double>(TouchTimeMs));
+	const int32 Before = Queue.Num();
+	EnqueueEvent(TEXT("rs_attribution"), WriteJson(Data), false);
+	if (Queue.Num() == Before)
+	{
+		return false;
+	}
+	if (!IsPlaytest() && GConfig)
+	{
+		GConfig->SetString(SaveSection, AttributionSentKey, *DeviceId, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	return true;
 }
