@@ -1049,17 +1049,18 @@ void URavensightSubsystem::EnqueueEvent(const FString& EventName, const FString&
 	DataJson = WriteJson(Parsed.ToSharedRef());
 
 	// The size the server checks: the data as JSON, in UTF-8 bytes, with a
-	// typed error's message and stack counted one byte a character. Bigger
-	// events are dropped here rather than refused with a 400 later.
-	FString Kind, Message, Stack;
+	// typed error's message, stack and trail counted one byte a character.
+	// Bigger events are dropped here rather than refused with a 400 later.
+	FString Kind, Message, Stack, Trail;
 	Parsed->TryGetStringField(TEXT("rs_kind"), Kind);
 	const bool bTypedError = Kind == TEXT("error");
 	if (bTypedError)
 	{
 		Parsed->TryGetStringField(TEXT("rs_message"), Message);
 		Parsed->TryGetStringField(TEXT("rs_stack"), Stack);
+		Parsed->TryGetStringField(TEXT("rs_trail"), Trail);
 	}
-	if (RavensightDelivery::EventDataBytes(Utf8(DataJson), bTypedError, Utf8(Message), Utf8(Stack)) > RavensightProtocol::MaxEventBytes)
+	if (RavensightDelivery::EventDataBytes(Utf8(DataJson), bTypedError, Utf8(Message), Utf8(Stack), Utf8(Trail)) > RavensightProtocol::MaxEventBytes)
 	{
 		if (bError)
 		{

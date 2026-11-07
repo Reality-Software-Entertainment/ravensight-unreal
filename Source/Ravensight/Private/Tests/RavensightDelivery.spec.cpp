@@ -23,17 +23,21 @@ namespace RavensightDeliverySpecVectors
 	}
 
 	/** A typed error's data as the SDK writes it, with an optional extra key. */
-	std::string ErrorData(const std::string& Message, const std::string& Stack, const std::string& Context = std::string())
+	std::string ErrorData(const std::string& Message, const std::string& Stack, const std::string& Context = std::string(),
+		const std::string& Trail = std::string())
 	{
 		std::string Json = R"J({"rs_kind":"error","rs_severity":"error","rs_message":)J" + RavensightDelivery::JsonString(Message)
 			+ R"J(,"rs_stack":)J" + RavensightDelivery::JsonString(Stack);
 		if (!Context.empty()) Json += R"J(,"context":)J" + RavensightDelivery::JsonString(Context);
+		if (!Trail.empty()) Json += R"J(,"rs_trail":)J" + RavensightDelivery::JsonString(Trail);
 		return Json + "}";
 	}
 
-	bool Fits(const std::string& Message, const std::string& Stack, const std::string& Context = std::string())
+	bool Fits(const std::string& Message, const std::string& Stack, const std::string& Context = std::string(),
+		const std::string& Trail = std::string())
 	{
-		return RavensightDelivery::EventDataBytes(ErrorData(Message, Stack, Context), true, Message, Stack) <= RavensightDelivery::MaxEventBytes;
+		return RavensightDelivery::EventDataBytes(ErrorData(Message, Stack, Context, Trail), true, Message, Stack, Trail)
+			<= RavensightDelivery::MaxEventBytes;
 	}
 }
 
@@ -78,6 +82,8 @@ void FRavensightDeliverySpec::Define()
 				RavensightDelivery::EventDataBytes(Plain, false, std::string(), std::string()) <= RavensightDelivery::MaxEventBytes);
 			TestFalse(TEXT("the rest of the data counts in full"), Fits("boom", Repeat("s", 2000), Repeat(Control, 1100)));
 			TestFalse(TEXT("a stack past 2,000 characters counts in bytes"), Fits("boom", Repeat(Control, 2001)));
+			TestTrue(TEXT("1,500 control characters of trail fit too"),
+				Fits("boom", Repeat(Control, 2000), std::string(), Repeat(Control, 1500)));
 		});
 
 		It("names the queue file by 64-bit FNV-1a", [this]()

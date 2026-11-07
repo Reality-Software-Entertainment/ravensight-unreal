@@ -22,6 +22,7 @@ namespace RavensightDelivery
 	/** Typed error text caps the server exempts from the byte ceiling. */
 	inline constexpr int MaxMessageChars = 200;
 	inline constexpr int MaxStackChars = 2000;
+	inline constexpr int MaxTrailChars = 1500;
 
 	/** Device fields are cut to this many characters. */
 	inline constexpr int MaxDeviceField = 128;
@@ -48,17 +49,18 @@ namespace RavensightDelivery
 	int Utf16Length(const std::string& Utf8);
 
 	/**
-	 * How many bytes a typed error's message or stack, within its cap, takes
+	 * How many bytes a typed error's message, stack or trail, within its cap, takes
 	 * as JSON beyond one byte a character. EventDataBytes subtracts it.
 	 */
 	int ExemptOverheadBytes(const std::string& Utf8Value, int CapChars);
 
 	/**
 	 * One event's data size as the server measures it: the UTF-8 bytes of its
-	 * JSON, less the overhead of a typed error's message and stack when the
-	 * event is a typed error (pass empty text otherwise).
+	 * JSON, less the overhead of a typed error's message, stack and trail when
+	 * the event is a typed error (pass empty text otherwise).
 	 */
-	int EventDataBytes(const std::string& DataJsonUtf8, bool bTypedError, const std::string& Message, const std::string& Stack);
+	int EventDataBytes(const std::string& DataJsonUtf8, bool bTypedError, const std::string& Message, const std::string& Stack,
+		const std::string& Trail = std::string());
 
 	/** "0.0015" is "1500": whole micros on the decimal digits, half up past six decimals. Empty when invalid. */
 	std::string MicrosFromDecimalString(const std::string& Text);

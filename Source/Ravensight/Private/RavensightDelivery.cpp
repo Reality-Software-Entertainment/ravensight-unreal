@@ -225,13 +225,15 @@ namespace RavensightDelivery
 		return static_cast<int>(JsonString(Utf8Value).size()) - Chars;
 	}
 
-	int EventDataBytes(const std::string& DataJsonUtf8, bool bTypedError, const std::string& Message, const std::string& Stack)
+	int EventDataBytes(const std::string& DataJsonUtf8, bool bTypedError, const std::string& Message, const std::string& Stack,
+		const std::string& Trail)
 	{
 		int Bytes = static_cast<int>(DataJsonUtf8.size());
 		if (bTypedError)
 		{
 			if (!Message.empty()) Bytes -= ExemptOverheadBytes(Message, MaxMessageChars);
 			if (!Stack.empty()) Bytes -= ExemptOverheadBytes(Stack, MaxStackChars);
+			if (!Trail.empty()) Bytes -= ExemptOverheadBytes(Trail, MaxTrailChars);
 		}
 		return Bytes;
 	}
