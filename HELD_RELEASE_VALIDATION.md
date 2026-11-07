@@ -42,8 +42,13 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live S3 test.
 - No remote writes, publication or deployment. Live S3/device/game capture checks remain held.
 
-## Unreleased: delivery, ads and attribution, exposure and device fields (November 6, 2026)
+## 0.5.0: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
+- Release 0.5.0, with the 8 KB check counting a typed error's trail one byte a
+  character: Unreal Engine 5.8.3 Mac Development editor target built with
+  `-WarningsAsErrors`; full `Ravensight` automation run **193 passed** (180
+  clean, 13 with expected warnings), 0 failed, 0 not run; host check **150
+  cases passed**. The iOS exclusion is still compiled only by an iOS build.
 - After the backup and temporary file hardening (exclusion before the move,
   checked with one retry, temporary file removed on failure and on every delete,
   folder and older files excluded at load): host check **150 cases passed**; full
