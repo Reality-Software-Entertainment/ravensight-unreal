@@ -2,11 +2,12 @@
 
 All notable changes to this plugin are documented here.
 
-## Unreleased
+## [0.5.0] - 2026-11-06
 
 Follows the platform's SDK delivery, ads and attribution, exposure and device
-contracts. The server releases for these contracts ship first; see "Server
-prerequisites".
+contracts. Needs a Ravensight server that accepts origins, signatures, gzip bodies,
+`rs_exposure` and the `rs_ad_*` and `rs_attr_*` keys; the hosted service at
+ravensight.io runs one.
 
 ### Changes for 0.4.0 games
 
@@ -41,8 +42,8 @@ prerequisites".
   mobile an expired saved exit is queued under its origin.
 * gzip for batches of 1,024 bytes or more, and request signing when the
   session answers with `signing` (secret in memory only).
-* The 8,192 byte check measures as the server does: a typed error's message
-  and stack count one byte a character.
+* The 8,192 byte check measures as the server does: a typed error's message,
+  stack and trail count one byte a character.
 * `TrackAd`, `TrackAdRevenue`, `TrackAdRevenueFromMediation` and
   `SetAttribution` (once per device), Blueprint callable.
 * `device` on `POST /session` from `GetDeviceMakeAndModel`, `GetOSVersion` and
@@ -57,13 +58,6 @@ prerequisites".
   versions are covered. A failed write deletes its temporary file, and every
   delete of the queue file deletes `queue-<hash>.json.tmp` as well. The README
   gives the Android Auto Backup rules a game adds.
-
-### Server prerequisites
-
-* `rs_exposure` must be in `SDK_AUTOMATIC_EVENTS` before release, or a public
-  key's allowlist refuses it.
-* The Phase 2 delivery release and the Phase 5 `rs_ad_*` and `rs_attr_*` keys
-  must be deployed first.
 
 ## [0.4.0] - 2026-11-06
 

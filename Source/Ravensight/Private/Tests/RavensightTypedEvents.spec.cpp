@@ -81,7 +81,7 @@ void FRavensightTypedEventsSpec::Define()
 		It("is unreal/ plus the plugin version", [this]()
 		{
 			TestTrue("tag", SameText(RavensightVersion::SdkTag(), FString(TEXT("unreal/")) + FString(RavensightVersion::Sdk)));
-			TestTrue("version is 0.4.0", SameText(RavensightVersion::Sdk, TEXT("0.4.0")));
+			TestTrue("version is 0.5.0", SameText(RavensightVersion::Sdk, TEXT("0.5.0")));
 		});
 	});
 

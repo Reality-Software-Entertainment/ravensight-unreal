@@ -432,7 +432,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.4.0". */
+	/** The plugin version, "0.5.0". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
