@@ -812,6 +812,19 @@ That builds the queue, the protocol table and their two specs against stand-in
 headers and runs them. It checks the engine-free logic only; it is not an
 Unreal build. See `Tools/README.md` for compile checking with the engine.
 
+### Continuous integration
+
+GitHub Actions (`.github/workflows/ci.yml`) runs the host check above on every
+pull request and every push to `main`, with clang on Ubuntu and Apple clang on
+macOS. The host check also confirms that the generated scrub vectors match the
+vendored fixture, and it runs the four report hash cases.
+
+Unreal Engine cannot run on GitHub's hosted runners, so CI does not build the
+plugin or run the automation specs. The full editor build and the editor
+automation suite (193 tests for the current release) are run locally before
+every release, as recorded in `HELD_RELEASE_VALIDATION.md` and
+`Tools/README.md`.
+
 ## Device id and privacy
 
 The plugin generates a random GUID on first run and stores it in the local game
