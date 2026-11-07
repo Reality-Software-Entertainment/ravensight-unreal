@@ -1,0 +1,36 @@
+name: CI
+
+# Unreal Engine is not available on GitHub-hosted runners, so this runs only
+# the engine-free parts: Tools/host-check/run.sh compiles the queue, protocol,
+# typed events, delivery and error capture sources with their specs against
+# stand-in headers, checks the generated scrub vectors against the vendored
+# fixture, and runs the report hash cases. The editor build and the automation
+# suite are run locally before release (see README.md, Running the tests).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host-check:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Clang on both, as Unreal itself uses on Linux and macOS.
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compiler
+        run: clang++ --version
+
+      - name: Host check
+        env:
+          CXX: clang++
+        run: bash Tools/host-check/run.sh
