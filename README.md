@@ -504,6 +504,16 @@ Watch the SDK work with `Log LogRavensight Verbose` in the console, or turn
 Verbose Logging on to get the same lines at normal verbosity in a packaged
 build.
 
+If you edit `Config/DefaultGame.ini` by hand, quote the URL. The engine's ini
+reader cuts an unquoted value at `//`, so `ApiUrl=http://127.0.0.1:8080`
+reaches the plugin as `http:` and no request arrives anywhere. The settings
+panel writes the quotes for you:
+
+```ini
+[/Script/Ravensight.RavensightSettings]
+ApiUrl="https://api.ravensight.io"
+```
+
 ## Public builds
 
 For a game anyone can download, fork or play: a demo, a game jam entry, an
@@ -938,6 +948,45 @@ Console networking still has to pass platform certification, which is the
 developer's responsibility as it would be for any online feature. So far it
 has been built and spec tested on macOS only (Unreal Engine 5.8.3); see
 [Verification status](#verification-status).
+
+### macOS Shipping builds need network access
+
+Unreal Engine 5.8 signs a Mac Shipping build with its default App Sandbox
+entitlements, which allow no network access. In that build the plugin starts
+and queues every event to disk, but no request leaves the game, so the
+dashboard stays empty while Development builds and Play In Editor work. Give
+Shipping the outgoing connection entitlement,
+`com.apple.security.network.client`:
+
+1. Add `Build/Mac/Resources/Sandbox.ShippingNet.entitlements` to your project:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+   	<key>com.apple.security.app-sandbox</key>
+   	<true/>
+   	<key>com.apple.security.network.client</key>
+   	<true/>
+   </dict>
+   </plist>
+   ```
+
+2. Point the Shipping entitlements at it in `Config/DefaultEngine.ini`:
+
+   ```ini
+   [/Script/MacTargetPlatform.XcodeProjectSettings]
+   ShippingSpecificMacEntitlements=(FilePath="/Game/Build/Mac/Resources/Sandbox.ShippingNet.entitlements")
+   ```
+
+3. Package again.
+
+`network.client` allows outgoing connections only; the game still accepts no
+incoming ones. Checked on 2026-11-13 with Unreal Engine 5.8.3: a packaged,
+sandboxed Shipping app with this entitlement passed the same 11 delivery
+checks as the editor, and the same app with the default entitlements sent
+nothing.
 
 ## Other SDKs
 
