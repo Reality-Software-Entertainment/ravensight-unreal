@@ -84,4 +84,7 @@ namespace RavensightDelivery
 
 	/** The version part of an OS description, its name removed: "Mac OS X 14.2.1" is "14.2.1". */
 	std::string OsVersionFrom(const std::string& Utf8);
+
+	/** The model from GetDeviceMakeAndModel's "make|model[|chipset]": "Apple|Apple M4 Pro" is "Apple M4 Pro". */
+	std::string DeviceModelFrom(const std::string& Utf8);
 }

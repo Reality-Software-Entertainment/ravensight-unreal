@@ -34,6 +34,13 @@ server whose session answer carries `identify.salt` and that offers
   it, and consent applies as to everything else. `RavensightCampaignLink.h`
   holds the engine-free parsing, run by the host check.
 
+### Changed
+
+* `device.model` is the model part of `GetDeviceMakeAndModel`'s
+  `make|model[|chipset]`, so a Mac sends `Apple M4 Pro` instead of
+  `Apple|Apple M4 Pro`, iOS sends `iPhone15,2` and Android sends `Build.MODEL`,
+  the same text as the native iOS and Android SDKs.
+
 ## [0.5.0] - 2026-11-06
 
 Follows the platform's SDK delivery, ads and attribution, exposure and device

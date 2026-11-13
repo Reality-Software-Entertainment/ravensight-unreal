@@ -893,7 +893,8 @@ advertising id, or any hardware identifier. Besides the events you send, the
 SDK sends:
 
 * **Device fields**, once per session on `POST /session`: `model`
-  (`FPlatformMisc::GetDeviceMakeAndModel`), `osVersion`
+  (the model part of `FPlatformMisc::GetDeviceMakeAndModel`, such as
+  `iPhone15,2` or `Apple M4 Pro`, without the make), `osVersion`
   (`FPlatformMisc::GetOSVersion`, the OS name removed) and `gpu`
   (`GRHIAdapterName`). The engine reports these without a permission prompt;
   none is a hardware identifier. Each is at most 128 printable characters. The

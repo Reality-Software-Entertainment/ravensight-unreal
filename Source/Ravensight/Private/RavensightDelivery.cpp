@@ -417,4 +417,17 @@ namespace RavensightDelivery
 		}
 		return DeviceField(Text);
 	}
+
+	std::string DeviceModelFrom(const std::string& Utf8)
+	{
+		// The engine answers "make|model", or "make|model|chipset" when it
+		// knows the chipset. The model is the second field: "iPhone15,2" on
+		// iOS and Build.MODEL on Android, the same text the native iOS and
+		// Android SDKs send. The make alone is kept only when there is no model.
+		const size_t First = Utf8.find('|');
+		if (First == std::string::npos) return DeviceField(Utf8);
+		const size_t Second = Utf8.find('|', First + 1);
+		const std::string Model = DeviceField(Utf8.substr(First + 1, Second == std::string::npos ? std::string::npos : Second - First - 1));
+		return Model.empty() ? DeviceField(Utf8.substr(0, First)) : Model;
+	}
 }

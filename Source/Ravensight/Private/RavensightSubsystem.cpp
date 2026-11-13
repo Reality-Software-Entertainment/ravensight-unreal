@@ -3283,7 +3283,7 @@ TSharedRef<FJsonObject> URavensightSubsystem::DeviceFields() const
 	// Only what the engine reports without a permission prompt; none is a
 	// hardware identifier.
 	const TSharedRef<FJsonObject> Device = MakeShared<FJsonObject>();
-	const std::string Model = RavensightDelivery::DeviceField(Utf8(FPlatformMisc::GetDeviceMakeAndModel()));
+	const std::string Model = RavensightDelivery::DeviceModelFrom(Utf8(FPlatformMisc::GetDeviceMakeAndModel()));
 	const std::string OsVersion = RavensightDelivery::OsVersionFrom(Utf8(FPlatformMisc::GetOSVersion()));
 	const std::string Gpu = RavensightDelivery::DeviceField(Utf8(GRHIAdapterName));
 	if (!Model.empty()) Device->SetStringField(TEXT("model"), FromUtf8(Model));
