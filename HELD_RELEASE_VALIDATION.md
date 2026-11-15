@@ -39,8 +39,8 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   UnrealHeaderTool generated Blueprint reflection. Full native automation: **136 passed**
   (127 clean + 9 expected-warning cases), zero failures/not-run, process exit 0. Both new
   prepared-report cases passed. Evidence: sibling `validation/unreal-reports-automation/index.json`
-  and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live S3 test.
-- No remote writes, publication or deployment. Live S3/device/game capture checks remain held.
+  and `/tmp/unreal-reports-build.log`. This is an editor test, not a packaged device or live storage upload test.
+- No remote writes, publication or deployment. Live storage upload, device and game capture checks remain held.
 
 ## 0.5.0: delivery, ads and attribution, exposure and device fields (November 6, 2026)
 
