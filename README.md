@@ -974,5 +974,5 @@ API, session or playtest credentials. No automatic retries or polling occur.
 Screenshot reports reserve 20,001 weighted events; text-only reports use 1 event.
 Processing and refunds are server-authoritative. A transport error is not proof that
 nothing was charged: poll or cancel the retained handle. Server support requires Player
-Reports enabled with private storage, migrated Mongo indexes and the processing worker.
+Reports enabled on the server, with private storage and report processing.
 The server strips image metadata and delivers sanitized JPEGs and thumbnails to the inbox.
