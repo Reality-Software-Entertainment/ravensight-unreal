@@ -95,9 +95,16 @@ namespace RavensightIdentifySpecHost
 			Session.clear();
 		}
 
+		/** The Index-th request as (session, body), or two empty strings when there is none. */
+		std::pair<std::string, std::string> SendAt(size_t Index) const
+		{
+			return Index < Sends.size() ? Sends[Index] : std::pair<std::string, std::string>();
+		}
+
 		std::string SentHash(size_t Index) const
 		{
-			const std::string& Body = Sends[Index].second;
+			const std::string Body = SendAt(Index).second;
+			if (Body.empty()) return std::string();
 			const std::string Prefix = "{\"accountHash\":\"";
 			return Body.substr(Prefix.size(), 64);
 		}
@@ -199,7 +206,7 @@ void FRavensightIdentifySpec::Define()
 			StepIs(1, "session S1 opens");
 			Host.OpenSession(Salt);
 			TestEqual(TEXT("1 one send"), static_cast<int32>(Host.Sends.size()), 1);
-			TestTrue(TEXT("1 on S1"), Host.Sends[0].first == "S1");
+			TestTrue(TEXT("1 on S1"), Host.SendAt(0).first == "S1");
 			TestTrue(TEXT("1 hash"), Host.SentHash(0) == Sequence[1].Send);
 			TestTrue(TEXT("1 saved"), Host.SavedHash() == Sequence[1].Stored);
 			TestTrue(TEXT("1 saved salt"), Host.Saved.substr(0, 64) == Salt);
@@ -217,7 +224,7 @@ void FRavensightIdentifySpec::Define()
 			TestTrue(TEXT("3 identified from the saved value"), Host.Identity.IsIdentified());
 			Host.OpenSession(Salt);
 			TestEqual(TEXT("3 two sends"), static_cast<int32>(Host.Sends.size()), 2);
-			TestTrue(TEXT("3 on S2"), Host.Sends[1].first == "S2");
+			TestTrue(TEXT("3 on S2"), Host.SendAt(1).first == "S2");
 			TestTrue(TEXT("3 hash"), Host.SentHash(1) == Sequence[3].Send);
 
 			// 4: an email is refused; nothing changes.
@@ -234,7 +241,7 @@ void FRavensightIdentifySpec::Define()
 			TestTrue(TEXT("5 saved"), Host.SavedHash() == Sequence[5].Stored);
 			Host.OpenSession(Salt);
 			TestEqual(TEXT("5 three sends"), static_cast<int32>(Host.Sends.size()), 3);
-			TestTrue(TEXT("5 on S3"), Host.Sends[2].first == "S3");
+			TestTrue(TEXT("5 on S3"), Host.SendAt(2).first == "S3");
 			TestTrue(TEXT("5 hash"), Host.SentHash(2) == Sequence[5].Send);
 
 			// 6: reset: fresh device, S4, nothing sent, nothing saved.
@@ -261,7 +268,7 @@ void FRavensightIdentifySpec::Define()
 			Host.AnswerCode = "quota_exceeded";
 			Host.Identify("u3");
 			TestEqual(TEXT("8 four sends"), static_cast<int32>(Host.Sends.size()), 4);
-			TestTrue(TEXT("8 on S4"), Host.Sends[3].first == "S4");
+			TestTrue(TEXT("8 on S4"), Host.SendAt(3).first == "S4");
 			TestTrue(TEXT("8 hash"), Host.SentHash(3) == Sequence[8].Send);
 			TestTrue(TEXT("8 saved"), Host.SavedHash() == Sequence[8].Stored);
 			Host.Identify("u3");
@@ -322,8 +329,8 @@ void FRavensightIdentifySpec::Define()
 			TestTrue(TEXT("kept"), Host.Identity.IsIdentified());
 			Host.OpenSession(Salt);
 			TestEqual(TEXT("retried"), static_cast<int32>(Host.Sends.size()), 2);
-			TestTrue(TEXT("on S2"), Host.Sends[1].first == "S2");
-			TestTrue(TEXT("same hash"), Host.Sends[1].second == Host.Sends[0].second);
+			TestTrue(TEXT("on S2"), Host.SendAt(1).first == "S2");
+			TestTrue(TEXT("same hash"), Host.SendAt(1).second == Host.SendAt(0).second);
 		});
 
 		It("follows the answer table", [this]()
@@ -367,7 +374,7 @@ void FRavensightIdentifySpec::Define()
 			Host.OpenSession(Salt);
 			Host.Identify(Accept[0].AccountId);
 			TestEqual(TEXT("at once in an open session"), static_cast<int32>(Host.Sends.size()), 1);
-			TestTrue(TEXT("same body"), Host.Sends[0].second == RavensightIdentify::RequestBody(Wire));
+			TestTrue(TEXT("same body"), Host.SendAt(0).second == RavensightIdentify::RequestBody(Wire));
 		});
 
 		It("holds an id in memory without consent or a key, then sends on the yes", [this]()
@@ -435,8 +442,8 @@ void FRavensightIdentifySpec::Define()
 				Host.Identity.OnSendAnswer(Generation, OldSession, Host.Session, LateStatus, "");
 				Host.OpenSession(Salt);
 				TestEqual(TEXT("u2 sent"), static_cast<int32>(Host.Sends.size()), 1);
-				TestTrue(TEXT("on a new session"), Host.Sends[0].first != OldSession);
-				TestTrue(TEXT("another hash"), Host.Sends[0].second != Body);
+				TestTrue(TEXT("on a new session"), Host.SendAt(0).first != OldSession);
+				TestTrue(TEXT("another hash"), Host.SendAt(0).second != Body);
 			});
 		}
 	});
