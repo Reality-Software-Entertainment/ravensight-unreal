@@ -25,6 +25,14 @@ server whose session answer carries `identify.salt` and that offers
   run by the host check against the contract's binding vectors
   (`Tests/Fixtures/identify-vectors.json`, generated into
   `RavensightIdentifyVectors.inl` by `Tools/identify-vectors/generate.py`).
+* Campaign links: `URavensightSubsystem::SetCampaignLink(LinkId)` and the
+  static `CampaignLinkFromUrl(Url)`, Blueprint callable under Ravensight |
+  Campaign Links. The id from a deep link, App Link or install referrer the
+  game handles goes once, as `campaignLink` on the next `POST /session`.
+  Only a 24 character hex id is taken, sent lower case. It is never saved,
+  only a session the server opens clears it, a Playtest run never sends
+  it, and consent applies as to everything else. `RavensightCampaignLink.h`
+  holds the engine-free parsing, run by the host check.
 
 ## [0.5.0] - 2026-11-06
 

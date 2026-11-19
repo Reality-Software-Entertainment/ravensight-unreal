@@ -426,6 +426,8 @@ callable.
 | `SaveTrackingEnabled(bool)` / `LoadTrackingEnabled()` | Static: write or read the saved choice without a running subsystem. |
 | `SetEnabled(bool)` | The developer switch, the runtime side of the Enabled setting. Not saved. |
 | `ResetDeviceId()` | Forgets this install's identity: a new saved id, an empty queue, a new session on the next event. Returns the new id. |
+| `SetCampaignLink(LinkId)` | Sends a campaign link id once, with the next session, from your deep link or App Link handler. Returns false for anything but 24 hex characters. See [Campaign links](#campaign-links). |
+| `CampaignLinkFromUrl(Url)` | Static: the `rs_link` id in an incoming address or query string, lower cased, or empty. |
 | `SetPlaytestContext(Token, RunId, JobId, Persona)` | Marks the run as a Playtest run, for platforms where the runner cannot set the environment. Call before `Init`. |
 | `IsSessionReady()` | True once a session token exists and has not expired. |
 | `IsTrackingActive()` | True when the Enabled setting, the kill switch, the player's choice and the key all allow sending. |
@@ -615,6 +617,52 @@ return false across restarts. Pass `GetDeviceId()` to an attribution partner
 as its customer user id before the partner starts, so its install callback
 names this device.
 
+## Campaign links
+
+A Ravensight campaign link counts the players and sessions it brought on the
+Campaign links page, and you can open those players in Player insights. The
+link's redirect adds `rs_link=<link id>` to your own https page, so a
+universal link or App Link that opens the game carries it. Hand it to the
+plugin from the deep link handler you already have, and the plugin sends it
+once, as `campaignLink` on the next `POST /session`: the same request,
+nothing else added. Unreal has no web build, so there is no page address to
+read by itself. Both calls are Blueprint callable too (Ravensight | Campaign
+Links).
+
+```cpp
+#include "RavensightSubsystem.h"
+
+// Wherever your game already receives a deep link, universal link or App Link.
+void UMyGameInstance::HandleIncomingLink(const FString& Url)
+{
+    const FString LinkId = URavensightSubsystem::CampaignLinkFromUrl(Url);
+    if (!LinkId.IsEmpty())
+    {
+        GetSubsystem<URavensightSubsystem>()->SetCampaignLink(LinkId);
+    }
+    // ...then your own deep link handling.
+}
+```
+
+`CampaignLinkFromUrl` also reads a bare query string, such as an install
+referrer you already read.
+
+- **`SetCampaignLink(LinkId)`** returns true when the id is 24 hex
+  characters (any case; it is sent lower case) and now waits for a session,
+  replacing any earlier one. Anything else returns false and changes
+  nothing. You can call it before `Init`. Best called before the first
+  session; a later call goes with the next session the plugin opens.
+- **Once:** only a session the server opens clears it. A failed or offline
+  attempt keeps it for the next one, and later sessions carry none unless
+  you set one again.
+- **Consent:** without a key nothing is sent. With Consent on Opt In it waits
+  and goes with the first session after the player's yes; an opted out
+  player sends nothing. A Playtest run never sends it.
+- **Nothing stored:** the id is held in memory only, never in
+  `GameUserSettings.ini` or the queue file. It is an id your studio made,
+  not personal data. The server keeps it only when it names a link of the
+  same game.
+
 ## About your ingest key
 
 The `gt_live_...` key is publishable. It is safe to ship inside a packaged
@@ -745,6 +793,7 @@ Source/Ravensight/
     RavensightSubsystem.h    UGameInstanceSubsystem, the entry point
     RavensightProtocol.h     response table, feedback rules, lifecycle rules
     RavensightTypedEvents.h  typed event property sets and the health sampler, no UObject
+    RavensightCampaignLink.h the campaign link id check and rs_link parsing, no UObject
   Private/
     RavensightQueue.cpp
     RavensightProtocol.cpp
@@ -840,6 +889,8 @@ SDK sends:
   none is a hardware identifier. Each is at most 128 printable characters. The
   server derives the country itself; the SDK never sends one.
 * **Attribution**, once per install, only when the game calls `SetAttribution`.
+* **Campaign link**, once, on the next `POST /session`, only when the game
+  passes one to `SetCampaignLink`. See [Campaign links](#campaign-links).
 
 The queue file under `Saved/Ravensight` holds queued events and each session's
 opaque origin stamp; never the session token or signing secret.
