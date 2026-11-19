@@ -88,3 +88,22 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   engine-free identify cases and 8 subsystem identify cases.
 - Fake transport only: no live Ravensight service, packaged game or device
   was used. Nothing was published, tagged or deployed.
+
+### Campaign links (same 0.6.0)
+
+- Branch `feat/campaign-link`, on `feat/identify` at 1abf2e8, built to the
+  campaign link contract (the JS SDK is the reference). Native only: Unreal
+  has no web build, so the game passes the id with `SetCampaignLink`.
+- Host check: **173 cases passed** (170 before), plus the 4 report hash
+  cases. The 3 new cases run 36 vectors: the id check and `rs_link` read from
+  query strings and whole addresses.
+- Unreal Engine 5.8 Mac Development editor target of a scratch host project,
+  built with `-WarningsAsErrors` (UnrealHeaderTool included) from commit
+  21faa33: passed. Full `Ravensight` automation run: **234 passed** (215
+  clean, 19 with expected warnings), 0 failed, 0 not run, among them the 3
+  engine-free campaign link cases and 10 subsystem campaign link cases (once
+  per session, lower case, kept after a failed or token-less answer, a link
+  set while the session is on the wire, opt in, opt out, no key, a Playtest
+  run, nothing saved).
+- Fake transport only: no live Ravensight service, packaged game or device
+  was used. Nothing was published, tagged or deployed.
