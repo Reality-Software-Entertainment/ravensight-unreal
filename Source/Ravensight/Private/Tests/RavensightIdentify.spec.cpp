@@ -364,6 +364,62 @@ void FRavensightIdentifySpec::Define()
 		});
 	});
 
+	Describe("no_session in a row", [this]()
+	{
+		auto NextSession = [](FHost& Host, int32 Status, const char* Code)
+		{
+			Host.AnswerStatus = Status;
+			Host.AnswerCode = Code;
+			Host.Session.clear(); // a fresh session; the identity is kept
+			Host.OpenSession(Salt);
+		};
+
+		It("stops identify after a second in a row, keeping the identity", [this, NextSession]()
+		{
+			FHost Host;
+			Host.AnswerStatus = 400;
+			Host.AnswerCode = "no_session";
+			Host.OpenSession(Salt);
+			Host.Identify("u1");
+			TestEqual(TEXT("first"), static_cast<int32>(Host.Sends.size()), 1);
+			NextSession(Host, 400, "no_session");
+			TestEqual(TEXT("tried once at the next session"), static_cast<int32>(Host.Sends.size()), 2);
+			NextSession(Host, 200, "");
+			NextSession(Host, 200, "");
+			TestEqual(TEXT("stopped"), static_cast<int32>(Host.Sends.size()), 2);
+			TestTrue(TEXT("kept"), Host.Identity.IsIdentified());
+		});
+
+		It("does not stop when another answer comes between", [this, NextSession]()
+		{
+			FHost Host;
+			Host.AnswerStatus = 400;
+			Host.AnswerCode = "no_session";
+			Host.OpenSession(Salt);
+			Host.Identify("u1");
+			NextSession(Host, 503, "");
+			NextSession(Host, 400, "no_session");
+			NextSession(Host, 200, "");
+			TestEqual(TEXT("still sent"), static_cast<int32>(Host.Sends.size()), 4);
+		});
+
+		It("turns back on after ResetIdentity", [this, NextSession]()
+		{
+			FHost Host;
+			Host.AnswerStatus = 400;
+			Host.AnswerCode = "no_session";
+			Host.OpenSession(Salt);
+			Host.Identify("u1");
+			NextSession(Host, 400, "no_session");
+			NextSession(Host, 200, "");
+			TestEqual(TEXT("stopped"), static_cast<int32>(Host.Sends.size()), 2);
+			Host.Reset();
+			Host.Identify("u1");
+			Host.OpenSession(Salt);
+			TestEqual(TEXT("back on"), static_cast<int32>(Host.Sends.size()), 3);
+		});
+	});
+
 	Describe("the request and the gates", [this]()
 	{
 		It("sends exactly the hash, never a device id", [this]()
