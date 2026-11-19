@@ -916,6 +916,49 @@ Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
+## Identify players who sign in
+
+If your game has its own accounts, tell Ravensight who signed in, so one
+person on two devices, or before and after sign-in, counts as one player.
+Both calls are Blueprint callable too (Ravensight | Identity).
+
+```cpp
+if (URavensightSubsystem* Ravensight = URavensightSubsystem::Get(this))
+{
+    Ravensight->Identify(Account.Id);   // after your own sign-in succeeds
+    Ravensight->ResetIdentity();        // on sign-out
+}
+```
+
+- **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
+  game's own salt, which the session answer gives the plugin) and the
+  session token, once per session. The raw account id is never sent and
+  never saved; emails and names are never sent.
+- **Checked on the device:** the id must not be empty, must be at most 256
+  bytes of UTF-8 and must not contain `@`, so an email or a handle is
+  refused: `Identify` returns false, logs one warning and changes nothing.
+  It is used exactly as given (never trimmed).
+- **Remembered:** only the salt and the hash, under `[Ravensight]` in
+  `GameUserSettings.ini` beside the device id (key `Identity`), so the next
+  launch identifies its session without another call. `IsIdentified()` says
+  whether one is set.
+- **`ResetIdentity()`** on sign-out forgets it and switches to a fresh
+  device id, exactly like `ResetDeviceId()`, so the next player on this
+  device is not linked to the account. `ResetDeviceId()` alone keeps it.
+- **Signing in as another account** calls `ResetIdentity()` for you first.
+- **Consent:** without a key, or with Consent on Opt In before the player's
+  yes, the id waits in memory and nothing is sent. The player's opt-out
+  (`SetTrackingEnabled(false)`) forgets it; your own switch,
+  `SetEnabled(false)`, keeps it and identifies again when turned back on. A
+  Playtest run keeps it in memory and sends nothing. You can call `Identify`
+  before `Init`.
+- **Cost:** one event on your usage meter per identified session. The
+  request goes after the session's first batch and never holds up your
+  events.
+
+A game that calls `Identify` links its data to the player's account:
+answer the store privacy forms that way.
+
 ## Telling players
 
 You do not need a permission prompt, but saying what the game sends is good

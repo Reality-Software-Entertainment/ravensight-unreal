@@ -2,6 +2,30 @@
 
 All notable changes to this plugin are documented here.
 
+## [0.6.0] - Unreleased
+
+Implements the Ravensight identify contract (version 2). Needs a Ravensight
+server whose session answer carries `identify.salt` and that offers
+`POST /api/v1/identify`; against an older server identify does nothing.
+
+### Added
+
+* `URavensightSubsystem::Identify(AccountId)`, `ResetIdentity()` and
+  `IsIdentified()`, Blueprint callable under Ravensight | Identity. The id
+  is checked on the device (not empty, at most 256 UTF-8 bytes, no `@`,
+  never trimmed; `Identify` returns false with one warning otherwise) and
+  only its HMAC-SHA256 with the game's salt is sent, once per session, with
+  the session token. The salt and hash are saved under `[Ravensight]
+  Identity`; the raw id is held in memory only until the salt is known.
+* A different salt deletes the saved identity, a session answer with no
+  salt drops a held id for the launch, signing in as another account resets
+  first, and opt-out and consent withdrawn forget it. `SetEnabled(false)`
+  keeps it. A Playtest run keeps it in memory and sends nothing.
+* `RavensightIdentify.h`: the engine-free checks, hash and state machine,
+  run by the host check against the contract's binding vectors
+  (`Tests/Fixtures/identify-vectors.json`, generated into
+  `RavensightIdentifyVectors.inl` by `Tools/identify-vectors/generate.py`).
+
 ## [0.5.0] - 2026-11-06
 
 Follows the platform's SDK delivery, ads and attribution, exposure and device
