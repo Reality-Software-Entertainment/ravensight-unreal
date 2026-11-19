@@ -976,11 +976,18 @@ Both calls are Blueprint callable too (Ravensight | Identity).
 ```cpp
 if (URavensightSubsystem* Ravensight = URavensightSubsystem::Get(this))
 {
-    Ravensight->Identify(Account.Id);   // after your own sign-in succeeds
-    Ravensight->ResetIdentity();        // on sign-out
+    Ravensight->Identify(Account.AnalyticsId);   // after your own sign-in succeeds: a random id stored with the account
+    Ravensight->ResetIdentity();                 // on sign-out
 }
 ```
 
+- **Pass a random, high-entropy id**, such as a random UUID
+  (`FGuid::NewGuid().ToString()`) or a random analytics id you make once for
+  each account and store with it, never a sequential database key, an email,
+  a name or a handle. Your game's salt reaches every copy of the game, so
+  anyone could hash 1, 2, 3 and onward and match a guessable id; a random
+  one cannot be guessed. The hash is still a pseudonymous identifier for the
+  player: declare it in your game's privacy notice.
 - **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
   game's own salt, which the session answer gives the plugin) and the
   session token, once per session. The raw account id is never sent and
