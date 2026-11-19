@@ -48,6 +48,25 @@ namespace
 	const TCHAR* const TrackingEnabledKey = TEXT("TrackingEnabled");
 	const TCHAR* const DeviceIdKey = TEXT("DeviceId");
 	const TCHAR* const OptInKey = TEXT("OptIn");
+	const TCHAR* const IdentityKey = TEXT("Identity");
+
+	/** The identify vectors' test salt and the wire of account "12345" under it. */
+	const TCHAR* const IdentifySalt = TEXT("a3f1c9e07b2d48c6915e2f7a0d4b8c3e6f1a9d2c7e5b0f4a8d3c6e9b1f2a7d40");
+	const TCHAR* const IdentifyWire12345 = TEXT("90728679b55680f484c23b06f119e6c3e91f74b51c8b39bda4541cec8b05ae50");
+
+	/** Every POST /identify among Requests, in order. */
+	TArray<FHttpRequestPtr> IdentifyRequests(const TArray<FHttpRequestPtr>& All)
+	{
+		TArray<FHttpRequestPtr> Found;
+		for (const FHttpRequestPtr& Request : All)
+		{
+			if (Request->GetURL().EndsWith(TEXT("/api/v1/identify")))
+			{
+				Found.Add(Request);
+			}
+		}
+		return Found;
+	}
 
 	/** A canned answer, as the HTTP module would hand it to a completion delegate. */
 	class FRavensightFakeResponse final : public IHttpResponse
@@ -426,6 +445,7 @@ void FRavensightSubsystemSpec::Define()
 		bHadDeviceId = GConfig->GetString(SaveSection, DeviceIdKey, SavedDeviceId, GGameUserSettingsIni);
 		bHadOptIn = GConfig->GetBool(SaveSection, OptInKey, bSavedOptIn, GGameUserSettingsIni);
 		GConfig->RemoveKey(SaveSection, OptInKey, GGameUserSettingsIni);
+		GConfig->RemoveKey(SaveSection, IdentityKey, GGameUserSettingsIni);
 		URavensightSubsystem::SaveTrackingEnabled(true);
 
 		Listener = NewObject<URavensightSpecListener>();
@@ -466,6 +486,8 @@ void FRavensightSubsystemSpec::Define()
 		{
 			GConfig->RemoveKey(SaveSection, OptInKey, GGameUserSettingsIni);
 		}
+
+		GConfig->RemoveKey(SaveSection, IdentityKey, GGameUserSettingsIni);
 
 		if (bHadTrackingEnabled)
 		{
@@ -685,6 +707,118 @@ void FRavensightSubsystemSpec::Define()
 			{
 				TestEqual(TEXT("X-Ravensight-Playtest"), Requests[0]->GetHeader(TEXT("X-Ravensight-Playtest")), FString());
 			}
+		});
+	});
+
+	Describe("Identify", [this]()
+	{
+		It("sends the salted hash once per session with the key and the session token, after the events", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			TestTrue(TEXT("accepted before Init"), Subsystem->Identify(TEXT("12345")));
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			TestFalse(TEXT("no device id in the session body's identify"), BodyOf(Requests[1]).Contains(TEXT("accountHash")));
+			Answer(Requests[1], 201, FString(TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600,\"identify\":{\"salt\":\"")) + IdentifySalt + TEXT("\"}}"));
+
+			const TArray<FHttpRequestPtr> Sent = IdentifyRequests(Requests);
+			if (!TestEqual(TEXT("one identify"), Sent.Num(), 1)) return;
+			const FHttpRequestPtr Request = Sent[0];
+			TestEqual(TEXT("verb"), Request->GetVerb(), FString(TEXT("POST")));
+			TestEqual(TEXT("key"), Request->GetHeader(TEXT("X-API-Key")), FString(SpecKey));
+			TestEqual(TEXT("session"), Request->GetHeader(TEXT("X-Session-Token")), FString(TEXT("tok_id")));
+			TestEqual(TEXT("body"), BodyOf(Request), FString(TEXT("{\"accountHash\":\"")) + IdentifyWire12345 + TEXT("\"}"));
+			TestFalse(TEXT("no device id"), BodyOf(Request).Contains(Subsystem->GetDeviceId()));
+			const int32 BatchAt = Requests.IndexOfByPredicate([](const FHttpRequestPtr& R) { return R->GetURL().EndsWith(TEXT("/track/batch")); });
+			if (BatchAt != INDEX_NONE)
+			{
+				TestTrue(TEXT("after the session's first batch"), BatchAt < Requests.Find(Request));
+			}
+
+			FString Saved;
+			GConfig->GetString(SaveSection, IdentityKey, Saved, GGameUserSettingsIni);
+			TestEqual(TEXT("saved salt and hash only"), Saved, FString(IdentifySalt) + TEXT(":") + IdentifyWire12345);
+
+			Answer(Request, 200, TEXT("{\"playerId\":\"px_90728679b55680f484c23b06f119e6c3\",\"linked\":true,\"verified\":false,\"repeat\":false}"));
+			TestTrue(TEXT("same account again"), Subsystem->Identify(TEXT("12345")));
+			TestEqual(TEXT("nothing more this session"), IdentifyRequests(Requests).Num(), 1);
+			TestTrue(TEXT("identified"), Subsystem->IsIdentified());
+		});
+
+		It("refuses an email: false, nothing saved or sent, the device id kept", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartReady();
+			const FString Device = Subsystem->GetDeviceId();
+			TestFalse(TEXT("refused"), Subsystem->Identify(TEXT("player@example.com")));
+			TestFalse(TEXT("refused empty"), Subsystem->Identify(FString()));
+			TestFalse(TEXT("not identified"), Subsystem->IsIdentified());
+			TestEqual(TEXT("nothing sent"), IdentifyRequests(Requests).Num(), 0);
+			TestFalse(TEXT("nothing saved"), HasSavedKey(IdentityKey));
+			TestEqual(TEXT("device kept"), Subsystem->GetDeviceId(), Device);
+		});
+
+		It("ResetIdentity deletes the saved identity and switches device, sending nothing", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, FString(TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600,\"identify\":{\"salt\":\"")) + IdentifySalt + TEXT("\"}}"));
+			TestTrue(TEXT("identified"), Subsystem->Identify(TEXT("u1")));
+			TestEqual(TEXT("sent at once in the open session"), IdentifyRequests(Requests).Num(), 1);
+			TestTrue(TEXT("saved"), HasSavedKey(IdentityKey));
+
+			const FString Device = Subsystem->GetDeviceId();
+			const int32 Before = Requests.Num();
+			Subsystem->ResetIdentity();
+			TestFalse(TEXT("deleted"), HasSavedKey(IdentityKey));
+			TestFalse(TEXT("not identified"), Subsystem->IsIdentified());
+			TestNotEqual(TEXT("fresh device"), Subsystem->GetDeviceId(), Device);
+			TestEqual(TEXT("no request"), Requests.Num(), Before);
+			TestEqual(TEXT("session dropped"), Subsystem->GetSessionToken(), FString());
+		});
+
+		It("without a key holds the id in memory and makes no request", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(FString());
+			TestTrue(TEXT("accepted"), Subsystem->Identify(TEXT("u1")));
+			TestTrue(TEXT("held"), Subsystem->IsIdentified());
+			Subsystem->ResetIdentity();
+			TestEqual(TEXT("no request"), Requests.Num(), 0);
+			TestFalse(TEXT("nothing saved"), HasSavedKey(IdentityKey));
+		});
+
+		It("drops a held id when the session answer has no salt", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Identify(TEXT("u1"));
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600}"));
+			TestFalse(TEXT("dropped"), Subsystem->IsIdentified());
+			TestEqual(TEXT("nothing sent"), IdentifyRequests(Requests).Num(), 0);
+			TestFalse(TEXT("nothing saved"), HasSavedKey(IdentityKey));
+		});
+
+		It("opting out deletes the saved identity", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, FString(TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600,\"identify\":{\"salt\":\"")) + IdentifySalt + TEXT("\"}}"));
+			Subsystem->Identify(TEXT("u1"));
+			TestTrue(TEXT("saved"), HasSavedKey(IdentityKey));
+			Subsystem->SetTrackingEnabled(false);
+			TestFalse(TEXT("deleted"), HasSavedKey(IdentityKey));
+			TestFalse(TEXT("not identified"), Subsystem->IsIdentified());
 		});
 	});
 

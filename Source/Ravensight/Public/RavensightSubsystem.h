@@ -7,6 +7,7 @@
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpRequest.h"
 #include "RavensightErrorCapture.h"
+#include "RavensightIdentify.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
 #include "RavensightQueueFile.h"
@@ -173,6 +174,32 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	FString ResetDeviceId();
+
+	/**
+	 * Links this device to your game's own account id after the player signs
+	 * in, so one person on two devices, or before and after sign-in, counts as
+	 * one player. Only a salted hash of the id is sent, once per session with
+	 * the session token; the raw id is never sent or saved. Returns false, with
+	 * one warning, and changes nothing for an empty id, one over 256 UTF-8
+	 * bytes, or one containing '@' (emails and handles). Used exactly as given.
+	 * Signing in as another account calls ResetIdentity first. Callable before
+	 * Init; without a key, or before consent, the id waits in memory.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Identity")
+	bool Identify(const FString& AccountId);
+
+	/**
+	 * For sign-out: forgets the saved identity and switches to a fresh device
+	 * id exactly as ResetDeviceId does, so the next player on this device is
+	 * not linked to the account. Sends nothing. With nothing saved or waiting
+	 * it does nothing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Identity")
+	void ResetIdentity();
+
+	/** True while an identity is saved, or an Identify waits for the session. The account id itself can never be read back. */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Identity")
+	bool IsIdentified() const;
 
 	/**
 	 * Marks this run as a Ravensight Playtest run. Call it before Init (turn
@@ -541,6 +568,17 @@ private:
 	void PersistQueueSoon();
 	void PersistQueueNow();
 	void AdoptSessionAnswer(const TSharedPtr<FJsonObject>& Parsed);
+
+	// --- Identify (docs/identify/CONTRACT.md) ------------------------------
+	/** A key, consent and not switched off: an identity may be saved and sent. */
+	bool MayStoreIdentity() const;
+	/** At Init: reads the saved identity, or deletes it while the player is opted out. */
+	void AdoptSavedIdentity();
+	/** Applies what FRavensightIdentity asked for: delete, fresh device, save, send. */
+	void ApplyIdentityEffects(const FRavensightIdentityEffects& Effects);
+	/** One POST /identify for the open session, when one is due. */
+	void SendIdentify();
+	void HandleIdentifyResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SessionToken);
 	TSharedRef<FJsonObject> DeviceFields() const;
 	static int64 NowMs();
 
@@ -694,6 +732,10 @@ private:
 	 * answer from an older generation is ignored.
 	 */
 	int32 QueueGeneration = 0;
+
+	/** Identify: the raw account id lives only in here, in memory, until it is hashed. */
+	FRavensightIdentity Identity;
+	bool bIdentifyBugLogged = false;
 
 	/** iOS: a background task is running for the background flush. */
 	bool bBackgroundTaskActive = false;
