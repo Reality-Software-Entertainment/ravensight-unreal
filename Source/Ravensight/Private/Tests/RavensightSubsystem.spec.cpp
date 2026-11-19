@@ -806,6 +806,35 @@ void FRavensightSubsystemSpec::Define()
 			TestFalse(TEXT("nothing saved"), HasSavedKey(IdentityKey));
 		});
 
+		It("the game's switch keeps the identity", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, FString(TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600,\"identify\":{\"salt\":\"")) + IdentifySalt + TEXT("\"}}"));
+			Subsystem->Identify(TEXT("u1"));
+			Subsystem->SetEnabled(false);
+			TestTrue(TEXT("kept"), HasSavedKey(IdentityKey));
+			TestTrue(TEXT("identified"), Subsystem->IsIdentified());
+		});
+
+		It("a Playtest run keeps it in memory and sends nothing", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetPlaytestContext(TEXT("pt_token"), TEXT("run1"), TEXT("job1"), TEXT("persona"));
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, FString(TEXT("{\"token\":\"tok_id\",\"expiresIn\":3600,\"identify\":{\"salt\":\"")) + IdentifySalt + TEXT("\"}}"));
+			TestTrue(TEXT("accepted"), Subsystem->Identify(TEXT("u1")));
+			TestTrue(TEXT("held"), Subsystem->IsIdentified());
+			TestEqual(TEXT("nothing sent"), IdentifyRequests(Requests).Num(), 0);
+			TestFalse(TEXT("nothing saved"), HasSavedKey(IdentityKey));
+		});
+
 		It("opting out deletes the saved identity", [this]()
 		{
 			URavensightSubsystem* Subsystem = StartInstance();

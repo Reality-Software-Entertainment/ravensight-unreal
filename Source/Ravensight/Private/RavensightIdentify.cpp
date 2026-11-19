@@ -46,19 +46,11 @@ bool FRavensightIdentity::Load(const std::string& Text)
 	return true;
 }
 
-bool FRavensightIdentity::AdoptSaved(const std::string& Text, FRavensightIdentityEffects& Out)
+bool FRavensightIdentity::AdoptSaved(const std::string& Text, FRavensightIdentityEffects& /*Out*/)
 {
-	const std::string Waiting = Held;
-	if (!Load(Text)) return false;
-	if (Waiting.empty()) return true;
-	if (RavensightIdentify::AccountHash(SavedSalt, Waiting) == SavedHash)
-	{
-		Held.clear();
-		return true;
-	}
-	Reset(Out);
-	Held = Waiting;
-	return true;
+	// A held id is decided when this launch's salt arrives, not here: the
+	// saved identity may be another game's.
+	return Load(Text);
 }
 
 std::string FRavensightIdentity::SavedText() const
@@ -77,10 +69,17 @@ const char* FRavensightIdentity::Identify(const std::string& AccountIdUtf8, bool
 		// An older server: nothing is held, saved or sent this launch.
 		return nullptr;
 	}
+	if (LaunchSalt.empty())
+	{
+		// This launch's salt is not known yet, and a saved identity may be
+		// another game's: hold the id (the last call wins) and decide when the
+		// session answer brings the salt.
+		Held = AccountIdUtf8;
+		return nullptr;
+	}
 	if (!SavedHash.empty())
 	{
-		// The saved salt is the game's: compare the accounts with it.
-		if (RavensightIdentify::AccountHash(SavedSalt, AccountIdUtf8) == SavedHash)
+		if (RavensightIdentify::AccountHash(LaunchSalt, AccountIdUtf8) == SavedHash)
 		{
 			Held.clear();
 			Out.bSend = true;
@@ -136,8 +135,23 @@ void FRavensightIdentity::OnSessionAnswer(bool bHasSalt, const std::string& Salt
 		++Generation;
 		Out.bDeleteSaved = true;
 	}
+	if (!Held.empty() && !SavedHash.empty())
+	{
+		if (RavensightIdentify::AccountHash(Salt, Held) == SavedHash)
+		{
+			Held.clear();
+		}
+		else
+		{
+			// Another account was identified before the salt was known: sign
+			// the saved one out first (fresh device and session).
+			const std::string Waiting = Held;
+			Reset(Out);
+			Held = Waiting;
+		}
+	}
 	Settle(bMayStore, Out);
-	if (!SavedHash.empty()) Out.bSend = true;
+	if (!SavedHash.empty() && !Out.bResetDevice) Out.bSend = true;
 }
 
 void FRavensightIdentity::Settle(bool bMayStore, FRavensightIdentityEffects& Out)

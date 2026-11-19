@@ -420,33 +420,70 @@ void FRavensightIdentifySpec::Define()
 			TestTrue(TEXT("identified"), Identity.IsIdentified());
 		});
 
-		It("signs out a saved account when another was identified before the start", [this]()
+		It("adopts a saved identity at the start without deciding on a held id", [this]()
 		{
-			// Identify("u2") before Init, then Init finds u1 saved.
+			// Identify("u2") before Init, then Init finds u1 saved: nothing is
+			// decided until this launch's salt arrives.
 			FRavensightIdentity Identity;
 			FRavensightIdentityEffects Before;
 			TestTrue(TEXT("held"), Identity.Identify("u2", false, Before) == nullptr);
 			FRavensightIdentityEffects Effects;
 			TestTrue(TEXT("adopted"), Identity.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, Effects));
-			TestTrue(TEXT("saved one deleted"), Effects.bDeleteSaved);
-			TestTrue(TEXT("fresh device"), Effects.bResetDevice);
-			TestTrue(TEXT("u2 still held"), Identity.IsIdentified() && Identity.SavedText().empty());
-
-			// The same account: kept, no reset.
-			FRavensightIdentity Same;
-			FRavensightIdentityEffects Held;
-			Same.Identify("u1", false, Held);
-			FRavensightIdentityEffects SameEffects;
-			TestTrue(TEXT("adopted"), Same.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, SameEffects));
-			TestFalse(TEXT("no delete"), SameEffects.bDeleteSaved);
-			TestFalse(TEXT("no reset"), SameEffects.bResetDevice);
-			TestTrue(TEXT("kept"), Same.SavedText() == std::string(Salt) + ":" + Sequence[1].Stored);
-
-			// Nothing held: just loaded; malformed: refused.
+			TestFalse(TEXT("nothing deleted yet"), Effects.bDeleteSaved);
+			TestFalse(TEXT("no reset yet"), Effects.bResetDevice);
+			TestTrue(TEXT("saved kept"), Identity.SavedText() == std::string(Salt) + ":" + Sequence[1].Stored);
 			FRavensightIdentity Plain;
 			FRavensightIdentityEffects PlainEffects;
-			TestTrue(TEXT("loaded"), Plain.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, PlainEffects));
 			TestFalse(TEXT("malformed"), Plain.AdoptSaved("x", PlainEffects));
+		});
+	});
+
+	Describe("before this launch's salt", [this]()
+	{
+		It("holds the id and hashes it under the salt that arrives", [this]()
+		{
+			FHost Host;
+			Host.Identify(DifferAccountId);
+			Host.OpenSession(Salt);
+			TestEqual(TEXT("first launch sent"), static_cast<int32>(Host.Sends.size()), 1);
+			Host.Relaunch();
+			const int32 Device = Host.Device;
+			Host.Identify(DifferAccountId); // the saved salt is not this launch's yet
+			Host.OpenSession(DifferSaltB);
+			TestEqual(TEXT("sent again"), static_cast<int32>(Host.Sends.size()), 2);
+			TestTrue(TEXT("under salt b"), Host.SentHash(1) == DifferWireB);
+			TestTrue(TEXT("saved under salt b"), Host.Saved.substr(0, 64) == DifferSaltB);
+			TestEqual(TEXT("deleted, not signed out"), Host.Device, Device);
+		});
+
+		It("signs the saved account out when another one arrives with the salt", [this]()
+		{
+			FHost Host;
+			Host.Identify("u1");
+			Host.OpenSession(Salt);
+			Host.Relaunch();
+			const int32 Device = Host.Device;
+			Host.Identify("u2");
+			TestEqual(TEXT("nothing decided before the salt"), Host.Device, Device);
+			Host.OpenSession(Salt);
+			TestTrue(TEXT("fresh device"), Host.Device != Device);
+			TestEqual(TEXT("not sent on the dropped session"), static_cast<int32>(Host.Sends.size()), 1);
+			Host.OpenSession(Salt);
+			TestEqual(TEXT("sent on the fresh session"), static_cast<int32>(Host.Sends.size()), 2);
+			TestTrue(TEXT("on S3"), Host.SendAt(1).first == "S3");
+			TestTrue(TEXT("u2"), Host.SentHash(1) == Sequence[5].Send);
+		});
+
+		It("keeps the last of two calls", [this]()
+		{
+			FHost Host;
+			const int32 Device = Host.Device;
+			Host.Identify("u1");
+			Host.Identify("u2");
+			Host.OpenSession(Salt);
+			TestEqual(TEXT("one send"), static_cast<int32>(Host.Sends.size()), 1);
+			TestTrue(TEXT("u2"), Host.SentHash(0) == Sequence[5].Send);
+			TestEqual(TEXT("device kept"), Host.Device, Device);
 		});
 	});
 

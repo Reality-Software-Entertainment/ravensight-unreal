@@ -67,8 +67,8 @@ public:
 
 	/**
 	 * Load at the start, when an id may already be held (Identify before Init).
-	 * Another account saved: it is signed out (delete it, fresh device) and the
-	 * held id stays. The same account: kept. False (nothing loaded) when malformed.
+	 * A held id is decided when this launch's salt arrives. False (nothing
+	 * loaded) when malformed. Out is for future use and left unchanged.
 	 */
 	bool AdoptSaved(const std::string& SavedText, FRavensightIdentityEffects& Out);
 
@@ -93,7 +93,11 @@ public:
 	/** Consent given or switched back on: a held id is settled if the salt is known. */
 	void MayStoreNow(FRavensightIdentityEffects& Out);
 
-	/** A session answer: its identify.salt, or none from an older server. */
+	/**
+	 * A session answer: its identify.salt, or none from an older server. With
+	 * bResetDevice set the session that just opened belongs to a signed out
+	 * account: the subsystem drops it and opens a fresh one.
+	 */
 	void OnSessionAnswer(bool bHasSalt, const std::string& Salt, bool bMayStore, FRavensightIdentityEffects& Out);
 
 	/** True when a request should go for this session now; fills the body and the generation to answer with. */

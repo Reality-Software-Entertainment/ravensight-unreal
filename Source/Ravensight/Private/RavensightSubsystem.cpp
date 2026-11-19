@@ -520,10 +520,8 @@ void URavensightSubsystem::SetEnabled(bool bInEnabled)
 
 	if (!bInEnabled)
 	{
+		// The game's own switch keeps the identity; the player's opt-out deletes it.
 		Log(TEXT("disabled by the game, queue discarded"));
-		FRavensightIdentityEffects Effects;
-		Identity.Forget(Effects);
-		ApplyIdentityEffects(Effects);
 		StopErrorCapture(true);
 		BumpQueueGeneration();
 		StopTimers();
@@ -1666,6 +1664,14 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			const bool bIdentifyDue = IdentityEffects.bSend;
 			IdentityEffects.bSend = false;
 			ApplyIdentityEffects(IdentityEffects);
+			if (IdentityEffects.bResetDevice)
+			{
+				// Another account signed in before the salt was known: the saved
+				// one was signed out with this session. A fresh one opens now.
+				Log(TEXT("signed out the saved account; opening a session for the next one"));
+				EnsureSession();
+				return;
+			}
 
 			// After batch 401s past the re open cap the ladder keeps climbing:
 			// only a 202 resets it then.
@@ -1749,6 +1755,17 @@ void URavensightSubsystem::ResetIdentity()
 {
 	FRavensightIdentityEffects Effects;
 	Identity.Reset(Effects);
+	if (!Effects.bResetDevice && GConfig && !IsPlaytest())
+	{
+		// A saved identity this run never read (no key, or before consent) is
+		// signed out too.
+		FString Existing;
+		if (GConfig->GetString(SaveSection, IdentityKey, Existing, GGameUserSettingsIni) && !Existing.IsEmpty())
+		{
+			Effects.bDeleteSaved = true;
+			Effects.bResetDevice = true;
+		}
+	}
 	ApplyIdentityEffects(Effects);
 }
 
@@ -1798,10 +1815,11 @@ void URavensightSubsystem::AdoptSavedIdentity()
 
 void URavensightSubsystem::ApplyIdentityEffects(const FRavensightIdentityEffects& Effects)
 {
-	// Never written during a Playtest run or without a key, as with every saved value.
+	// Never written during a Playtest run or without a key, as with every saved
+	// value; an earlier build's identity is still deleted on opt-out or sign-out.
 	const bool bDisk = GConfig && !IsPlaytest() && !bNoKey;
 
-	if (Effects.bDeleteSaved && bDisk)
+	if (Effects.bDeleteSaved && GConfig && !IsPlaytest())
 	{
 		FString Existing;
 		if (GConfig->GetString(SaveSection, IdentityKey, Existing, GGameUserSettingsIni))
@@ -1827,7 +1845,11 @@ void URavensightSubsystem::ApplyIdentityEffects(const FRavensightIdentityEffects
 
 void URavensightSubsystem::SendIdentify()
 {
-	if (!bInitialized || bNoKey || bStoppedForRun || bShuttingDown || !Queue.IsActive() || !Queue.IsSessionValid(NowSeconds()))
+	// A Playtest run keeps identify in memory and sends nothing. The token is
+	// the one the session answer returned, with no expiry check against this
+	// device's clock.
+	if (!bInitialized || bNoKey || IsPlaytest() || bStoppedForRun || bShuttingDown || !Queue.IsActive()
+		|| Queue.GetSessionToken().IsEmpty())
 	{
 		// The next session answer asks again.
 		return;
