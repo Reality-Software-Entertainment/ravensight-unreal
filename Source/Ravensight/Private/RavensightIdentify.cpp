@@ -46,6 +46,21 @@ bool FRavensightIdentity::Load(const std::string& Text)
 	return true;
 }
 
+bool FRavensightIdentity::AdoptSaved(const std::string& Text, FRavensightIdentityEffects& Out)
+{
+	const std::string Waiting = Held;
+	if (!Load(Text)) return false;
+	if (Waiting.empty()) return true;
+	if (RavensightIdentify::AccountHash(SavedSalt, Waiting) == SavedHash)
+	{
+		Held.clear();
+		return true;
+	}
+	Reset(Out);
+	Held = Waiting;
+	return true;
+}
+
 std::string FRavensightIdentity::SavedText() const
 {
 	return SavedHash.empty() ? std::string() : SavedSalt + ":" + SavedHash;

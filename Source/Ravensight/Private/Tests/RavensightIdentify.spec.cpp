@@ -419,6 +419,35 @@ void FRavensightIdentifySpec::Define()
 			TestTrue(TEXT("good"), Identity.Load(std::string(Salt) + ":" + Accept[0].Wire));
 			TestTrue(TEXT("identified"), Identity.IsIdentified());
 		});
+
+		It("signs out a saved account when another was identified before the start", [this]()
+		{
+			// Identify("u2") before Init, then Init finds u1 saved.
+			FRavensightIdentity Identity;
+			FRavensightIdentityEffects Before;
+			TestTrue(TEXT("held"), Identity.Identify("u2", false, Before) == nullptr);
+			FRavensightIdentityEffects Effects;
+			TestTrue(TEXT("adopted"), Identity.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, Effects));
+			TestTrue(TEXT("saved one deleted"), Effects.bDeleteSaved);
+			TestTrue(TEXT("fresh device"), Effects.bResetDevice);
+			TestTrue(TEXT("u2 still held"), Identity.IsIdentified() && Identity.SavedText().empty());
+
+			// The same account: kept, no reset.
+			FRavensightIdentity Same;
+			FRavensightIdentityEffects Held;
+			Same.Identify("u1", false, Held);
+			FRavensightIdentityEffects SameEffects;
+			TestTrue(TEXT("adopted"), Same.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, SameEffects));
+			TestFalse(TEXT("no delete"), SameEffects.bDeleteSaved);
+			TestFalse(TEXT("no reset"), SameEffects.bResetDevice);
+			TestTrue(TEXT("kept"), Same.SavedText() == std::string(Salt) + ":" + Sequence[1].Stored);
+
+			// Nothing held: just loaded; malformed: refused.
+			FRavensightIdentity Plain;
+			FRavensightIdentityEffects PlainEffects;
+			TestTrue(TEXT("loaded"), Plain.AdoptSaved(std::string(Salt) + ":" + Sequence[1].Stored, PlainEffects));
+			TestFalse(TEXT("malformed"), Plain.AdoptSaved("x", PlainEffects));
+		});
 	});
 
 	Describe("a late answer", [this]()

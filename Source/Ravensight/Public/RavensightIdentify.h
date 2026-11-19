@@ -65,6 +65,13 @@ public:
 	/** Reads a saved value at start. False (and nothing loaded) when it is malformed. */
 	bool Load(const std::string& SavedText);
 
+	/**
+	 * Load at the start, when an id may already be held (Identify before Init).
+	 * Another account saved: it is signed out (delete it, fresh device) and the
+	 * held id stays. The same account: kept. False (nothing loaded) when malformed.
+	 */
+	bool AdoptSaved(const std::string& SavedText, FRavensightIdentityEffects& Out);
+
 	/** The value to save: the salt and the hash, "<salt>:<hash>". Never the raw id. */
 	std::string SavedText() const;
 
