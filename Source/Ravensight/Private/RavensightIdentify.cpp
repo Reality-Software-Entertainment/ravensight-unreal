@@ -95,6 +95,9 @@ const char* FRavensightIdentity::Identify(const std::string& AccountIdUtf8, bool
 
 void FRavensightIdentity::Reset(FRavensightIdentityEffects& Out)
 {
+	// A sign-out turns identify back on after no_session stopped it.
+	NoSessionCount = 0;
+	bNoSessionStopped = false;
 	if (!IsIdentified()) return;
 	Forget(Out);
 	Out.bResetDevice = true;
@@ -167,7 +170,7 @@ void FRavensightIdentity::Settle(bool bMayStore, FRavensightIdentityEffects& Out
 
 bool FRavensightIdentity::BeginSend(const std::string& SessionToken, std::string& OutBody, int32_t& OutGeneration)
 {
-	if (SavedHash.empty() || bStopped || bNoSalt || SessionToken.empty() || LaunchSalt != SavedSalt) return false;
+	if (SavedHash.empty() || bStopped || bNoSessionStopped || bNoSalt || SessionToken.empty() || LaunchSalt != SavedSalt) return false;
 	if (SessionToken == DoneToken) return false;
 	// Each session is tried once, whatever the answer.
 	DoneToken = SessionToken;
@@ -183,6 +186,18 @@ ERavensightIdentifyOutcome FRavensightIdentity::OnSendAnswer(int32_t SentGenerat
 	{
 		return ERavensightIdentifyOutcome::Ignored;
 	}
+	// no_session: the first is tried once at the next session, a second in a
+	// row stops identify until ResetIdentity. Any other answer resets the count.
+	if (Status == 400 && ErrorCode == "no_session")
+	{
+		if (++NoSessionCount >= 2)
+		{
+			bNoSessionStopped = true;
+			return ERavensightIdentifyOutcome::StoppedNoSession;
+		}
+		return ERavensightIdentifyOutcome::NextSession;
+	}
+	NoSessionCount = 0;
 	if (Status >= 200 && Status < 300)
 	{
 		return ERavensightIdentifyOutcome::Done;

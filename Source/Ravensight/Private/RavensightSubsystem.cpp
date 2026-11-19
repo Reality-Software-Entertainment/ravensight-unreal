@@ -1903,6 +1903,9 @@ void URavensightSubsystem::HandleIdentifyResponse(FHttpRequestPtr Request, FHttp
 			Log(FString::Printf(TEXT("identify not offered by this server (HTTP %d); not tried again this run"), Code));
 		}
 		return;
+	case ERavensightIdentifyOutcome::StoppedNoSession:
+		Log(TEXT("identify refused twice in a row (no_session); not tried again until ResetIdentity"));
+		return;
 	default:
 		Log(FString::Printf(TEXT("identify not done (HTTP %d %s); tried again next session"), Code, *Error));
 		return;

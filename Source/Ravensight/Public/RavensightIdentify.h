@@ -55,6 +55,8 @@ enum class ERavensightIdentifyOutcome : uint8_t
 	Done,
 	/** 404 or invalid_account_hash: not tried again this launch; the identity is kept. */
 	Stopped,
+	/** A second no_session in a row: not tried again until ResetIdentity; the identity is kept. */
+	StoppedNoSession,
 	/** Anything else: tried again at the next session, never in a loop. */
 	NextSession,
 };
@@ -117,5 +119,7 @@ private:
 	std::string DoneToken;
 	bool bNoSalt = false;
 	bool bStopped = false;
+	int32_t NoSessionCount = 0;
+	bool bNoSessionStopped = false;
 	int32_t Generation = 0;
 };
