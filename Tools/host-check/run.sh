@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Compiles FRavensightQueue, RavensightProtocol, RavensightTypedEvents,
-# RavensightErrorCapture, RavensightIdentify and their automation specs with
-# a plain C++17 compiler against the stand-in headers in include/, then runs
-# the specs. This is a host check of the engine-free logic only. It is not an
-# Unreal build: the subsystem, UnrealHeaderTool and UnrealBuildTool are not
-# involved. See Tools/README.md.
+# RavensightErrorCapture, RavensightIdentify, RavensightCampaignLink and their
+# automation specs with a plain C++17 compiler against the stand-in headers in
+# include/, then runs the specs. This is a host check of the engine-free logic
+# only. It is not an Unreal build: the subsystem, UnrealHeaderTool and
+# UnrealBuildTool are not involved. See Tools/README.md.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -24,6 +24,7 @@ python3 "$HERE/../identify-vectors/generate.py" --check
   "$SRC/Private/RavensightDelivery.cpp" \
   "$SRC/Private/RavensightErrorCapture.cpp" \
   "$SRC/Private/RavensightIdentify.cpp" \
+  "$SRC/Private/RavensightCampaignLink.cpp" \
   "$SRC/Private/Tests/RavensightQueue.spec.cpp" \
   "$SRC/Private/Tests/RavensightProtocol.spec.cpp" \
   "$SRC/Private/Tests/RavensightTypedEvents.spec.cpp" \
@@ -32,6 +33,7 @@ python3 "$HERE/../identify-vectors/generate.py" --check
   "$SRC/Private/Tests/RavensightQueueFile.spec.cpp" \
   "$SRC/Private/Tests/RavensightErrorCapture.spec.cpp" \
   "$SRC/Private/Tests/RavensightIdentify.spec.cpp" \
+  "$SRC/Private/Tests/RavensightCampaignLink.spec.cpp" \
   "$HERE/main.cpp" \
   -o "$OUT/host-check"
 

@@ -68,6 +68,25 @@ namespace
 		return Found;
 	}
 
+	/** A campaign link id, and the same id in upper case as a game might pass it. */
+	const TCHAR* const LinkId = TEXT("64b0000000000000000000a1");
+	const TCHAR* const LinkIdUpper = TEXT("64B0000000000000000000A1");
+	const TCHAR* const OtherLinkId = TEXT("64b0000000000000000000b2");
+
+	/** Every POST /session among Requests, in order. */
+	TArray<FHttpRequestPtr> SessionRequests(const TArray<FHttpRequestPtr>& All)
+	{
+		TArray<FHttpRequestPtr> Found;
+		for (const FHttpRequestPtr& Request : All)
+		{
+			if (Request->GetURL().EndsWith(TEXT("/api/v1/session")))
+			{
+				Found.Add(Request);
+			}
+		}
+		return Found;
+	}
+
 	/** A canned answer, as the HTTP module would hand it to a completion delegate. */
 	class FRavensightFakeResponse final : public IHttpResponse
 	{
@@ -129,6 +148,19 @@ namespace
 		const TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(BodyOf(Request));
 		FJsonSerializer::Deserialize(Reader, Object);
 		return Object;
+	}
+
+	/** The campaignLink of every POST /session among Requests, in order, "-" where one carries none. */
+	FString SentLinks(const TArray<FHttpRequestPtr>& All)
+	{
+		TArray<FString> Links;
+		for (const FHttpRequestPtr& Request : SessionRequests(All))
+		{
+			const TSharedPtr<FJsonObject> Body = JsonOf(Request);
+			FString Link;
+			Links.Add(Body.IsValid() && Body->TryGetStringField(TEXT("campaignLink"), Link) ? Link : FString(TEXT("-")));
+		}
+		return FString::Join(Links, TEXT(","));
 	}
 
 	/** The persisted queue files, removed before and after every case so no case reads another's queue. */
@@ -848,6 +880,192 @@ void FRavensightSubsystemSpec::Define()
 			Subsystem->SetTrackingEnabled(false);
 			TestFalse(TEXT("deleted"), HasSavedKey(IdentityKey));
 			TestFalse(TEXT("not identified"), Subsystem->IsIdentified());
+		});
+	});
+
+	Describe("campaign links", [this]()
+	{
+		It("sends a valid id lower cased on the first session only", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			TestTrue(TEXT("accepted before Init"), Subsystem->SetCampaignLink(LinkIdUpper));
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			TestEqual(TEXT("same key"), Requests[1]->GetHeader(TEXT("X-API-Key")), FString(SpecKey));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_1\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3)) return;
+
+			// The session is refused on the batch: the client opens a new one.
+			Answer(Requests[2], 401, TEXT("{\"error\":\"invalid_session\"}"));
+			TestEqualSensitive(TEXT("once, lower case"), SentLinks(Requests), FString::Printf(TEXT("%s,-"), LinkId));
+		});
+
+		It("refuses an id that is not 24 hex characters and keeps the earlier one", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			TestTrue(TEXT("valid"), Subsystem->SetCampaignLink(LinkId));
+			const TArray<FString> Invalid = { FString(), TEXT("aaaaaaaaaaaaaaaaaaaaaaa"), TEXT("aaaaaaaaaaaaaaaaaaaaaaaaa"),
+				TEXT("gggggggggggggggggggggggg"), FString(TEXT(" ")) + LinkId, FString(LinkId) + TEXT(" ") };
+			for (const FString& Id : Invalid)
+			{
+				TestFalse(*FString::Printf(TEXT("refused '%s'"), *Id), Subsystem->SetCampaignLink(Id));
+			}
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			TestEqualSensitive(TEXT("the earlier link"), SentLinks(Requests), FString(LinkId));
+		});
+
+		It("sends nothing for an invalid id alone, and a valid call replaces the pending one", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			TestFalse(TEXT("refused"), Subsystem->SetCampaignLink(TEXT("abc")));
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			TestEqualSensitive(TEXT("none"), SentLinks(Requests), FString(TEXT("-")));
+			StopInstance(Subsystem);
+			Requests.Reset();
+
+			URavensightSubsystem* Second = StartInstance();
+			TestTrue(TEXT("first"), Second->SetCampaignLink(LinkId));
+			TestTrue(TEXT("second"), Second->SetCampaignLink(OtherLinkId));
+			Second->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			TestEqualSensitive(TEXT("the later link"), SentLinks(Requests), FString(OtherLinkId));
+		});
+
+		It("keeps the link after a failed session and after a 201 without a token", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetCampaignLink(LinkId);
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 500, TEXT("{\"error\":\"internal_error\"}"));
+			TestFalse(TEXT("no session"), Subsystem->IsSessionReady());
+
+			Subsystem->Flush();
+			if (!TestEqual(TEXT("second session request"), Requests.Num(), 3)) return;
+			Answer(Requests[2], 201, TEXT("{}"));
+			TestFalse(TEXT("no session without a token"), Subsystem->IsSessionReady());
+
+			Subsystem->Flush();
+			if (!TestEqual(TEXT("third session request"), Requests.Num(), 4)) return;
+			Answer(Requests[3], 201, TEXT("{\"token\":\"tok_3\",\"expiresIn\":3600}"));
+			TestTrue(TEXT("session ready"), Subsystem->IsSessionReady());
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 5)) return;
+			Answer(Requests[4], 401, TEXT("{\"error\":\"invalid_session\"}"));
+
+			TestEqualSensitive(TEXT("kept until the 201 with a token, then cleared"), SentLinks(Requests),
+				FString::Printf(TEXT("%s,%s,%s,-"), LinkId, LinkId, LinkId));
+		});
+
+		It("a link set while the session is on the wire waits for the next session", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetCampaignLink(LinkId);
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			TestTrue(TEXT("a new link meanwhile"), Subsystem->SetCampaignLink(OtherLinkId));
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_1\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3)) return;
+			Answer(Requests[2], 401, TEXT("{\"error\":\"invalid_session\"}"));
+			if (!TestEqual(TEXT("next session request"), Requests.Num(), 4)) return;
+			Answer(Requests[3], 201, TEXT("{\"token\":\"tok_2\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("next batch request"), Requests.Num(), 5)) return;
+			// Accepted, so the next 401 opens a session again.
+			Answer(Requests[4], 202, TEXT("{\"accepted\":1}"));
+			Subsystem->TrackEvent(TEXT("later"), TMap<FString, FString>());
+			Subsystem->Flush();
+			if (!TestEqual(TEXT("a later batch"), Requests.Num(), 6)) return;
+			Answer(Requests[5], 401, TEXT("{\"error\":\"invalid_session\"}"));
+
+			TestEqualSensitive(TEXT("each link once"), SentLinks(Requests), FString::Printf(TEXT("%s,%s,-"), LinkId, OtherLinkId));
+		});
+
+		It("waits for the yes with Consent on Opt In, and an opted-out player sends nothing", [this]()
+		{
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptIn;
+			GConfig->RemoveKey(SaveSection, TrackingEnabledKey, GGameUserSettingsIni);
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetCampaignLink(LinkId);
+			Subsystem->Init(SpecKey);
+			Subsystem->Flush();
+			TestEqual(TEXT("nothing before the yes"), Requests.Num(), 0);
+
+			Subsystem->SetTrackingEnabled(true);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			TestEqualSensitive(TEXT("with the first session after the yes"), SentLinks(Requests), FString(LinkId));
+			StopInstance(Subsystem);
+			Requests.Reset();
+
+			GetMutableDefault<URavensightSettings>()->Consent = ERavensightConsent::OptOut;
+			URavensightSubsystem::SaveTrackingEnabled(false);
+			URavensightSubsystem* OptedOut = StartInstance();
+			TestTrue(TEXT("accepted"), OptedOut->SetCampaignLink(LinkId));
+			OptedOut->Init(SpecKey);
+			OptedOut->Flush();
+			TestEqual(TEXT("opted out: no request"), Requests.Num(), 0);
+		});
+
+		It("without a key makes no request", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			TestTrue(TEXT("accepted"), Subsystem->SetCampaignLink(LinkId));
+			Subsystem->Init(FString());
+			Subsystem->Flush();
+			TestEqual(TEXT("no request"), Requests.Num(), 0);
+		});
+
+		It("a Playtest run never sends it", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetPlaytestContext(TEXT("pt_token"), TEXT("run1"), TEXT("job1"), TEXT("persona"));
+			Subsystem->SetCampaignLink(LinkId);
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			if (!TestEqual(TEXT("session request"), Requests.Num(), 2)) return;
+			Answer(Requests[1], 201, TEXT("{\"token\":\"tok_pt\",\"expiresIn\":3600}"));
+			if (!TestEqual(TEXT("batch request"), Requests.Num(), 3)) return;
+			Answer(Requests[2], 401, TEXT("{\"error\":\"invalid_session\"}"));
+			TestEqualSensitive(TEXT("never"), SentLinks(Requests), FString(TEXT("-,-")));
+		});
+
+		It("is never saved", [this]()
+		{
+			URavensightSubsystem* Subsystem = StartInstance();
+			Subsystem->SetCampaignLink(LinkId);
+			Subsystem->Init(SpecKey);
+			if (!TestEqual(TEXT("settings request"), Requests.Num(), 1)) return;
+			Answer(Requests[0], 200, TEXT("{\"trackingEnabled\":true}"));
+			TestEqualSensitive(TEXT("sent"), SentLinks(Requests), FString(LinkId));
+			Subsystem->SetCampaignLink(OtherLinkId);
+			GConfig->Flush(false, GGameUserSettingsIni);
+
+			TArray<FString> Saved;
+			GConfig->GetSection(SaveSection, Saved, GGameUserSettingsIni);
+			for (const FString& Line : Saved)
+			{
+				TestFalse(*FString::Printf(TEXT("saved line '%s'"), *Line), Line.Contains(TEXT("64b0000000000000000000")));
+			}
+		});
+
+		It("reads rs_link out of an incoming address", [this]()
+		{
+			TestEqualSensitive(TEXT("universal link"),
+				URavensightSubsystem::CampaignLinkFromUrl(FString(TEXT("https://play.example.com/open?rs_link=")) + LinkIdUpper), FString(LinkId));
+			TestEqualSensitive(TEXT("non-ASCII path"),
+				URavensightSubsystem::CampaignLinkFromUrl(FString(TEXT("https://example.com/café?rs_link=")) + LinkId), FString(LinkId));
+			TestEqualSensitive(TEXT("none"), URavensightSubsystem::CampaignLinkFromUrl(TEXT("https://example.com/open?ref=x")), FString());
 		});
 	});
 
