@@ -76,3 +76,15 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   for the next launch, the session's device fields, ads and attribution, and exposure.
 - Requests went through the fake transport; no live Ravensight service, packaged
   build or device was exercised. No push to GitHub, tag or publication.
+
+## 0.6.0: identify players who sign in (November 19, 2026)
+
+- Branch `feat/identify`, built to the platform's identify contract version 2.
+- Host check: **167 cases passed** (150 before), plus the 4 report hash cases.
+- Unreal Engine 5.8 Mac Development editor target of a scratch host project,
+  built with `-WarningsAsErrors` (UnrealHeaderTool included) from commit
+  26e6c2a: passed. Full `Ravensight` automation run: **218 passed** (201 clean,
+  17 with expected warnings), 0 failed, 0 not run, among them the 17
+  engine-free identify cases and 8 subsystem identify cases.
+- Fake transport only: no live Ravensight service, packaged game or device
+  was used. Nothing was published, tagged or deployed.
