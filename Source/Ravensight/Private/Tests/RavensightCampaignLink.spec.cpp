@@ -15,12 +15,12 @@
 
 namespace RavensightCampaignLinkSpecCases
 {
-	struct FCase { const char* Note; const char* Input; const char* Expected; };
+	struct FLinkCase { const char* Note; const char* Input; const char* Expected; };
 
 	constexpr const char* Id = "64b0000000000000000000a1";
 
 	/** URLSearchParams on location.search, as the contract lists them, then more. */
-	constexpr FCase Searches[] = {
+	constexpr FLinkCase Searches[] = {
 		{ "the id among other parameters, upper case in", "?lang=en&rs_link=64B0000000000000000000A1&utm_source=x", Id },
 		{ "too short", "?rs_link=abc", "" },
 		{ "24 characters that are not hex", "?rs_link=gggggggggggggggggggggggg", "" },
@@ -45,7 +45,7 @@ namespace RavensightCampaignLinkSpecCases
 	};
 
 	/** Whole addresses a deep link, universal link or App Link handler receives, and referrers. */
-	constexpr FCase Urls[] = {
+	constexpr FLinkCase Urls[] = {
 		{ "a universal link", "https://play.example.com/open?rs_link=64B0000000000000000000A1", Id },
 		{ "a custom scheme", "mygame://open?level=2&rs_link=64b0000000000000000000a1", Id },
 		{ "a fragment after the query", "https://example.com/p?rs_link=64b0000000000000000000a1#top", Id },
@@ -97,7 +97,7 @@ void FRavensightCampaignLinkSpec::Define()
 		It("reads location.search as URLSearchParams.get does", [this]()
 		{
 			int32 Count = 0;
-			for (const FCase& Case : Searches)
+			for (const FLinkCase& Case : Searches)
 			{
 				TestTrue(Case.Note, RavensightCampaignLink::FromUrl(Case.Input) == std::string(Case.Expected));
 				++Count;
@@ -108,7 +108,7 @@ void FRavensightCampaignLinkSpec::Define()
 		It("reads the query of a whole address", [this]()
 		{
 			int32 Count = 0;
-			for (const FCase& Case : Urls)
+			for (const FLinkCase& Case : Urls)
 			{
 				TestTrue(Case.Note, RavensightCampaignLink::FromUrl(Case.Input) == std::string(Case.Expected));
 				++Count;

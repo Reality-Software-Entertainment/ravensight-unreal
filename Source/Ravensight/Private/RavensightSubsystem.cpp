@@ -32,6 +32,7 @@
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
 #include "RavensightBackupExclusion.h"
+#include "RavensightCampaignLink.h"
 #include "RavensightQueueFile.h"
 #include "RavensightDelivery.h"
 #include "Misc/Compression.h"
@@ -1581,12 +1582,19 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	{
 		Body->SetObjectField(TEXT("device"), Device);
 	}
+	// The player's own session only, never a Playtest run, and once: only a
+	// 201 with a token clears it (HandleSessionResponse).
+	const FString SentCampaignLink = IsPlaytest() ? FString() : PendingCampaignLink;
+	if (!SentCampaignLink.IsEmpty())
+	{
+		Body->SetStringField(TEXT("campaignLink"), SentCampaignLink);
+	}
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/session"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->SetContentAsString(WriteJson(Body));
-	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration);
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration, SentCampaignLink);
 
 	if (!RavensightTransport::Send(Request))
 	{
@@ -1599,12 +1607,26 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	}
 }
 
-void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation)
+void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SentCampaignLink)
 {
 	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
 	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
 
 	bSessionRequestPending = false;
+
+	// The server has the campaign link once it answered 201 with a token,
+	// whatever becomes of this session. A link set again while the request
+	// was on the wire is a new one and waits for the next session.
+	if (!SentCampaignLink.IsEmpty() && PendingCampaignLink.Equals(SentCampaignLink, ESearchCase::CaseSensitive)
+		&& bConnectedSuccessfully && Response.IsValid() && Response->GetResponseCode() == 201)
+	{
+		const TSharedPtr<FJsonObject> SessionAnswer = ParseJsonObject(ResponseBody(Response));
+		FString AnswerToken;
+		if (SessionAnswer.IsValid() && SessionAnswer->TryGetStringField(TEXT("token"), AnswerToken) && !AnswerToken.IsEmpty())
+		{
+			PendingCampaignLink.Reset();
+		}
+	}
 
 	// A session opened for a queue (or a device id) that has since been
 	// thrown away is not adopted. The next flush opens a fresh one.
@@ -1772,6 +1794,25 @@ void URavensightSubsystem::ResetIdentity()
 bool URavensightSubsystem::IsIdentified() const
 {
 	return Identity.IsIdentified();
+}
+
+// --- Campaign links -------------------------------------------------------------
+
+bool URavensightSubsystem::SetCampaignLink(const FString& LinkId)
+{
+	const std::string ValidId = RavensightCampaignLink::Valid(Utf8(LinkId));
+	if (ValidId.empty())
+	{
+		Log(TEXT("campaign link ignored: not a 24 character link id"));
+		return false;
+	}
+	PendingCampaignLink = FromUtf8(ValidId);
+	return true;
+}
+
+FString URavensightSubsystem::CampaignLinkFromUrl(const FString& Url)
+{
+	return FromUtf8(RavensightCampaignLink::FromUrl(Utf8(Url)));
 }
 
 bool URavensightSubsystem::MayStoreIdentity() const

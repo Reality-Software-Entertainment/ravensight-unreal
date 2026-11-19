@@ -202,6 +202,31 @@ public:
 	bool IsIdentified() const;
 
 	/**
+	 * Sends a Ravensight campaign link id with the next session the SDK
+	 * opens, so the Campaign links page counts this player and session for
+	 * that link. Call it from the deep link, universal link, App Link or
+	 * install referrer handler you already have, with the rs_link value of
+	 * the incoming address (CampaignLinkFromUrl reads it). Returns true when
+	 * the id is 24 hex characters (any case; sent lower case) and now waits
+	 * for a session, replacing any earlier one; false, changing nothing,
+	 * otherwise. Best called before the first session; a later call goes with
+	 * the next session the SDK opens. Never saved. Without a key, or before
+	 * consent, it waits in memory; a Playtest run never sends it. Callable
+	 * before Init.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Campaign Links")
+	bool SetCampaignLink(const FString& LinkId);
+
+	/**
+	 * The campaign link id (rs_link) in an incoming address, such as a deep
+	 * link, universal link or App Link, or in a query string such as an
+	 * install referrer: lower cased, or empty when there is none or it is not
+	 * a link id. Pass the result to SetCampaignLink.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Campaign Links")
+	static FString CampaignLinkFromUrl(const FString& Url);
+
+	/**
 	 * Marks this run as a Ravensight Playtest run. Call it before Init (turn
 	 * Auto Initialize off), for platforms where the runner cannot set
 	 * environment variables or a command line. Desktop builds read
@@ -541,7 +566,8 @@ private:
 	void AfterSettingsChecked();
 
 	void EnsureSession(bool bExplicit = false);
-	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation);
+	/** SentCampaignLink: the campaignLink this session request carried, empty when none. */
+	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SentCampaignLink);
 
 	void FlushInternal(bool bForce, bool bExplicit = false);
 	void SendBatch(const TArray<FRavensightEvent>& Batch);
@@ -736,6 +762,13 @@ private:
 	/** Identify: the raw account id lives only in here, in memory, until it is hashed. */
 	FRavensightIdentity Identity;
 	bool bIdentifyBugLogged = false;
+
+	/**
+	 * The campaign link id waiting for the next session, lower case; empty
+	 * when none. Memory only. Cleared only when POST /session answers 201
+	 * with a token for a request that carried it.
+	 */
+	FString PendingCampaignLink;
 
 	/** iOS: a background task is running for the background flush. */
 	bool bBackgroundTaskActive = false;
