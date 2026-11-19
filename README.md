@@ -976,3 +976,7 @@ Processing and refunds are server-authoritative. A transport error is not proof 
 nothing was charged: poll or cancel the retained handle. Server support requires Player
 Reports enabled on the server, with private storage and report processing.
 The server strips image metadata and delivers sanitized JPEGs and thumbnails to the inbox.
+
+## Contributing
+
+Install the local checks once per clone: `git config core.hooksPath .githooks`. The pre-push hook then runs this repository's tests before every push, with a time limit, and refuses the push if they fail. CI runs nightly and on demand, not on pushes or pull requests, so this hook is where a change is checked first.
