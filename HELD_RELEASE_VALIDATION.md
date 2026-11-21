@@ -107,3 +107,16 @@ No pushes, tags, marketplace submissions, publishing or remote deployments were 
   run, nothing saved).
 - Fake transport only: no live Ravensight service, packaged game or device
   was used. Nothing was published, tagged or deployed.
+
+### Release (November 21, 2026)
+
+- Identify, campaign links, the Mac Shipping network note and the device
+  model fix (`device.model` without the make) together on main at ffe9ef1.
+- Host check: **174 cases passed**, plus the 4 report hash cases.
+- Unreal Engine 5.8 Mac Development editor target of a scratch host project,
+  built with `-WarningsAsErrors` (UnrealHeaderTool included) from this
+  release tree: passed. Full `Ravensight` automation run: **235 passed** (219
+  clean, 16 with expected warnings), 0 failed, 0 not run, the device model
+  case among them.
+- Fake transport only: no live Ravensight service, packaged game or device
+  was used.
