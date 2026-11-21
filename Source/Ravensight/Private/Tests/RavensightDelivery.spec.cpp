@@ -150,6 +150,18 @@ void FRavensightDeliverySpec::Define()
 			TestTrue(TEXT("version only"), RavensightDelivery::OsVersionFrom("10.0.22631") == "10.0.22631");
 			TestTrue(TEXT("name only"), RavensightDelivery::OsVersionFrom("Linux").empty());
 		});
+
+		It("sends the model from make|model without the make or the chipset", [this]()
+		{
+			TestTrue(TEXT("mac"), RavensightDelivery::DeviceModelFrom("Apple|Apple M4 Pro") == "Apple M4 Pro");
+			TestTrue(TEXT("ios"), RavensightDelivery::DeviceModelFrom("Apple|iPhone15,2") == "iPhone15,2");
+			TestTrue(TEXT("android with chipset"), RavensightDelivery::DeviceModelFrom("samsung|SM-S918B|SM8550") == "SM-S918B");
+			TestTrue(TEXT("trimmed"), RavensightDelivery::DeviceModelFrom(" Google | Pixel 7 ") == "Pixel 7");
+			TestTrue(TEXT("no model keeps the make"), RavensightDelivery::DeviceModelFrom("GenuineIntel| ") == "GenuineIntel");
+			TestTrue(TEXT("no separator"), RavensightDelivery::DeviceModelFrom("MacBookPro18,3") == "MacBookPro18,3");
+			TestTrue(TEXT("empty"), RavensightDelivery::DeviceModelFrom("|").empty());
+			TestTrue(TEXT("cut"), RavensightDelivery::DeviceModelFrom("Make|" + Repeat("g", 200)) == Repeat("g", 128));
+		});
 	});
 }
 

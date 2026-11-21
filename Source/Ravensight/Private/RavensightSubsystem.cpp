@@ -32,6 +32,7 @@
 #include "Misc/ScopeExit.h"
 #include "RavensightBackgroundTask.h"
 #include "RavensightBackupExclusion.h"
+#include "RavensightCampaignLink.h"
 #include "RavensightQueueFile.h"
 #include "RavensightDelivery.h"
 #include "Misc/Compression.h"
@@ -64,6 +65,9 @@ namespace
 	const TCHAR* const MarkerExpiresAtKey = TEXT("BackgroundSessionExpiresAt");
 	const TCHAR* const MarkerBackgroundedAtKey = TEXT("BackgroundedAt");
 	const TCHAR* const MarkerOriginKey = TEXT("BackgroundSessionOrigin");
+
+	/** The saved identity, "<salt>:<accountHash>" (the engine's ravensight_identity). Never the raw account id. */
+	const TCHAR* const IdentityKey = TEXT("Identity");
 
 	/** The device id this install's attribution was queued for, saved beside the device id. */
 	const TCHAR* const AttributionSentKey = TEXT("AttributionSentFor");
@@ -288,14 +292,21 @@ void URavensightSubsystem::Init(const FString& InIngestKey, const FString& InApi
 		DeviceId = TEXT("pt-") + PlaytestRunId;
 		Platform = PlaytestPlatform;
 	}
-	else if (Consent == ERavensightConsent::OptIn && !Queue.IsLocallyEnabled())
-	{
-		// Opt In before the player's yes: no device id is made or read.
-		DeviceId.Reset();
-	}
 	else
 	{
-		DeviceId = ResolveDeviceId();
+		// Before the device id is read: signing out a saved account forgets
+		// the saved device id too, so a fresh one is made just below.
+		AdoptSavedIdentity();
+
+		if (Consent == ERavensightConsent::OptIn && !Queue.IsLocallyEnabled())
+		{
+			// Opt In before the player's yes: no device id is made or read.
+			DeviceId.Reset();
+		}
+		else
+		{
+			DeviceId = ResolveDeviceId();
+		}
 	}
 
 	// Events tracked before Init were given an id without the device part,
@@ -409,6 +420,14 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 	// setting says, so the choice is on disk the moment the player makes it.
 	SaveTrackingEnabled(bEnabled);
 
+	if (!bEnabled)
+	{
+		// Opt-out or consent withdrawn: the identity and a held id go.
+		FRavensightIdentityEffects Effects;
+		Identity.Forget(Effects);
+		ApplyIdentityEffects(Effects);
+	}
+
 	if (bEnabled == Queue.IsLocallyEnabled())
 	{
 		return;
@@ -437,6 +456,13 @@ void URavensightSubsystem::SetTrackingEnabled(bool bEnabled)
 
 	Log(TEXT("tracking opted in"));
 	StartIfAllowed();
+
+	if (MayStoreIdentity())
+	{
+		FRavensightIdentityEffects Effects;
+		Identity.MayStoreNow(Effects);
+		ApplyIdentityEffects(Effects);
+	}
 }
 
 void URavensightSubsystem::SaveTrackingEnabled(bool bEnabled)
@@ -495,6 +521,7 @@ void URavensightSubsystem::SetEnabled(bool bInEnabled)
 
 	if (!bInEnabled)
 	{
+		// The game's own switch keeps the identity; the player's opt-out deletes it.
 		Log(TEXT("disabled by the game, queue discarded"));
 		StopErrorCapture(true);
 		BumpQueueGeneration();
@@ -506,6 +533,13 @@ void URavensightSubsystem::SetEnabled(bool bInEnabled)
 
 	Log(TEXT("enabled by the game"));
 	StartIfAllowed();
+
+	if (MayStoreIdentity())
+	{
+		FRavensightIdentityEffects Effects;
+		Identity.MayStoreNow(Effects);
+		ApplyIdentityEffects(Effects);
+	}
 }
 
 FString URavensightSubsystem::ResetDeviceId()
@@ -1548,12 +1582,19 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	{
 		Body->SetObjectField(TEXT("device"), Device);
 	}
+	// The player's own session only, never a Playtest run, and once: only a
+	// 201 with a token clears it (HandleSessionResponse).
+	const FString SentCampaignLink = IsPlaytest() ? FString() : PendingCampaignLink;
+	if (!SentCampaignLink.IsEmpty())
+	{
+		Body->SetStringField(TEXT("campaignLink"), SentCampaignLink);
+	}
 
 	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/session"));
 	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
 	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
 	Request->SetContentAsString(WriteJson(Body));
-	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration);
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleSessionResponse, QueueGeneration, SentCampaignLink);
 
 	if (!RavensightTransport::Send(Request))
 	{
@@ -1566,12 +1607,26 @@ void URavensightSubsystem::EnsureSession(bool bExplicit)
 	}
 }
 
-void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation)
+void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SentCampaignLink)
 {
 	// Whatever this answer leads to, an iOS background task ends once nothing is left in flight.
 	ON_SCOPE_EXIT { EndBackgroundTaskIfIdle(); };
 
 	bSessionRequestPending = false;
+
+	// The server has the campaign link once it answered 201 with a token,
+	// whatever becomes of this session. A link set again while the request
+	// was on the wire is a new one and waits for the next session.
+	if (!SentCampaignLink.IsEmpty() && PendingCampaignLink.Equals(SentCampaignLink, ESearchCase::CaseSensitive)
+		&& bConnectedSuccessfully && Response.IsValid() && Response->GetResponseCode() == 201)
+	{
+		const TSharedPtr<FJsonObject> SessionAnswer = ParseJsonObject(ResponseBody(Response));
+		FString AnswerToken;
+		if (SessionAnswer.IsValid() && SessionAnswer->TryGetStringField(TEXT("token"), AnswerToken) && !AnswerToken.IsEmpty())
+		{
+			PendingCampaignLink.Reset();
+		}
+	}
 
 	// A session opened for a queue (or a device id) that has since been
 	// thrown away is not adopted. The next flush opens a fresh one.
@@ -1620,6 +1675,26 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			Queue.SetSession(Token, ExpiresAt);
 			AdoptSessionAnswer(Parsed);
 
+			// The game's identify salt, or none from an older server. The
+			// request itself goes after this session's first batch.
+			FString IdentifySalt;
+			const TSharedPtr<FJsonObject>* IdentifyObject = nullptr;
+			const bool bHasSalt = Parsed->TryGetObjectField(TEXT("identify"), IdentifyObject) && IdentifyObject
+				&& IdentifyObject->IsValid() && (*IdentifyObject)->TryGetStringField(TEXT("salt"), IdentifySalt);
+			FRavensightIdentityEffects IdentityEffects;
+			Identity.OnSessionAnswer(bHasSalt, Utf8(IdentifySalt), MayStoreIdentity(), IdentityEffects);
+			const bool bIdentifyDue = IdentityEffects.bSend;
+			IdentityEffects.bSend = false;
+			ApplyIdentityEffects(IdentityEffects);
+			if (IdentityEffects.bResetDevice)
+			{
+				// Another account signed in before the salt was known: the saved
+				// one was signed out with this session. A fresh one opens now.
+				Log(TEXT("signed out the saved account; opening a session for the next one"));
+				EnsureSession();
+				return;
+			}
+
 			// After batch 401s past the re open cap the ladder keeps climbing:
 			// only a 202 resets it then.
 			if (ConsecutiveBatchUnauthorized == 0)
@@ -1634,6 +1709,10 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 			FetchConfig();
 
 			FlushInternal(false);
+			if (bIdentifyDue)
+			{
+				SendIdentify();
+			}
 			return;
 		}
 
@@ -1674,6 +1753,202 @@ void URavensightSubsystem::HandleSessionResponse(FHttpRequestPtr Request, FHttpR
 		SetStatusReason(RavensightProtocol::NextStatusReason(RavensightReason::SessionFailed, Verdict));
 		OnSessionFailed.Broadcast(FailReason);
 		ScheduleRetry();
+		return;
+	}
+}
+
+// --- Identify ---------------------------------------------------------------
+
+bool URavensightSubsystem::Identify(const FString& AccountId)
+{
+	FRavensightIdentityEffects Effects;
+	if (const char* Refusal = Identity.Identify(Utf8(AccountId), MayStoreIdentity(), Effects))
+	{
+		UE_LOG(LogRavensight, Warning,
+			TEXT("Identify refused (%s): an account id is 1 to 256 bytes of text with no @. Nothing changed."),
+			UTF8_TO_TCHAR(Refusal));
+		return false;
+	}
+	ApplyIdentityEffects(Effects);
+	return true;
+}
+
+void URavensightSubsystem::ResetIdentity()
+{
+	FRavensightIdentityEffects Effects;
+	Identity.Reset(Effects);
+	if (!Effects.bResetDevice && GConfig && !IsPlaytest())
+	{
+		// A saved identity this run never read (no key, or before consent) is
+		// signed out too.
+		FString Existing;
+		if (GConfig->GetString(SaveSection, IdentityKey, Existing, GGameUserSettingsIni) && !Existing.IsEmpty())
+		{
+			Effects.bDeleteSaved = true;
+			Effects.bResetDevice = true;
+		}
+	}
+	ApplyIdentityEffects(Effects);
+}
+
+bool URavensightSubsystem::IsIdentified() const
+{
+	return Identity.IsIdentified();
+}
+
+// --- Campaign links -------------------------------------------------------------
+
+bool URavensightSubsystem::SetCampaignLink(const FString& LinkId)
+{
+	const std::string ValidId = RavensightCampaignLink::Valid(Utf8(LinkId));
+	if (ValidId.empty())
+	{
+		Log(TEXT("campaign link ignored: not a 24 character link id"));
+		return false;
+	}
+	PendingCampaignLink = FromUtf8(ValidId);
+	return true;
+}
+
+FString URavensightSubsystem::CampaignLinkFromUrl(const FString& Url)
+{
+	return FromUtf8(RavensightCampaignLink::FromUrl(Utf8(Url)));
+}
+
+bool URavensightSubsystem::MayStoreIdentity() const
+{
+	return bInitialized && !bNoKey && !bStoppedForRun && CurrentGate().bAllowEnqueue;
+}
+
+void URavensightSubsystem::AdoptSavedIdentity()
+{
+	if (!GConfig || IsPlaytest() || bNoKey)
+	{
+		return;
+	}
+
+	FString Saved;
+	if (!GConfig->GetString(SaveSection, IdentityKey, Saved, GGameUserSettingsIni) || Saved.IsEmpty())
+	{
+		return;
+	}
+
+	FRavensightIdentityEffects Effects;
+	if (!Queue.IsLocallyEnabled() || !Identity.AdoptSaved(Utf8(Saved), Effects))
+	{
+		// Opted out (or no yes yet), or not ours to read: nothing is kept.
+		GConfig->RemoveKey(SaveSection, IdentityKey, GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+		return;
+	}
+	if (Effects.bDeleteSaved)
+	{
+		GConfig->RemoveKey(SaveSection, IdentityKey, GGameUserSettingsIni);
+	}
+	if (Effects.bResetDevice)
+	{
+		// Another account was identified before Init: the next player's device
+		// id is fresh, as after ResetIdentity.
+		GConfig->RemoveKey(SaveSection, DeviceIdKey, GGameUserSettingsIni);
+	}
+	GConfig->Flush(false, GGameUserSettingsIni);
+}
+
+void URavensightSubsystem::ApplyIdentityEffects(const FRavensightIdentityEffects& Effects)
+{
+	// Never written during a Playtest run or without a key, as with every saved
+	// value; an earlier build's identity is still deleted on opt-out or sign-out.
+	const bool bDisk = GConfig && !IsPlaytest() && !bNoKey;
+
+	if (Effects.bDeleteSaved && GConfig && !IsPlaytest())
+	{
+		FString Existing;
+		if (GConfig->GetString(SaveSection, IdentityKey, Existing, GGameUserSettingsIni))
+		{
+			GConfig->RemoveKey(SaveSection, IdentityKey, GGameUserSettingsIni);
+			GConfig->Flush(false, GGameUserSettingsIni);
+		}
+	}
+	if (Effects.bResetDevice && bInitialized && !bNoKey)
+	{
+		ResetDeviceId();
+	}
+	if (Effects.bSave && bDisk)
+	{
+		GConfig->SetString(SaveSection, IdentityKey, *FromUtf8(Identity.SavedText()), GGameUserSettingsIni);
+		GConfig->Flush(false, GGameUserSettingsIni);
+	}
+	if (Effects.bSend)
+	{
+		SendIdentify();
+	}
+}
+
+void URavensightSubsystem::SendIdentify()
+{
+	// A Playtest run keeps identify in memory and sends nothing. The token is
+	// the one the session answer returned, with no expiry check against this
+	// device's clock.
+	if (!bInitialized || bNoKey || IsPlaytest() || bStoppedForRun || bShuttingDown || !Queue.IsActive()
+		|| Queue.GetSessionToken().IsEmpty())
+	{
+		// The next session answer asks again.
+		return;
+	}
+
+	const FString Token = Queue.GetSessionToken();
+	std::string Body;
+	int32 Generation = 0;
+	if (!Identity.BeginSend(Utf8(Token), Body, Generation))
+	{
+		return;
+	}
+
+	// Never queued and never in the queue file: a request of its own, which
+	// no event waits on.
+	const FHttpRequestRef Request = MakeRequest(TEXT("POST"), TEXT("/identify"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("X-API-Key"), IngestKey);
+	Request->SetHeader(TEXT("X-Session-Token"), Token);
+	Request->SetContentAsString(FromUtf8(Body));
+	Request->OnProcessRequestComplete().BindUObject(this, &URavensightSubsystem::HandleIdentifyResponse, Generation, Token);
+
+	if (!RavensightTransport::Send(Request))
+	{
+		Log(TEXT("identify request could not start; tried again next session"));
+	}
+}
+
+void URavensightSubsystem::HandleIdentifyResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SessionToken)
+{
+	const bool bAnswered = bConnectedSuccessfully && Response.IsValid();
+	const int32 Code = bAnswered ? Response->GetResponseCode() : 0;
+	const FString Error = bAnswered ? ExtractError(ResponseBody(Response), FString()) : FString();
+
+	switch (Identity.OnSendAnswer(Generation, Utf8(SessionToken), Utf8(Queue.GetSessionToken()), Code, Utf8(Error)))
+	{
+	case ERavensightIdentifyOutcome::Ignored:
+		// For an identity or a session that is gone: changes nothing.
+		return;
+	case ERavensightIdentifyOutcome::Done:
+		Log(TEXT("identified this session"));
+		return;
+	case ERavensightIdentifyOutcome::Stopped:
+		if (Code == 400 && !bIdentifyBugLogged)
+		{
+			bIdentifyBugLogged = true;
+			UE_LOG(LogRavensight, Warning, TEXT("identify refused (invalid_account_hash); not tried again this run"));
+		}
+		else
+		{
+			Log(FString::Printf(TEXT("identify not offered by this server (HTTP %d); not tried again this run"), Code));
+		}
+		return;
+	case ERavensightIdentifyOutcome::StoppedNoSession:
+		Log(TEXT("identify refused twice in a row (no_session); not tried again until ResetIdentity"));
+		return;
+	default:
+		Log(FString::Printf(TEXT("identify not done (HTTP %d %s); tried again next session"), Code, *Error));
 		return;
 	}
 }
@@ -3008,7 +3283,7 @@ TSharedRef<FJsonObject> URavensightSubsystem::DeviceFields() const
 	// Only what the engine reports without a permission prompt; none is a
 	// hardware identifier.
 	const TSharedRef<FJsonObject> Device = MakeShared<FJsonObject>();
-	const std::string Model = RavensightDelivery::DeviceField(Utf8(FPlatformMisc::GetDeviceMakeAndModel()));
+	const std::string Model = RavensightDelivery::DeviceModelFrom(Utf8(FPlatformMisc::GetDeviceMakeAndModel()));
 	const std::string OsVersion = RavensightDelivery::OsVersionFrom(Utf8(FPlatformMisc::GetOSVersion()));
 	const std::string Gpu = RavensightDelivery::DeviceField(Utf8(GRHIAdapterName));
 	if (!Model.empty()) Device->SetStringField(TEXT("model"), FromUtf8(Model));

@@ -426,6 +426,8 @@ callable.
 | `SaveTrackingEnabled(bool)` / `LoadTrackingEnabled()` | Static: write or read the saved choice without a running subsystem. |
 | `SetEnabled(bool)` | The developer switch, the runtime side of the Enabled setting. Not saved. |
 | `ResetDeviceId()` | Forgets this install's identity: a new saved id, an empty queue, a new session on the next event. Returns the new id. |
+| `SetCampaignLink(LinkId)` | Sends a campaign link id once, with the next session, from your deep link or App Link handler. Returns false for anything but 24 hex characters. See [Campaign links](#campaign-links). |
+| `CampaignLinkFromUrl(Url)` | Static: the `rs_link` id in an incoming address or query string, lower cased, or empty. |
 | `SetPlaytestContext(Token, RunId, JobId, Persona)` | Marks the run as a Playtest run, for platforms where the runner cannot set the environment. Call before `Init`. |
 | `IsSessionReady()` | True once a session token exists and has not expired. |
 | `IsTrackingActive()` | True when the Enabled setting, the kill switch, the player's choice and the key all allow sending. |
@@ -503,6 +505,16 @@ the server's events join this player's session.
 Watch the SDK work with `Log LogRavensight Verbose` in the console, or turn
 Verbose Logging on to get the same lines at normal verbosity in a packaged
 build.
+
+If you edit `Config/DefaultGame.ini` by hand, quote the URL. The engine's ini
+reader cuts an unquoted value at `//`, so `ApiUrl=http://127.0.0.1:8080`
+reaches the plugin as `http:` and no request arrives anywhere. The settings
+panel writes the quotes for you:
+
+```ini
+[/Script/Ravensight.RavensightSettings]
+ApiUrl="https://api.ravensight.io"
+```
 
 ## Public builds
 
@@ -614,6 +626,52 @@ callable.
 return false across restarts. Pass `GetDeviceId()` to an attribution partner
 as its customer user id before the partner starts, so its install callback
 names this device.
+
+## Campaign links
+
+A Ravensight campaign link counts the players and sessions it brought on the
+Campaign links page, and you can open those players in Player insights. The
+link's redirect adds `rs_link=<link id>` to your own https page, so a
+universal link or App Link that opens the game carries it. Hand it to the
+plugin from the deep link handler you already have, and the plugin sends it
+once, as `campaignLink` on the next `POST /session`: the same request,
+nothing else added. Unreal has no web build, so there is no page address to
+read by itself. Both calls are Blueprint callable too (Ravensight | Campaign
+Links).
+
+```cpp
+#include "RavensightSubsystem.h"
+
+// Wherever your game already receives a deep link, universal link or App Link.
+void UMyGameInstance::HandleIncomingLink(const FString& Url)
+{
+    const FString LinkId = URavensightSubsystem::CampaignLinkFromUrl(Url);
+    if (!LinkId.IsEmpty())
+    {
+        GetSubsystem<URavensightSubsystem>()->SetCampaignLink(LinkId);
+    }
+    // ...then your own deep link handling.
+}
+```
+
+`CampaignLinkFromUrl` also reads a bare query string, such as an install
+referrer you already read.
+
+- **`SetCampaignLink(LinkId)`** returns true when the id is 24 hex
+  characters (any case; it is sent lower case) and now waits for a session,
+  replacing any earlier one. Anything else returns false and changes
+  nothing. You can call it before `Init`. Best called before the first
+  session; a later call goes with the next session the plugin opens.
+- **Once:** only a session the server opens clears it. A failed or offline
+  attempt keeps it for the next one, and later sessions carry none unless
+  you set one again.
+- **Consent:** without a key nothing is sent. With Consent on Opt In it waits
+  and goes with the first session after the player's yes; an opted out
+  player sends nothing. A Playtest run never sends it.
+- **Nothing stored:** the id is held in memory only, never in
+  `GameUserSettings.ini` or the queue file. It is an id your studio made,
+  not personal data. The server keeps it only when it names a link of the
+  same game.
 
 ## About your ingest key
 
@@ -745,6 +803,7 @@ Source/Ravensight/
     RavensightSubsystem.h    UGameInstanceSubsystem, the entry point
     RavensightProtocol.h     response table, feedback rules, lifecycle rules
     RavensightTypedEvents.h  typed event property sets and the health sampler, no UObject
+    RavensightCampaignLink.h the campaign link id check and rs_link parsing, no UObject
   Private/
     RavensightQueue.cpp
     RavensightProtocol.cpp
@@ -834,12 +893,15 @@ advertising id, or any hardware identifier. Besides the events you send, the
 SDK sends:
 
 * **Device fields**, once per session on `POST /session`: `model`
-  (`FPlatformMisc::GetDeviceMakeAndModel`), `osVersion`
+  (the model part of `FPlatformMisc::GetDeviceMakeAndModel`, such as
+  `iPhone15,2` or `Apple M4 Pro`, without the make), `osVersion`
   (`FPlatformMisc::GetOSVersion`, the OS name removed) and `gpu`
   (`GRHIAdapterName`). The engine reports these without a permission prompt;
   none is a hardware identifier. Each is at most 128 printable characters. The
   server derives the country itself; the SDK never sends one.
 * **Attribution**, once per install, only when the game calls `SetAttribution`.
+* **Campaign link**, once, on the next `POST /session`, only when the game
+  passes one to `SetCampaignLink`. See [Campaign links](#campaign-links).
 
 The queue file under `Saved/Ravensight` holds queued events and each session's
 opaque origin stamp; never the session token or signing secret.
@@ -916,6 +978,56 @@ Product Interaction as not linked to the player and not used for tracking,
 and needs no tracking permission prompt. The row by row answers for the App
 Store and Google Play forms are at https://ravensight.io/docs/#privacy-label.
 
+## Identify players who sign in
+
+If your game has its own accounts, tell Ravensight who signed in, so one
+person on two devices, or before and after sign-in, counts as one player.
+Both calls are Blueprint callable too (Ravensight | Identity).
+
+```cpp
+if (URavensightSubsystem* Ravensight = URavensightSubsystem::Get(this))
+{
+    Ravensight->Identify(Account.AnalyticsId);   // after your own sign-in succeeds: a random id stored with the account
+    Ravensight->ResetIdentity();                 // on sign-out
+}
+```
+
+- **Pass a random, high-entropy id**, such as a random UUID
+  (`FGuid::NewGuid().ToString()`) or a random analytics id you make once for
+  each account and store with it, never a sequential database key, an email,
+  a name or a handle. Your game's salt reaches every copy of the game, so
+  anyone could hash 1, 2, 3 and onward and match a guessable id; a random
+  one cannot be guessed. The hash is still a pseudonymous identifier for the
+  player: declare it in your game's privacy notice.
+- **What is sent:** a salted hash of the account id (HMAC-SHA256 with your
+  game's own salt, which the session answer gives the plugin) and the
+  session token, once per session. The raw account id is never sent and
+  never saved; emails and names are never sent.
+- **Checked on the device:** the id must not be empty, must be at most 256
+  bytes of UTF-8 and must not contain `@`, so an email or a handle is
+  refused: `Identify` returns false, logs one warning and changes nothing.
+  It is used exactly as given (never trimmed).
+- **Remembered:** only the salt and the hash, under `[Ravensight]` in
+  `GameUserSettings.ini` beside the device id (key `Identity`), so the next
+  launch identifies its session without another call. `IsIdentified()` says
+  whether one is set.
+- **`ResetIdentity()`** on sign-out forgets it and switches to a fresh
+  device id, exactly like `ResetDeviceId()`, so the next player on this
+  device is not linked to the account. `ResetDeviceId()` alone keeps it.
+- **Signing in as another account** calls `ResetIdentity()` for you first.
+- **Consent:** without a key, or with Consent on Opt In before the player's
+  yes, the id waits in memory and nothing is sent. The player's opt-out
+  (`SetTrackingEnabled(false)`) forgets it; your own switch,
+  `SetEnabled(false)`, keeps it and identifies again when turned back on. A
+  Playtest run keeps it in memory and sends nothing. You can call `Identify`
+  before `Init`.
+- **Cost:** one event on your usage meter per identified session. The
+  request goes after the session's first batch and never holds up your
+  events.
+
+A game that calls `Identify` links its data to the player's account:
+answer the store privacy forms that way.
+
 ## Telling players
 
 You do not need a permission prompt, but saying what the game sends is good
@@ -938,6 +1050,45 @@ Console networking still has to pass platform certification, which is the
 developer's responsibility as it would be for any online feature. So far it
 has been built and spec tested on macOS only (Unreal Engine 5.8.3); see
 [Verification status](#verification-status).
+
+### macOS Shipping builds need network access
+
+Unreal Engine 5.8 signs a Mac Shipping build with its default App Sandbox
+entitlements, which allow no network access. In that build the plugin starts
+and queues every event to disk, but no request leaves the game, so the
+dashboard stays empty while Development builds and Play In Editor work. Give
+Shipping the outgoing connection entitlement,
+`com.apple.security.network.client`:
+
+1. Add `Build/Mac/Resources/Sandbox.ShippingNet.entitlements` to your project:
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+   	<key>com.apple.security.app-sandbox</key>
+   	<true/>
+   	<key>com.apple.security.network.client</key>
+   	<true/>
+   </dict>
+   </plist>
+   ```
+
+2. Point the Shipping entitlements at it in `Config/DefaultEngine.ini`:
+
+   ```ini
+   [/Script/MacTargetPlatform.XcodeProjectSettings]
+   ShippingSpecificMacEntitlements=(FilePath="/Game/Build/Mac/Resources/Sandbox.ShippingNet.entitlements")
+   ```
+
+3. Package again.
+
+`network.client` allows outgoing connections only; the game still accepts no
+incoming ones. Checked on 2026-11-13 with Unreal Engine 5.8.3: a packaged,
+sandboxed Shipping app with this entitlement passed the same 11 delivery
+checks as the editor, and the same app with the default entitlements sent
+nothing.
 
 ## Other SDKs
 

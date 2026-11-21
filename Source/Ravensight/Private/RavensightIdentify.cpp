@@ -1,0 +1,211 @@
+// Copyright 2026 Reality Software Entertainment. MIT licensed.
+
+#include "RavensightIdentify.h"
+
+#include "RavensightDelivery.h"
+
+namespace RavensightIdentify
+{
+	const char* Refusal(const std::string& AccountIdUtf8)
+	{
+		if (AccountIdUtf8.empty()) return "empty";
+		if (AccountIdUtf8.size() > MaxBytes) return "too_long";
+		if (AccountIdUtf8.find('@') != std::string::npos) return "looks_like_email";
+		return nullptr;
+	}
+
+	std::string AccountHash(const std::string& Salt, const std::string& AccountIdUtf8)
+	{
+		return RavensightDelivery::HmacSha256Hex(Salt, AccountIdUtf8);
+	}
+
+	bool IsHex64(const std::string& Text)
+	{
+		if (Text.size() != 64) return false;
+		for (const char C : Text)
+		{
+			if (!((C >= '0' && C <= '9') || (C >= 'a' && C <= 'f'))) return false;
+		}
+		return true;
+	}
+
+	std::string RequestBody(const std::string& Hash)
+	{
+		return "{\"accountHash\":\"" + Hash + "\"}";
+	}
+}
+
+bool FRavensightIdentity::Load(const std::string& Text)
+{
+	if (Text.size() != 129 || Text[64] != ':') return false;
+	const std::string Salt = Text.substr(0, 64);
+	const std::string Hash = Text.substr(65);
+	if (!RavensightIdentify::IsHex64(Salt) || !RavensightIdentify::IsHex64(Hash)) return false;
+	SavedSalt = Salt;
+	SavedHash = Hash;
+	return true;
+}
+
+bool FRavensightIdentity::AdoptSaved(const std::string& Text, FRavensightIdentityEffects& /*Out*/)
+{
+	// A held id is decided when this launch's salt arrives, not here: the
+	// saved identity may be another game's.
+	return Load(Text);
+}
+
+std::string FRavensightIdentity::SavedText() const
+{
+	return SavedHash.empty() ? std::string() : SavedSalt + ":" + SavedHash;
+}
+
+const char* FRavensightIdentity::Identify(const std::string& AccountIdUtf8, bool bMayStore, FRavensightIdentityEffects& Out)
+{
+	if (const char* Reason = RavensightIdentify::Refusal(AccountIdUtf8))
+	{
+		return Reason;
+	}
+	if (bNoSalt)
+	{
+		// An older server: nothing is held, saved or sent this launch.
+		return nullptr;
+	}
+	if (LaunchSalt.empty())
+	{
+		// This launch's salt is not known yet, and a saved identity may be
+		// another game's: hold the id (the last call wins) and decide when the
+		// session answer brings the salt.
+		Held = AccountIdUtf8;
+		return nullptr;
+	}
+	if (!SavedHash.empty())
+	{
+		if (RavensightIdentify::AccountHash(LaunchSalt, AccountIdUtf8) == SavedHash)
+		{
+			Held.clear();
+			Out.bSend = true;
+			return nullptr;
+		}
+		// Another account on this device: sign the first one out.
+		Reset(Out);
+	}
+	Held = AccountIdUtf8;
+	Settle(bMayStore, Out);
+	return nullptr;
+}
+
+void FRavensightIdentity::Reset(FRavensightIdentityEffects& Out)
+{
+	// A sign-out turns identify back on after no_session stopped it.
+	NoSessionCount = 0;
+	bNoSessionStopped = false;
+	if (!IsIdentified()) return;
+	Forget(Out);
+	Out.bResetDevice = true;
+}
+
+void FRavensightIdentity::Forget(FRavensightIdentityEffects& Out)
+{
+	Out.bDeleteSaved = true;
+	Held.clear();
+	SavedSalt.clear();
+	SavedHash.clear();
+	++Generation;
+}
+
+void FRavensightIdentity::MayStoreNow(FRavensightIdentityEffects& Out)
+{
+	Settle(true, Out);
+	if (!SavedHash.empty()) Out.bSend = true;
+}
+
+void FRavensightIdentity::OnSessionAnswer(bool bHasSalt, const std::string& Salt, bool bMayStore, FRavensightIdentityEffects& Out)
+{
+	if (bNoSalt) return;
+	if (!bHasSalt || !RavensightIdentify::IsHex64(Salt))
+	{
+		// Unavailable this launch: the held id goes; a saved one is kept, unsent.
+		bNoSalt = true;
+		LaunchSalt.clear();
+		Held.clear();
+		return;
+	}
+	LaunchSalt = Salt;
+	if (!SavedHash.empty() && SavedSalt != Salt)
+	{
+		// Made under another game's key: deleted, never sent here.
+		SavedSalt.clear();
+		SavedHash.clear();
+		++Generation;
+		Out.bDeleteSaved = true;
+	}
+	if (!Held.empty() && !SavedHash.empty())
+	{
+		if (RavensightIdentify::AccountHash(Salt, Held) == SavedHash)
+		{
+			Held.clear();
+		}
+		else
+		{
+			// Another account was identified before the salt was known: sign
+			// the saved one out first (fresh device and session).
+			const std::string Waiting = Held;
+			Reset(Out);
+			Held = Waiting;
+		}
+	}
+	Settle(bMayStore, Out);
+	if (!SavedHash.empty() && !Out.bResetDevice) Out.bSend = true;
+}
+
+void FRavensightIdentity::Settle(bool bMayStore, FRavensightIdentityEffects& Out)
+{
+	if (Held.empty() || LaunchSalt.empty() || !bMayStore) return;
+	SavedSalt = LaunchSalt;
+	SavedHash = RavensightIdentify::AccountHash(LaunchSalt, Held);
+	Held.clear();
+	++Generation;
+	Out.bSave = true;
+	Out.bSend = true;
+}
+
+bool FRavensightIdentity::BeginSend(const std::string& SessionToken, std::string& OutBody, int32_t& OutGeneration)
+{
+	if (SavedHash.empty() || bStopped || bNoSessionStopped || bNoSalt || SessionToken.empty() || LaunchSalt != SavedSalt) return false;
+	if (SessionToken == DoneToken) return false;
+	// Each session is tried once, whatever the answer.
+	DoneToken = SessionToken;
+	OutBody = RavensightIdentify::RequestBody(SavedHash);
+	OutGeneration = Generation;
+	return true;
+}
+
+ERavensightIdentifyOutcome FRavensightIdentity::OnSendAnswer(int32_t SentGeneration, const std::string& SentToken,
+	const std::string& CurrentToken, int32_t Status, const std::string& ErrorCode)
+{
+	if (SentGeneration != Generation || SentToken != CurrentToken)
+	{
+		return ERavensightIdentifyOutcome::Ignored;
+	}
+	// no_session: the first is tried once at the next session, a second in a
+	// row stops identify until ResetIdentity. Any other answer resets the count.
+	if (Status == 400 && ErrorCode == "no_session")
+	{
+		if (++NoSessionCount >= 2)
+		{
+			bNoSessionStopped = true;
+			return ERavensightIdentifyOutcome::StoppedNoSession;
+		}
+		return ERavensightIdentifyOutcome::NextSession;
+	}
+	NoSessionCount = 0;
+	if (Status >= 200 && Status < 300)
+	{
+		return ERavensightIdentifyOutcome::Done;
+	}
+	if (Status == 404 || (Status == 400 && ErrorCode == "invalid_account_hash"))
+	{
+		bStopped = true;
+		return ERavensightIdentifyOutcome::Stopped;
+	}
+	return ERavensightIdentifyOutcome::NextSession;
+}

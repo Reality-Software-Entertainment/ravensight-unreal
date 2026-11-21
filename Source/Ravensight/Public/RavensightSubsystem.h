@@ -7,6 +7,7 @@
 #include "Engine/TimerHandle.h"
 #include "Interfaces/IHttpRequest.h"
 #include "RavensightErrorCapture.h"
+#include "RavensightIdentify.h"
 #include "RavensightProtocol.h"
 #include "RavensightQueue.h"
 #include "RavensightQueueFile.h"
@@ -173,6 +174,57 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "Ravensight")
 	FString ResetDeviceId();
+
+	/**
+	 * Links this device to your game's own account id after the player signs
+	 * in, so one person on two devices, or before and after sign-in, counts as
+	 * one player. Only a salted hash of the id is sent, once per session with
+	 * the session token; the raw id is never sent or saved. Returns false, with
+	 * one warning, and changes nothing for an empty id, one over 256 UTF-8
+	 * bytes, or one containing '@' (emails and handles). Used exactly as given.
+	 * Signing in as another account calls ResetIdentity first. Callable before
+	 * Init; without a key, or before consent, the id waits in memory.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Identity")
+	bool Identify(const FString& AccountId);
+
+	/**
+	 * For sign-out: forgets the saved identity and switches to a fresh device
+	 * id exactly as ResetDeviceId does, so the next player on this device is
+	 * not linked to the account. Sends nothing. With nothing saved or waiting
+	 * it does nothing.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Identity")
+	void ResetIdentity();
+
+	/** True while an identity is saved, or an Identify waits for the session. The account id itself can never be read back. */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Identity")
+	bool IsIdentified() const;
+
+	/**
+	 * Sends a Ravensight campaign link id with the next session the SDK
+	 * opens, so the Campaign links page counts this player and session for
+	 * that link. Call it from the deep link, universal link, App Link or
+	 * install referrer handler you already have, with the rs_link value of
+	 * the incoming address (CampaignLinkFromUrl reads it). Returns true when
+	 * the id is 24 hex characters (any case; sent lower case) and now waits
+	 * for a session, replacing any earlier one; false, changing nothing,
+	 * otherwise. Best called before the first session; a later call goes with
+	 * the next session the SDK opens. Never saved. Without a key, or before
+	 * consent, it waits in memory; a Playtest run never sends it. Callable
+	 * before Init.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "Ravensight|Campaign Links")
+	bool SetCampaignLink(const FString& LinkId);
+
+	/**
+	 * The campaign link id (rs_link) in an incoming address, such as a deep
+	 * link, universal link or App Link, or in a query string such as an
+	 * install referrer: lower cased, or empty when there is none or it is not
+	 * a link id. Pass the result to SetCampaignLink.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Ravensight|Campaign Links")
+	static FString CampaignLinkFromUrl(const FString& Url);
 
 	/**
 	 * Marks this run as a Ravensight Playtest run. Call it before Init (turn
@@ -432,7 +484,7 @@ public:
 	/** Accepts a bare host or a full /api/v1 base and always returns the versioned base. */
 	static FString NormalizeApiUrl(const FString& InUrl);
 
-	/** The plugin version, "0.5.0". */
+	/** The plugin version, "0.6.0". */
 	static FString GetSdkVersion() { return RavensightVersion::Sdk; }
 
 private:
@@ -514,7 +566,8 @@ private:
 	void AfterSettingsChecked();
 
 	void EnsureSession(bool bExplicit = false);
-	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation);
+	/** SentCampaignLink: the campaignLink this session request carried, empty when none. */
+	void HandleSessionResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SentCampaignLink);
 
 	void FlushInternal(bool bForce, bool bExplicit = false);
 	void SendBatch(const TArray<FRavensightEvent>& Batch);
@@ -541,6 +594,17 @@ private:
 	void PersistQueueSoon();
 	void PersistQueueNow();
 	void AdoptSessionAnswer(const TSharedPtr<FJsonObject>& Parsed);
+
+	// --- Identify (docs/identify/CONTRACT.md) ------------------------------
+	/** A key, consent and not switched off: an identity may be saved and sent. */
+	bool MayStoreIdentity() const;
+	/** At Init: reads the saved identity, or deletes it while the player is opted out. */
+	void AdoptSavedIdentity();
+	/** Applies what FRavensightIdentity asked for: delete, fresh device, save, send. */
+	void ApplyIdentityEffects(const FRavensightIdentityEffects& Effects);
+	/** One POST /identify for the open session, when one is due. */
+	void SendIdentify();
+	void HandleIdentifyResponse(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bConnectedSuccessfully, int32 Generation, FString SessionToken);
 	TSharedRef<FJsonObject> DeviceFields() const;
 	static int64 NowMs();
 
@@ -694,6 +758,17 @@ private:
 	 * answer from an older generation is ignored.
 	 */
 	int32 QueueGeneration = 0;
+
+	/** Identify: the raw account id lives only in here, in memory, until it is hashed. */
+	FRavensightIdentity Identity;
+	bool bIdentifyBugLogged = false;
+
+	/**
+	 * The campaign link id waiting for the next session, lower case; empty
+	 * when none. Memory only. Cleared only when POST /session answers 201
+	 * with a token for a request that carried it.
+	 */
+	FString PendingCampaignLink;
 
 	/** iOS: a background task is running for the background flush. */
 	bool bBackgroundTaskActive = false;
